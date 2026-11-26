@@ -190,7 +190,7 @@ def project_filter_sql(schema: TableSchema | None, projects: list[str] | tuple[s
 
 class TableSource:
     def __init__(self, project: str, dataset: str, table: str, schema: TableSchema,
-                 *, sharded: bool = False, created=None, filter_projects=None):
+                 *, sharded: bool = False, created=None, filter_projects=None, location: str | None = None):
         self.project = project
         self.dataset = dataset
         self.table = table
@@ -198,6 +198,10 @@ class TableSource:
         self.sharded = sharded
         self.created = created
         self.filter_projects = list(filter_projects) if filter_projects else None
+        self.location = location
+
+    def each(self) -> list["TableSource"]:
+        return [self]
 
     @property
     def label(self) -> str:
@@ -226,7 +230,11 @@ class TableSource:
 
 
 class MultiTableSource:
-    """Combines equivalent tables across multiple workspace projects via UNION ALL."""
+    """Combines equivalent tables across multiple workspace projects.
+
+    Callers should iterate `each()` (or `by_location()`) so tables in different BigQuery locations
+    (e.g. `US` and `asia-northeast3`) or with different Log Router inferred schemas are queried
+    independently and merged rather than crashing a single cross-location `UNION ALL`."""
 
     def __init__(self, sources: list[TableSource]):
         self.sources = list(sources)
@@ -236,6 +244,18 @@ class MultiTableSource:
         self.schema = sources[0].schema
         self.sharded = any(s.sharded for s in sources)
         self.created = min((s.created for s in sources if s.created is not None), default=None)
+        locs = {s.location for s in sources if s.location}
+        self.location = next(iter(locs)) if len(locs) == 1 else None
+
+    def each(self) -> list[TableSource]:
+        return list(self.sources)
+
+    def by_location(self) -> list[TableSource | "MultiTableSource"]:
+        groups: dict[str, list[TableSource]] = {}
+        for s in self.sources:
+            key = (s.location or f"__unknown__:{s.project}:{s.dataset}").upper()
+            groups.setdefault(key, []).append(s)
+        return [g[0] if len(g) == 1 else MultiTableSource(g) for g in groups.values()]
 
     @property
     def label(self) -> str:
@@ -276,7 +296,7 @@ class SchemaRegistry:
                    % (project, dataset))
             res = self.gcp.query(sql, {}, quota_project=quota_project, module="schema", max_bytes=max_bytes)
             out: dict = {}
-            for row in res.rows:
+            for row in sorted(res.rows, key=lambda r: str(r.get("table_name") or "")):
                 tname = row.get("table_name")
                 ctime = row.get("creation_time")
                 if not tname:
@@ -285,26 +305,40 @@ class SchemaRegistry:
                 if m:
                     prefix, suffix = m.group(1), m.group(2)
                     cur = out.get(prefix)
-                    if cur is None or not cur["sharded"] or suffix > cur["latest_suffix"]:
-                        created = min(cur["created"], ctime) if (cur and cur.get("created") and ctime) else ctime
-                        out[prefix] = {"sharded": True, "sample": tname, "latest_suffix": suffix, "created": created}
+                    if cur is None:
+                        out[prefix] = {"sharded": True, "sample": tname, "latest_suffix": suffix, "created": ctime}
+                    elif cur["sharded"]:
+                        if suffix > cur["latest_suffix"]:
+                            created = min(cur["created"], ctime) if (cur.get("created") and ctime) else ctime
+                            out[prefix] = {"sharded": True, "sample": tname, "latest_suffix": suffix, "created": created}
+                    # If a non-sharded partitioned table already exists for the same prefix, keep it deterministically
+                    # unless the shard is strictly newer (e.g. legacy sharded sink still active).
+                    elif ctime and cur.get("created") and ctime > cur["created"]:
+                        out[prefix] = {"sharded": True, "sample": tname, "latest_suffix": suffix, "created": cur["created"]}
                 else:
                     out[tname] = {"sharded": False, "sample": tname, "latest_suffix": "", "created": ctime}
             return out
         val, _ = self._cache.get_or_compute(key, TABLES_TTL, load)
         return val
 
-    def get_schema(self, project: str, dataset: str, table: str, *, quota_project: str) -> TableSchema:
-        key = ("schema", project, dataset, table)
+    def get_schema_and_location(self, project: str, dataset: str, table: str, *,
+                                quota_project: str) -> tuple[TableSchema, str | None]:
+        key = ("schema_loc", project, dataset, table)
         def load():
             client = self.gcp.bq_client(quota_project)
             tbl = client.get_table("%s.%s.%s" % (project, dataset, table))
             tp = getattr(tbl, "time_partitioning", None)
             pfield = getattr(tp, "field", None) if tp else None
             ingestion = tp is not None and not pfield
-            return TableSchema(tbl.schema, partition_field=pfield, ingestion_partitioned=ingestion)
+            loc = getattr(tbl, "location", None)
+            return TableSchema(tbl.schema, partition_field=pfield, ingestion_partitioned=ingestion), (
+                str(loc) if isinstance(loc, str) and loc else None)
         val, _ = self._cache.get_or_compute(key, SCHEMA_TTL, load)
         return val
+
+    def get_schema(self, project: str, dataset: str, table: str, *, quota_project: str) -> TableSchema:
+        schema, _ = self.get_schema_and_location(project, dataset, table, quota_project=quota_project)
+        return schema
 
     def resolve(self, project: str, dataset: str, prefix: str, *, quota_project: str,
                 max_bytes: int, filter_projects=None) -> TableSource | None:
@@ -312,6 +346,6 @@ class SchemaRegistry:
         hit = tables.get(prefix)
         if not hit:
             return None
-        schema = self.get_schema(project, dataset, hit["sample"], quota_project=quota_project)
+        schema, loc = self.get_schema_and_location(project, dataset, hit["sample"], quota_project=quota_project)
         return TableSource(project, dataset, prefix, schema, sharded=hit["sharded"],
-                           created=hit.get("created"), filter_projects=filter_projects)
+                           created=hit.get("created"), filter_projects=filter_projects, location=loc)

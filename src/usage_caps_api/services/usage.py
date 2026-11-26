@@ -368,7 +368,13 @@ def _add_daily_ts(usage: UsageResult, person: str, ts, rng, tz, requests: int, t
 # Antigravity usage: BigQuery sink + Cloud Logging gap/tail fallback
 # ---------------------------------------------------------------------------
 
-def _bq_antigravity(ctx, src, start: dt.datetime, end: dt.datetime, *, email: str | None = None, rng=None) -> UsageResult:
+def _sources_of(src) -> list:
+    if src is None:
+        return []
+    return src.each() if hasattr(src, "each") else [src]
+
+
+def _bq_antigravity_one(ctx, src, start: dt.datetime, end: dt.datetime, *, email: str | None = None, rng=None) -> UsageResult:
     f = agy_fields(src)
     if not f["user"]:
         raise GcpError("invalid", message="sink table lacks labels.user_id")
@@ -423,7 +429,7 @@ def _bq_antigravity(ctx, src, start: dt.datetime, end: dt.datetime, *, email: st
             continue
         pub, model = clean_model(row.get("model"))
         usage.add_record(
-            person, surface="antigravity", project=rp if isinstance(rp, str) else ctx.project,
+            person, surface="antigravity", project=rp if isinstance(rp, str) else src.project,
             model=model or "unspecified", publisher=pub, requests=req,
             total=to_int(row.get("tokens")), prompt=to_int(row.get("prompt_tokens")),
             cand=to_int(row.get("candidate_tokens")), cached=to_int(row.get("cached_tokens")),
@@ -444,6 +450,29 @@ def _bq_antigravity(ctx, src, start: dt.datetime, end: dt.datetime, *, email: st
     usage.token_sources["antigravity"] = "logs"
     usage.ok = True
     return usage
+
+
+def _bq_antigravity(ctx, src, start: dt.datetime, end: dt.datetime, *, email: str | None = None, rng=None) -> UsageResult:
+    parts = _sources_of(src)
+    if len(parts) == 1:
+        return _bq_antigravity_one(ctx, parts[0], start, end, email=email, rng=rng)
+    res = ctx.run({s.label: (lambda one=s: _bq_antigravity_one(ctx, one, start, end, email=email, rng=rng)) for s in parts})
+    merged = UsageResult("bigquery")
+    merged.token_sources["antigravity"] = "logs"
+    first_err = None
+    any_ok = False
+    for s in parts:
+        ok, val = res.get(s.label, (False, None))
+        if ok:
+            any_ok = True
+            merged.merge(val)
+        else:
+            first_err = first_err or val
+            ctx.warn_error(s.label, val, "Antigravity BigQuery usage")
+    if not any_ok:
+        raise first_err or GcpError("unavailable", message="Antigravity BigQuery usage failed")
+    merged.ok = True
+    return merged
 
 
 def _user_label_regex(email: str) -> str:
@@ -646,6 +675,15 @@ def resolve_user_label(value, directory: dict) -> str | None:
     return directory.get(raw.lower())
 
 
+def _norm_project(raw, fallback: str | None = None) -> str | None:
+    if isinstance(raw, str):
+        val = raw.split("/", 1)[1] if raw.startswith("projects/") else raw
+        val = val.strip().lower()
+        if config.valid_project(val):
+            return val
+    return fallback
+
+
 def parse_vertex_entry(entry: dict, *, header_label: str, long_ctx: int) -> dict | None:
     """Parses one `aiplatform.googleapis.com/inference_request` entry. Returns None for failed requests."""
     if not isinstance(entry, dict):
@@ -654,9 +692,7 @@ def parse_vertex_entry(entry: dict, *, header_label: str, long_ctx: int) -> dict
     if str(entry.get("severity") or "").upper() == "ERROR" or payload.get("error"):
         return None
     res_labels = ((entry.get("resource") or {}).get("labels") or {}) if isinstance(entry.get("resource"), dict) else {}
-    project = res_labels.get("resource_container") or entry_project(entry.get("logName"))
-    if isinstance(project, str) and project.startswith("projects/"):
-        project = project.split("/", 1)[1]
+    project = _norm_project(res_labels.get("resource_container"), entry_project(entry.get("logName")))
     pub, model = clean_model(res_labels.get("model_user_id") or res_labels.get("model_id") or res_labels.get("model"),
                              res_labels.get("publisher"))
     if not model:
@@ -698,7 +734,8 @@ def parse_vertex_entry(entry: dict, *, header_label: str, long_ctx: int) -> dict
     user_vals = _header_values(headers, HEADER_LABEL_PREFIX + header_label)
     principal = payload.get("principal")
     if isinstance(principal, dict):
-        principal = principal.get("email") or principal.get("principalEmail") or principal.get("serviceAccount")
+        principal = (principal.get("id") or principal.get("email") or principal.get("principalEmail")
+                     or principal.get("serviceAccount"))
     ts = timeutil.parse_rfc3339(payload.get("requestStartTime")) or timeutil.parse_rfc3339(entry.get("timestamp"))
     return {"project": project, "publisher": pub, "model": model, "counts": counts, "traffic": traffic,
             "user_label": user_vals[0] if user_vals else None,
@@ -743,23 +780,26 @@ def _vertex_fields(src) -> dict:
                   "rawPredictDetails.usageMetadata.cacheReadInputTokens"),
         "c_cw": p("rawPredictDetails.usageMetadata.cache_creation_input_tokens",
                   "rawPredictDetails.usageMetadata.cacheCreationInputTokens"),
-        "principal": p("principal.email", "principal", cast="STRING"),
+        "principal": p("principal.id", "principal.email", "principal", cast="STRING"),
         "header_tpl": hdr,
         "ts": "t.%s" % quote_ident(src.time_column()),
         "log": expr("t", s, "logName", cast="STRING"),
     }
 
 
-def _bq_vertex_inference(ctx, src, start: dt.datetime, end: dt.datetime) -> list[dict]:
+def _bq_vertex_inference_one(ctx, src, start: dt.datetime, end: dt.datetime) -> list[dict]:
     f = _vertex_fields(src)
     if not f["model"]:
         raise GcpError("invalid", message="inference_request sink table lacks resource.labels.model_user_id")
     s = src.schema
     label = header_label_key(ctx).replace("-", "_")
     hcol = f["header_tpl"].format(label=label)
-    user_sql = expr("t", s, *[c + ".values" for c in payload_paths(s, hcol)], *payload_paths(s, hcol), cast="STRING")
+    hpaths = payload_paths(s, hcol)
+    user_sql = expr("t", s, *[c + ".values[0]" for c in hpaths], *[c + ".values" for c in hpaths],
+                    *hpaths, cast="STRING")
     null = "CAST(NULL AS STRING)"
-    proj = f["project"] or ("REGEXP_EXTRACT(%s, r'^projects/([^/]+)/')" % f["log"] if f["log"] else null)
+    log_proj = "REGEXP_EXTRACT(%s, r'^projects/([^/]+)/')" % f["log"] if f["log"] else null
+    proj = f["project"] or log_proj
     z = lambda col: "IFNULL(%s, 0)" % (col or "0")  # noqa: E731
     prompt = "(%s + %s + %s + %s + %s)" % (z(f["g_prompt"]), z(f["g_tool"]), z(f["c_in"]), z(f["c_cr"]), z(f["c_cw"]))
     cand = "(%s + %s)" % (z(f["g_cand"]), z(f["c_out"]))
@@ -775,18 +815,18 @@ def _bq_vertex_inference(ctx, src, start: dt.datetime, end: dt.datetime) -> list
     where = " AND ".join(ok) if ok else "TRUE"
     start_ts = "IFNULL(%s, %s)" % (f["start"], f["ts"]) if f["start"] else f["ts"]
     sql = (
-        "WITH %s,\nv AS (SELECT %s AS ts, %s AS project, %s AS publisher, %s AS model, %s AS user_label, "
-        "%s AS principal, IFNULL(%s, 'ON_DEMAND') AS traffic, %s AS prompt, %s AS cand, %s AS thoughts, "
-        "%s AS cached, %s AS cwrite, %s AS total FROM s t WHERE %s AND %s IS NOT NULL)\n"
-        "SELECT TIMESTAMP_TRUNC(ts, MINUTE) AS minute, project, publisher, model, user_label, principal, traffic, "
-        "COUNT(*) AS requests, SUM(prompt) AS prompt_tokens, SUM(cand) AS candidate_tokens, "
+        "WITH %s,\nv AS (SELECT %s AS ts, %s AS project, %s AS log_project, %s AS publisher, %s AS model, "
+        "%s AS user_label, %s AS principal, IFNULL(%s, 'ON_DEMAND') AS traffic, %s AS prompt, %s AS cand, "
+        "%s AS thoughts, %s AS cached, %s AS cwrite, %s AS total FROM s t WHERE %s AND %s IS NOT NULL)\n"
+        "SELECT TIMESTAMP_TRUNC(ts, MINUTE) AS minute, project, log_project, publisher, model, user_label, principal, "
+        "traffic, COUNT(*) AS requests, SUM(prompt) AS prompt_tokens, SUM(cand) AS candidate_tokens, "
         "SUM(thoughts) AS thoughts_tokens, SUM(cached) AS cached_tokens, SUM(cwrite) AS cache_write_tokens, "
         "SUM(total) AS tokens, COUNTIF(prompt > @long_ctx) AS long_requests, "
         "SUM(IF(prompt > @long_ctx, prompt, 0)) AS long_input_tokens, "
         "SUM(IF(prompt > @long_ctx, GREATEST(total - prompt, cand + thoughts, 0), 0)) AS long_output_tokens, "
         "SUM(IF(prompt > @long_ctx, cached, 0)) AS long_cached_tokens, MAX(ts) AS last_ts\n"
-        "FROM v GROUP BY minute, project, publisher, model, user_label, principal, traffic"
-        % (src.cte("s", start="w_start", end="w_end"), start_ts, proj, f["publisher"] or null, f["model"],
+        "FROM v GROUP BY minute, project, log_project, publisher, model, user_label, principal, traffic"
+        % (src.cte("s", start="w_start", end="w_end"), start_ts, proj, log_proj, f["publisher"] or null, f["model"],
            user_sql or null, f["principal"] or null, f["traffic"] or "CAST(NULL AS STRING)", prompt, cand, thoughts,
            cached, cwrite, total, where, f["model"])
     )
@@ -803,14 +843,34 @@ def _bq_vertex_inference(ctx, src, start: dt.datetime, end: dt.datetime) -> list
                               requests=to_int(r.get("requests")), traffic=traffic,
                               long={k: to_int(r.get(k)) for k in LONG_COUNTERS})
         minute = r.get("minute")
-        out.append({"project": r.get("project"), "publisher": pub, "model": model, "counts": counts,
+        proj_id = _norm_project(r.get("project"), _norm_project(r.get("log_project"), src.project))
+        out.append({"project": proj_id, "publisher": pub, "model": model, "counts": counts,
                     "traffic": traffic, "user_label": r.get("user_label"), "principal": r.get("principal"),
                     "ts": r.get("last_ts") if isinstance(r.get("last_ts"), dt.datetime) else minute,
                     "minute": _minute(minute) if isinstance(minute, dt.datetime) else _minute(r.get("last_ts"))})
     return out
 
 
-def _bq_vertex_audit(ctx, dsrc, start: dt.datetime, end: dt.datetime) -> list[dict] | None:
+def _bq_vertex_inference(ctx, src, start: dt.datetime, end: dt.datetime) -> list[dict]:
+    parts = _sources_of(src)
+    if len(parts) == 1:
+        return _bq_vertex_inference_one(ctx, parts[0], start, end)
+    res = ctx.run({s.label: (lambda one=s: _bq_vertex_inference_one(ctx, one, start, end)) for s in parts})
+    out, first_err, any_ok = [], None, False
+    for s in parts:
+        ok, val = res.get(s.label, (False, None))
+        if ok:
+            any_ok = True
+            out.extend(val)
+        else:
+            first_err = first_err or val
+            ctx.warn_error(s.label, val, "Gemini Platform inference request logs")
+    if not any_ok:
+        raise first_err or GcpError("unavailable", message="Gemini Platform inference request logs failed")
+    return out
+
+
+def _bq_vertex_audit_one(ctx, dsrc, start: dt.datetime, end: dt.datetime) -> list[dict] | None:
     s = dsrc.schema
     principal = expr("t", s, "protopayload_auditlog.authenticationInfo.principalEmail", cast="STRING")
     service = expr("t", s, "protopayload_auditlog.serviceName", cast="STRING")
@@ -837,9 +897,31 @@ def _bq_vertex_audit(ctx, dsrc, start: dt.datetime, end: dt.datetime) -> list[di
     for r in rows:
         pub, model = clean_model(r.get("model"), r.get("publisher"))
         minute = r.get("minute") if isinstance(r.get("minute"), dt.datetime) else r.get("last_ts")
-        out.append({"email": r.get("email"), "project": r.get("project"), "model": model, "publisher": pub,
-                    "requests": to_int(r.get("requests")), "minute": _minute(minute),
+        out.append({"email": r.get("email"), "project": r.get("project") or dsrc.project, "model": model,
+                    "publisher": pub, "requests": to_int(r.get("requests")), "minute": _minute(minute),
                     "ts": r.get("last_ts") if isinstance(r.get("last_ts"), dt.datetime) else minute})
+    return out
+
+
+def _bq_vertex_audit(ctx, dsrc, start: dt.datetime, end: dt.datetime) -> list[dict] | None:
+    parts = _sources_of(dsrc)
+    if len(parts) == 1:
+        return _bq_vertex_audit_one(ctx, parts[0], start, end)
+    res = ctx.run({s.label: (lambda one=s: _bq_vertex_audit_one(ctx, one, start, end)) for s in parts})
+    out, first_err, any_ok = [], None, False
+    for s in parts:
+        ok, val = res.get(s.label, (False, None))
+        if ok:
+            if val is not None:
+                any_ok = True
+                out.extend(val)
+        else:
+            first_err = first_err or val
+            ctx.warn_error(s.label, val, "Gemini Platform Data Access audit logs")
+    if not any_ok:
+        if first_err is not None:
+            raise first_err
+        return None
     return out
 
 
@@ -856,19 +938,22 @@ def parse_audit_entry(entry: dict) -> dict | None:
             "publisher": pub, "requests": 1, "minute": _minute(ts), "ts": ts}
 
 
-def _logging_vertex(ctx, start: dt.datetime, end: dt.datetime) -> tuple[list[dict], list[dict], bool]:
+def _logging_vertex(ctx, start: dt.datetime, end: dt.datetime, *,
+                    need_audit: bool = True) -> tuple[list[dict], list[dict], bool]:
     log_id = (ctx.config.get("caps") or {}).get("vertex_inference_log") or DEFAULT_VERTEX_LOG
     if not config.LOG_NAME_RE.match(log_id):
         raise GcpError("invalid", message="invalid vertex_inference_log")
     label = header_label_key(ctx)
     long_ctx = _long_threshold(ctx)
     projects = list(ctx.projects)
+    da_filter = ('protoPayload.serviceName="aiplatform.googleapis.com" AND '
+                 'protoPayload.methodName=~"%s"' % MODEL_CALL_METHODS)
     tasks = {}
     for p in projects:
         tasks[("inf", p)] = (lambda pr=p: _logging_project(ctx, pr, log_id, start, end))
-        tasks[("aud", p)] = (lambda pr=p: _logging_project(
-            ctx, pr, AUDIT_DATA_ACCESS_LOG, start, end,
-            extra_filter='protoPayload.serviceName="aiplatform.googleapis.com"'))
+        if need_audit:
+            tasks[("aud", p)] = (lambda pr=p: _logging_project(
+                ctx, pr, AUDIT_DATA_ACCESS_LOG, start, end, extra_filter=da_filter))
     res = ctx.run(tasks)
     inf, aud, truncated, any_ok = [], [], False, False
     for p in projects:
@@ -885,15 +970,16 @@ def _logging_vertex(ctx, start: dt.datetime, end: dt.datetime) -> tuple[list[dic
                     inf.append(item)
         elif p == ctx.project and isinstance(val, GcpError):
             raise val
-        ok, val = res.get(("aud", p), (False, None))
-        if ok:
-            entries, trunc = val
-            truncated = truncated or trunc
-            for e in entries:
-                item = parse_audit_entry(e)
-                if item:
-                    item["project"] = item["project"] or p
-                    aud.append(item)
+        if need_audit:
+            ok, val = res.get(("aud", p), (False, None))
+            if ok:
+                entries, trunc = val
+                truncated = truncated or trunc
+                for e in entries:
+                    item = parse_audit_entry(e)
+                    if item:
+                        item["project"] = item["project"] or p
+                        aud.append(item)
     if not any_ok:
         raise GcpError("unavailable", message="inference_request log unreadable")
     return inf, aud, truncated
@@ -1031,7 +1117,7 @@ def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None
                 ctx.warn_error(dsrc.label, res["aud"][1], "Gemini Platform Data Access audit logs")
     if inf_rows is None and mode in ("auto", "logging"):
         try:
-            inf_rows, log_audit, truncated = _logging_vertex(ctx, start, end)
+            inf_rows, log_audit, truncated = _logging_vertex(ctx, start, end, need_audit=(audit_rows is None))
             audit_rows = audit_rows if audit_rows is not None else log_audit
             ctx.add_source("api:logging.entries")
         except GcpError as err:
@@ -1044,7 +1130,7 @@ def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None
             ctx.warn("gemini_platform", "inference_logs_missing",
                      "Gemini Platform inference request metadata logging is not enabled or not routed: per-user request "
                      "counts come from Data Access audit logs but token counts and costs are unavailable. Run "
-                     "POST /v1/projects/{project}/vertex-logging:enable or scripts/prepare.sh.")
+                     "POST /v1/projects/{project}/vertex-logging/enable or scripts/prepare.sh.")
             return _vertex_audit_only(ctx, audit_rows, email=email, rng=rng)
         if inf_rows is None:
             out = UsageResult("unavailable")
@@ -1082,15 +1168,11 @@ def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None
 # Gemini Enterprise activity (per-seat licensed: requests + model when the log carries it)
 # ---------------------------------------------------------------------------
 
-def _gemini_enterprise_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None = None, rng=None) -> UsageResult:
-    asrc = ctx.audit_source(GE_ACTIVITY, optional=True)
-    msrc = ctx.audit_source(GE_MESSAGE, optional=True)
-    src = asrc or msrc
-    if src is None:
-        return UsageResult("unavailable")
+def _bq_ge_one(ctx, src, is_activity: bool, start: dt.datetime, end: dt.datetime, *,
+               email: str | None = None, rng=None) -> UsageResult:
     s = src.schema
     user_col = (expr("t", s, "jsonPayload.useriamprincipal", "jsonPayload.userIamPrincipal", cast="STRING")
-                if src is asrc else expr("t", s, "jsonPayload.user", cast="STRING"))
+                if is_activity else expr("t", s, "jsonPayload.user", cast="STRING"))
     if not user_col:
         return UsageResult("unavailable")
     model_col = expr("t", s, "jsonPayload.model", "jsonPayload.modelId", "jsonPayload.model_id",
@@ -1110,12 +1192,7 @@ def _gemini_enterprise_usage(ctx, start: dt.datetime, end: dt.datetime, *, email
     )
     sql = base + "\nSELECT email, model, project, COUNT(*) AS requests, MAX(ts) AS last_ts FROM g WHERE %s GROUP BY email, model, project" % where
     usage = UsageResult("bigquery")
-    try:
-        rows = ctx.query(sql, params, "usage")
-        ctx.add_source(src.label)
-    except GcpError as err:
-        ctx.warn_error(src.label, err, "Gemini Enterprise activity logs")
-        return usage
+    rows = ctx.query(sql, params, "usage")
     for r in rows:
         person = identity.person_key(r.get("email"))
         if not person:
@@ -1124,7 +1201,7 @@ def _gemini_enterprise_usage(ctx, start: dt.datetime, end: dt.datetime, *, email
         usage.records += req
         pub, model = clean_model(r.get("model"))
         usage.add_record(
-            person, surface="gemini_enterprise", project=r.get("project") or ctx.project,
+            person, surface="gemini_enterprise", project=r.get("project") or src.project,
             model=model, publisher=pub, requests=req, total=0, prompt=0, cand=0, cached=0, ts=r.get("last_ts"),
         )
     if rng is not None:
@@ -1144,6 +1221,53 @@ def _gemini_enterprise_usage(ctx, start: dt.datetime, end: dt.datetime, *, email
     usage.token_sources["gemini_enterprise"] = "requests_only"
     usage.ok = True
     return usage
+
+
+def _gemini_enterprise_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None = None, rng=None) -> UsageResult:
+    mode = (ctx.config.get("caps") or {}).get("usage_source") or "auto"
+    if mode == "logging":
+        return UsageResult("unavailable")
+    asrc = ctx.audit_source(GE_ACTIVITY, optional=True)
+    msrc = ctx.audit_source(GE_MESSAGE, optional=True)
+    # Prefer GE_ACTIVITY per project; fall back to GE_MESSAGE for projects that only have message logs.
+    chosen: list[tuple] = []
+    seen_projects: set[str] = set()
+    for one in _sources_of(asrc):
+        chosen.append((one, True))
+        seen_projects.add(one.project)
+    for one in _sources_of(msrc):
+        if one.project not in seen_projects:
+            chosen.append((one, False))
+            seen_projects.add(one.project)
+    if not chosen:
+        return UsageResult("unavailable")
+    if len(chosen) == 1:
+        one, is_act = chosen[0]
+        try:
+            res = _bq_ge_one(ctx, one, is_act, start, end, email=email, rng=rng)
+            if res.ok:
+                ctx.add_source(one.label)
+            return res
+        except GcpError as err:
+            ctx.warn_error(one.label, err, "Gemini Enterprise activity logs")
+            return UsageResult("bigquery")
+    tasks = {one.label: (lambda s=one, a=is_act: _bq_ge_one(ctx, s, a, start, end, email=email, rng=rng))
+             for one, is_act in chosen}
+    res_map = ctx.run(tasks)
+    merged = UsageResult("bigquery")
+    any_ok = False
+    for one, _ in chosen:
+        ok, val = res_map.get(one.label, (False, None))
+        if ok and isinstance(val, UsageResult) and val.ok:
+            any_ok = True
+            merged.merge(val)
+            ctx.add_source(one.label)
+        elif not ok:
+            ctx.warn_error(one.label, val, "Gemini Enterprise activity logs")
+    if any_ok:
+        merged.token_sources["gemini_enterprise"] = "requests_only"
+        merged.ok = True
+    return merged
 
 
 def collect_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None = None,

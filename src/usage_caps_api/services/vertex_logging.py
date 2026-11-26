@@ -48,6 +48,10 @@ def status(ctx, project: str) -> dict:
     try:
         payload = ctx.rest("GET", url, timeout=20)
     except GcpError as err:
+        if err.kind == "not_found":
+            # Fresh projects return 404 until setPublisherModelConfig is called for the first time.
+            return {"project": project, "enabled": False, "state": "STATE_UNSPECIFIED",
+                    "readable": True, "error": None}
         return {"project": project, "enabled": None, "state": None, "readable": False, "error": err.kind}
     state = _state_of(payload)
     return {"project": project, "enabled": state == "ENABLED", "state": state or "STATE_UNSPECIFIED",

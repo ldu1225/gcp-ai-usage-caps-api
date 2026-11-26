@@ -204,7 +204,7 @@ finalize_args() {
     die "--scope-type $SCOPE_TYPE needs --scope-ids"
   fi
   [[ -z "$SCOPE_IDS" || "$SCOPE_IDS" =~ ^[0-9,[:space:]]+$ ]] || die "--scope-ids must be numeric ids"
-  [[ "$DATASET" =~ ^[A-Za-z0-9_]{1,1024}$ ]] || die "invalid --dataset"
+  [[ "$DATASET" =~ ^[A-Za-z0-9_]+$ && ${#DATASET} -le 1024 ]] || die "invalid --dataset"
   [[ -z "$ORG_ID" || "$ORG_ID" =~ ^[0-9]+$ ]] || die "--org-id must be numeric"
   case "$DENY_ATTACHMENT" in projects|scope) ;; *) die "--deny-attachment must be projects or scope" ;; esac
   case "$MODE" in manual|auto) ;; *) die "--mode must be manual or auto" ;; esac
@@ -227,7 +227,8 @@ finalize_args() {
   HUB="$PROJECT_ID"
   DATASET_LOCATION="${DATASET_LOCATION:-$REGION}"
   if [[ -n "$REUSE_DATASET" ]]; then
-    [[ "$REUSE_DATASET" =~ ^([a-z][a-z0-9.:-]{4,99}):([A-Za-z0-9_]{1,1024})$ ]] || die "--reuse-dataset must be PROJECT:DATASET"
+    [[ "$REUSE_DATASET" =~ ^([a-z][a-z0-9.:-]{4,99}):([A-Za-z0-9_]+)$ && ${#BASH_REMATCH[2]} -le 1024 ]] \
+      || die "--reuse-dataset must be PROJECT:DATASET"
     AUDIT_PROJECT="${BASH_REMATCH[1]}"
     DATASET="${BASH_REMATCH[2]}"
   fi
@@ -389,18 +390,34 @@ enable_apis() {
 # ---------------------------------------------------------------------------
 # IAM
 # ---------------------------------------------------------------------------
+_retry_iam_grant() {
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    run_quiet "$@"
+    return $?
+  fi
+  local attempt=1
+  while [[ $attempt -le 4 ]]; do
+    if "$@" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep $((attempt * 2))
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
 grant_project_role() {  # grant_project_role PROJECT MEMBER ROLE
-  run_quiet gcloud projects add-iam-policy-binding "$1" --member="$2" --role="$3" --condition=None --quiet \
+  _retry_iam_grant gcloud projects add-iam-policy-binding "$1" --member="$2" --role="$3" --condition=None --quiet \
     || warn "could not grant $3 to $2 on $1 (ask a project owner to run it)"
 }
 
 grant_org_role() {  # grant_org_role ORG MEMBER ROLE
-  run_quiet gcloud organizations add-iam-policy-binding "$1" --member="$2" --role="$3" --condition=None --quiet \
+  _retry_iam_grant gcloud organizations add-iam-policy-binding "$1" --member="$2" --role="$3" --condition=None --quiet \
     || warn "could not grant $3 to $2 on organization $1"
 }
 
 grant_folder_role() {  # grant_folder_role FOLDER MEMBER ROLE
-  run_quiet gcloud resource-manager folders add-iam-policy-binding "$1" --member="$2" --role="$3" --condition=None \
+  _retry_iam_grant gcloud resource-manager folders add-iam-policy-binding "$1" --member="$2" --role="$3" --condition=None \
     --quiet || warn "could not grant $3 to $2 on folder $1"
 }
 
@@ -411,6 +428,12 @@ detect_org_id() {
     return 0
   fi
   [[ "${DRY_RUN:-0}" == "1" ]] && return 0
+  local ptype pid
+  read -r ptype pid < <(gcloud projects describe "$HUB" --format='value(parent.type,parent.id)' 2>/dev/null || true)
+  if [[ "$ptype" == "organization" && -n "$pid" ]]; then
+    ORG_ID="$pid"
+    return 0
+  fi
   ORG_ID="$(gcloud projects get-ancestors "$HUB" --format='value(id,type)' 2>/dev/null \
     | awk '$2=="organization"{print $1; exit}' || true)"
   return 0
@@ -622,14 +645,15 @@ enable_vertex_inference_logging() {
   token="$(gcloud auth print-access-token 2>/dev/null || true)"
   [[ -n "$token" ]] || { warn "no access token (gcloud auth print-access-token); enable on ${project} manually: ${manual}"; return 0; }
   out="$(mktemp)"
-  code="$(curl -sS -o "$out" -w '%{http_code}' --max-time 30 -H "Authorization: Bearer ${token}" "$fetch_url" 2>/dev/null || echo 000)"
+  code="$(curl -sS -o "$out" -w '%{http_code}' --max-time 30 -H "Authorization: Bearer ${token}" \
+    -H "x-goog-user-project: ${project}" "$fetch_url" 2>/dev/null || echo 000)"
   if [[ "$code" == "200" ]] && grep -Eq '"state"[[:space:]]*:[[:space:]]*"ENABLED"' "$out"; then
     rm -f "$out"
     info "${project}: Gemini Platform inference request metadata logging already ENABLED"
     return 0
   fi
   code="$(curl -sS -o "$out" -w '%{http_code}' --max-time 60 -X POST -H "Authorization: Bearer ${token}" \
-    -H "Content-Type: application/json" "$set_url" -d "$VERTEX_LOGGING_BODY" 2>/dev/null || echo 000)"
+    -H "x-goog-user-project: ${project}" -H "Content-Type: application/json" "$set_url" -d "$VERTEX_LOGGING_BODY" 2>/dev/null || echo 000)"
   case "$code" in
     2??) info "${project}: Gemini Platform inference request metadata logging ENABLED (effective within a few minutes)" ;;
     409) info "${project}: Gemini Platform inference request metadata logging already ENABLED (409)" ;;
@@ -651,7 +675,7 @@ enable_vertex_inference_logging() {
 # ensure_vertex_reader_role PROJECT MEMBER: one-permission custom role (fetchPublisherModelConfig) bound to MEMBER so
 # the runtime can report the logging state. No read-only predefined role is documented to contain this permission.
 ensure_vertex_reader_role() {
-  local project="$1" member="$2"
+  local project="$1" member="$2" deleted=""
   if ! probe gcloud iam roles describe "$VERTEX_READER_ROLE_ID" --project="$project"; then
     run_quiet gcloud iam roles create "$VERTEX_READER_ROLE_ID" --project="$project" \
       --title="GCP AI Caps Vertex logging reader" \
@@ -659,6 +683,11 @@ ensure_vertex_reader_role() {
       --permissions="$VERTEX_READER_PERMISSION" --stage=GA --quiet \
       || run_quiet gcloud iam roles undelete "$VERTEX_READER_ROLE_ID" --project="$project" --quiet \
       || { warn "could not create custom role ${VERTEX_READER_ROLE_ID} on ${project} (needs iam.roles.create); the vertex logging status shows as unreadable"; return 0; }
+  elif [[ "${DRY_RUN:-0}" != "1" ]]; then
+    deleted="$(gcloud iam roles describe "$VERTEX_READER_ROLE_ID" --project="$project" --format='value(deleted)' 2>/dev/null || true)"
+    if [[ "$deleted" == "True" || "$deleted" == "true" ]]; then
+      run_quiet gcloud iam roles undelete "$VERTEX_READER_ROLE_ID" --project="$project" --quiet || true
+    fi
   fi
   grant_project_role "$project" "$member" "projects/${project}/roles/${VERTEX_READER_ROLE_ID}"
 }
@@ -666,14 +695,20 @@ ensure_vertex_reader_role() {
 # ensure_vertex_reader_org_role ORG: organization-level variant for folder/organization scope grants; sets
 # VERTEX_READER_ORG_ROLE (empty when the role cannot be created).
 ensure_vertex_reader_org_role() {
-  local org="$1"
+  local org="$1" deleted=""
   VERTEX_READER_ORG_ROLE=""
   if ! probe gcloud iam roles describe "$VERTEX_READER_ROLE_ID" --organization="$org"; then
     run_quiet gcloud iam roles create "$VERTEX_READER_ROLE_ID" --organization="$org" \
       --title="GCP AI Caps Vertex logging reader" \
       --description="Read Gemini Platform inference request logging state (GCP AI Usage Caps API)" \
       --permissions="$VERTEX_READER_PERMISSION" --stage=GA --quiet \
+      || run_quiet gcloud iam roles undelete "$VERTEX_READER_ROLE_ID" --organization="$org" --quiet \
       || { warn "could not create organization custom role ${VERTEX_READER_ROLE_ID} on ${org} (needs roles/iam.organizationRoleAdmin)"; return 0; }
+  elif [[ "${DRY_RUN:-0}" != "1" ]]; then
+    deleted="$(gcloud iam roles describe "$VERTEX_READER_ROLE_ID" --organization="$org" --format='value(deleted)' 2>/dev/null || true)"
+    if [[ "$deleted" == "True" || "$deleted" == "true" ]]; then
+      run_quiet gcloud iam roles undelete "$VERTEX_READER_ROLE_ID" --organization="$org" --quiet || true
+    fi
   fi
   VERTEX_READER_ORG_ROLE="organizations/${org}/roles/${VERTEX_READER_ROLE_ID}"
 }

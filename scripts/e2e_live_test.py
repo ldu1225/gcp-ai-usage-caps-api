@@ -147,11 +147,21 @@ class Run:
         rows = page.get("data") or [] if st == 200 else []
         def ok(m):
             mid = str(m.get("id") or "")
-            stage = str(m.get("launch_stage") or "").upper()
-            return "flash" in mid and not any(x in mid for x in ("image", "tts", "audio", "live", "embedding")) \
-                and stage in ("GA", "")
+            lc = m.get("lifecycle") if isinstance(m.get("lifecycle"), dict) else {}
+            stage = str(lc.get("stage") or m.get("launch_stage") or "").upper()
+            return ("flash" in mid and mid.startswith("gemini-")
+                    and not any(x in mid for x in ("image", "tts", "audio", "live", "embedding", "omni", "preview", "exp", "lite"))
+                    and stage in ("GA", ""))
 
         cands = sorted((m for m in rows if ok(m)), key=lambda m: str(m.get("id")), reverse=True)
+        if not cands:
+            def fallback_ok(m):
+                mid = str(m.get("id") or "")
+                lc = m.get("lifecycle") if isinstance(m.get("lifecycle"), dict) else {}
+                stage = str(lc.get("stage") or m.get("launch_stage") or "").upper()
+                return ("flash" in mid and not any(x in mid for x in ("image", "tts", "audio", "live", "embedding", "omni"))
+                        and stage in ("GA", ""))
+            cands = sorted((m for m in rows if fallback_ok(m)), key=lambda m: str(m.get("id")), reverse=True)
         if not cands:
             raise SystemExit("Could not pick a model from GET /v1/models; pass --model <model-id>.")
         self.model = cands[0]["id"]
@@ -170,7 +180,8 @@ def phase_preflight(r: Run) -> bool:
     st, vl = r.api("GET", "/v1/projects/%s/vertex-logging" % r.a.project)
     if st == 200 and not vl.get("enabled"):
         st2, res = r.api("POST", "/v1/projects/%s/vertex-logging/enable" % r.a.project, {})
-        r.step("Inference request metadata logging enabled", st2 == 200, str(res.get("action") or res)[:120])
+        r.step("Inference request metadata logging enabled", st2 == 200 and bool(res.get("enabled")),
+               str(res.get("action") or res)[:120])
         r.info("logging was just enabled; the first entries can take a few minutes to appear")
     else:
         r.step("Inference request metadata logging enabled", st == 200 and bool(vl.get("enabled")),

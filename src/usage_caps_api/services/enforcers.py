@@ -21,6 +21,7 @@ point (`per_attachment` in `plan` / `apply`).
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
 import time
@@ -60,6 +61,8 @@ TRANSIENT_KINDS = frozenset(("unavailable", "timeout", "network"))
 READ_RETRIES = 2
 READ_RETRY_SECONDS = 1
 QUOTA_WAIT_SECONDS = (20, 40)
+HTTP_QUOTA_WAIT_SECONDS = (15,)
+DENY_CACHE_TTL = 45.0
 MISSING_PRINCIPAL_RE = re.compile(r"principal specified by member \((principal://[^)\s]+)\) was not found")
 MAX_MISSING_PRINCIPALS = 25
 SCOPE_COLLECTIONS = {"folder": "folders", "organization": "organizations"}
@@ -187,10 +190,41 @@ class DenyPolicyClient:
         self.sleep = sleep
         self.polls = max(0, int(polls))
         if quota_waits is None:
-            quota_waits = QUOTA_WAIT_SECONDS if getattr(ctx, "deny_quota_patience", False) is True else ()
+            quota_waits = QUOTA_WAIT_SECONDS if getattr(ctx, "deny_quota_patience", False) is True else HTTP_QUOTA_WAIT_SECONDS
         self.quota_waits = tuple(quota_waits)
 
-    def get(self, ap: str, pid: str) -> dict | None:
+    def _cache(self):
+        app = getattr(self.ctx, "app", None)
+        cache = getattr(app, "cache", None) if app is not None else None
+        if cache is None:
+            return None, 0.0
+        cfg = getattr(self.ctx, "config", None) or {}
+        srv_ttl = (cfg.get("server") or {}).get("cache_ttl_seconds")
+        if srv_ttl is not None and float(srv_ttl) <= 0:
+            return None, 0.0
+        ttl = min(DENY_CACHE_TTL, float(srv_ttl)) if srv_ttl is not None else DENY_CACHE_TTL
+        return cache, ttl
+
+    def _ckey(self, ap: str, pid: str):
+        return ("deny_policy", ap, pid)
+
+    def _cache_put(self, ap: str, pid: str, value):
+        cache, ttl = self._cache()
+        if cache is not None and ttl > 0:
+            cache.set(self._ckey(ap, pid), copy.deepcopy(value), ttl)
+
+    def _cache_drop(self, ap: str, pid: str):
+        cache, _ = self._cache()
+        if cache is not None:
+            cache.delete(self._ckey(ap, pid))
+
+    def get(self, ap: str, pid: str, *, fresh: bool = False) -> dict | None:
+        cache, ttl = self._cache()
+        ckey = self._ckey(ap, pid)
+        if not fresh and cache is not None and ttl > 0:
+            hit, cached = cache.get(ckey)
+            if hit:
+                return copy.deepcopy(cached)
         url = _policy_url(ap, pid)
         quota_tries = transient_tries = 0
         while True:
@@ -198,6 +232,7 @@ class DenyPolicyClient:
                 payload = self.ctx.rest("GET", url, timeout=REQUEST_TIMEOUT)
             except GcpError as err:
                 if err.kind == "not_found":
+                    self._cache_put(ap, pid, None)
                     return None
                 if err.status == 429 and quota_tries < len(self.quota_waits):
                     self.sleep(self.quota_waits[quota_tries])
@@ -208,19 +243,33 @@ class DenyPolicyClient:
                     self.sleep(READ_RETRY_SECONDS * transient_tries)
                     continue
                 raise
-            return payload if isinstance(payload, dict) else {}
+            val = payload if isinstance(payload, dict) else {}
+            self._cache_put(ap, pid, val)
+            return copy.deepcopy(val)
 
     def create(self, ap: str, pid: str, policy: dict) -> dict:
+        self._cache_drop(ap, pid)
         op = self.ctx.rest("POST", _collection_url(ap), json_body=policy,
                            params={"policyId": _checked_id(pid)}, timeout=REQUEST_TIMEOUT)
-        return self.wait(op)
+        res = self.wait(op)
+        if res["done"] and res["error"] is None and isinstance(res["response"], dict) and res["response"].get("etag"):
+            self._cache_put(ap, pid, res["response"])
+        return res
 
     def update(self, ap: str, pid: str, policy: dict) -> dict:
-        return self.wait(self.ctx.rest("PUT", _policy_url(ap, pid), json_body=policy, timeout=REQUEST_TIMEOUT))
+        self._cache_drop(ap, pid)
+        res = self.wait(self.ctx.rest("PUT", _policy_url(ap, pid), json_body=policy, timeout=REQUEST_TIMEOUT))
+        if res["done"] and res["error"] is None and isinstance(res["response"], dict) and res["response"].get("etag"):
+            self._cache_put(ap, pid, res["response"])
+        return res
 
     def delete(self, ap: str, pid: str, etag: str | None = None) -> dict:
+        self._cache_drop(ap, pid)
         params = {"etag": etag} if etag else None
-        return self.wait(self.ctx.rest("DELETE", _policy_url(ap, pid), params=params, timeout=REQUEST_TIMEOUT))
+        res = self.wait(self.ctx.rest("DELETE", _policy_url(ap, pid), params=params, timeout=REQUEST_TIMEOUT))
+        if res["done"] and res["error"] is None:
+            self._cache_put(ap, pid, None)
+        return res
 
     def wait(self, op) -> dict:
         current = op if isinstance(op, dict) else {}
