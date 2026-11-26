@@ -162,6 +162,9 @@ DEFAULTS = {
         "service_name": "gcp-ai-usage-caps-api",
         "runtime_service_account": "",
         "enforcer_service_account": "",
+        # Opt-in: treat service accounts as policy subjects (usage, caps, rules, IAM Deny). The hub's own runtime and
+        # enforcer service accounts are always protected.
+        "service_account_subjects": False,
         "org_id": "",
         "vpc_network": "",
         "vpc_subnet": "",
@@ -417,6 +420,8 @@ def _apply_env(cfg: dict, env: dict) -> dict:
                           ("SETTINGS_BUCKET", "state_bucket")):
         if get(env_name):
             hub[key] = get(env_name)
+    if get("SERVICE_ACCOUNT_SUBJECTS"):
+        hub["service_account_subjects"] = _parse_bool(get("SERVICE_ACCOUNT_SUBJECTS"))
     if get("ORG_ID") and SCOPE_ID_RE.match(get("ORG_ID")):
         hub["org_id"] = get("ORG_ID")
 

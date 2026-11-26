@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deploy the hub: Cloud Run API service, Enforcer Job, GCS state bucket, bootstrap key, ONE real-time Pub/Sub topic fed
-# by a Log Router sink in EVERY managed project (Antigravity inference_response + Vertex AI inference_request), Cloud
+# by a Log Router sink in EVERY managed project (Antigravity inference_response + Gemini Platform inference_request), Cloud
 # Scheduler safety net + daily OIDC pricing sync, and least-privilege grants for the runtime (API) and enforcer service
 # accounts on the hub AND every managed project (or at folder/org level), including the one-permission custom role
 # gcpAiCapsVertexLoggingReader (aiplatform.endpoints.fetchPublisherModelConfig) for the runtime.
@@ -65,7 +65,7 @@ if [[ "$DATASET_MODE" == "per_project" ]]; then
 fi
 
 log "1/9 Enabling hub APIs (${HUB})"
-HUB_REQUIRED="run.googleapis.com artifactregistry.googleapis.com storage.googleapis.com secretmanager.googleapis.com iam.googleapis.com iamcredentials.googleapis.com cloudresourcemanager.googleapis.com serviceusage.googleapis.com logging.googleapis.com bigquery.googleapis.com orgpolicy.googleapis.com cloudquotas.googleapis.com monitoring.googleapis.com aiplatform.googleapis.com"
+HUB_REQUIRED="run.googleapis.com artifactregistry.googleapis.com storage.googleapis.com secretmanager.googleapis.com iam.googleapis.com iamcredentials.googleapis.com cloudresourcemanager.googleapis.com serviceusage.googleapis.com logging.googleapis.com bigquery.googleapis.com orgpolicy.googleapis.com cloudquotas.googleapis.com monitoring.googleapis.com aiplatform.googleapis.com cloudidentity.googleapis.com"
 HUB_OPTIONAL="cloudbuild.googleapis.com cloudscheduler.googleapis.com cloudbilling.googleapis.com accesscontextmanager.googleapis.com"
 [[ "$REALTIME" == "1" ]] && HUB_OPTIONAL="${HUB_OPTIONAL} pubsub.googleapis.com"
 [[ "$SPEND_CAPS" == "true" ]] && HUB_OPTIONAL="${HUB_OPTIONAL} billingbudgets.googleapis.com"
@@ -179,7 +179,8 @@ MANAGED_CSV="$(IFS=,; echo "${MANAGED_ARR[*]+"${MANAGED_ARR[*]}"}")"
 [[ -n "$BILLING_ACCOUNT" ]] && ENV_PAIRS+=("BILLING_ACCOUNT_ID=${BILLING_ACCOUNT}")
 # Optional v1.2 runtime settings (costs = log token counts x Cloud Billing Catalog SKU prices; no billing export).
 for var in CAP_SCOPE VERTEX_USER_HEADER_LABEL METERED_SURFACES MODEL_VIOLATION_BLOCK_SCOPE MODEL_PUBLISHERS \
-           LONG_CONTEXT_THRESHOLD_TOKENS PROVISIONED_THROUGHPUT_COST VERTEX_LOGGING_ENDPOINT; do
+           LONG_CONTEXT_THRESHOLD_TOKENS PROVISIONED_THROUGHPUT_COST VERTEX_LOGGING_ENDPOINT \
+           SERVICE_ACCOUNT_SUBJECTS; do
   if [[ -n "${!var}" ]]; then ENV_PAIRS+=("${var}=${!var// /}"); fi
 done
 ENV_VARS="^|^$(IFS='|'; echo "${ENV_PAIRS[*]}")"

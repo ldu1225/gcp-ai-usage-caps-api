@@ -1,6 +1,6 @@
 """Project-level Google Cloud Spend Caps via Cloud Billing Budget API v1.
 
-Manages Cloud Billing spend cap budgets for workspace projects targeting Agent Platform / Vertex AI
+Manages Cloud Billing spend cap budgets for workspace projects targeting Gemini Platform
 (`services/C7E2-9256-1C43`). Includes all safety guards from `ai-control-plane`:
 - Workspace project allowlist (never pauses projects outside workspace scope)
 - USD billing account guard (no stale FX conversion)

@@ -1,7 +1,7 @@
 """Readiness categories `bigquery` and `logging`: datasets, existing AI log tables (adoption), freshness, Log Router
 sinks (project + aggregated org/folder sinks, adoption, writer access, disabled sinks), the `_Default` sink, Data
-Access audit log configuration for Vertex AI and Vertex AI inference request metadata logging
-(`aiplatform.googleapis.com/inference_request`, the per-request token source of Vertex AI usage).
+Access audit log configuration for Gemini Platform and Gemini Platform inference request metadata logging
+(`aiplatform.googleapis.com/inference_request`, the per-request token source of Gemini Platform usage).
 
 Costs are computed from log token counts x official Cloud Billing Catalog SKU prices, so no Cloud Billing export is
 detected or required.
@@ -31,7 +31,7 @@ AI_TABLES = {
 }
 NEEDED_LOGS = {
     "antigravity": ("businessaicode.googleapis.com/inference_response",),
-    # Tokens come from inference_request; per-user attribution of Vertex AI calls also needs the Data Access audit log.
+    # Tokens come from inference_request; per-user attribution of Gemini Platform calls also needs the Data Access audit log.
     "gemini_platform": (VERTEX_INFERENCE_LOG, "cloudaudit.googleapis.com/data_access"),
     "gemini_enterprise": ("discoveryengine.googleapis.com/gen_ai_user_message",
                           "discoveryengine.googleapis.com/gemini_enterprise_user_activity"),
@@ -90,7 +90,7 @@ def _list_tables(run, pid: str, dataset: str) -> list[str]:
 
 def _classify(tables: list[str]) -> dict:
     """{kind: latest_table_id} for AI log tables (sharded `_YYYYMMDD` or partitioned). The first prefix of a kind
-    with tables wins (Vertex AI: the inference_request token log before the Data Access audit log)."""
+    with tables wins (Gemini Platform: the inference_request token log before the Data Access audit log)."""
     out = {}
     for kind, prefixes in AI_TABLES.items():
         for prefix in prefixes:
@@ -421,7 +421,7 @@ def _sink_checks(run, pid: str, sinks: list[dict], aggregated: list[dict]) -> li
         detail = "No sink routes %s logs of %s to BigQuery (missing log IDs: %s)." % (
             ", ".join(missing), pid, ", ".join(missing_logs))
         if VERTEX_INFERENCE_LOG in missing_logs:
-            detail += (" Vertex AI token usage comes from %s: sinks created before v1.2 lack it in their filter."
+            detail += (" Gemini Platform token usage comes from %s: sinks created before v1.2 lack it in their filter."
                        % VERTEX_INFERENCE_LOG)
         if adopt:
             detail += " Existing sinks cover: %s." % "; ".join("%s (%s)" % (a["sink"], a["kind"]) for a in adopt[:5])
@@ -446,7 +446,7 @@ def _sink_checks(run, pid: str, sinks: list[dict], aggregated: list[dict]) -> li
             usage_sink, topic_path, pid, q(REALTIME_FILTER))
     if ps_cover and not ps_missing:
         out.append(check("logging.sink.pubsub", "logging", "pass", *ps_title,
-                         "Antigravity and Vertex AI inference logs are pushed to Pub/Sub by %s." % ", ".join(
+                         "Antigravity and Gemini Platform inference logs are pushed to Pub/Sub by %s." % ", ".join(
                              "%s -> %s" % (s.get("name"), s.get("destination")) for s in ps_cover[:3]),
                          data=ps_data))
     elif ps_cover:
@@ -457,7 +457,7 @@ def _sink_checks(run, pid: str, sinks: list[dict], aggregated: list[dict]) -> li
                          impact=["realtime"], auto_fixable=True, commands=[ps_cmd], data=ps_data))
     else:
         out.append(check("logging.sink.pubsub", "logging", "info", *ps_title,
-                         "No Pub/Sub sink for Antigravity / Vertex AI inference logs in %s: real-time enforcement "
+                         "No Pub/Sub sink for Antigravity / Gemini Platform inference logs in %s: real-time enforcement "
                          "falls back to the 5-minute scheduler. deploy.sh creates one publishing to the hub topic."
                          % pid, impact=["realtime"], auto_fixable=True, commands=[ps_cmd], data=ps_data))
     if disabled:
@@ -579,11 +579,11 @@ def _has_data_access(configs: list, services=("aiplatform.googleapis.com", "allS
 
 
 def audit_config_check(run, pid: str) -> dict:
-    title = ("Vertex AI 데이터 액세스 감사 로그", "Vertex AI Data Access audit logs")
+    title = ("Gemini Platform 데이터 액세스 감사 로그", "Gemini Platform Data Access audit logs")
     cid = "logging.audit_config.aiplatform"
     if run.api_enabled(pid, "aiplatform.googleapis.com") is False:
         return check(cid, "logging", "info", *title,
-                     "aiplatform.googleapis.com is not enabled on %s; Vertex AI per-user usage is not applicable." % pid)
+                     "aiplatform.googleapis.com is not enabled on %s; Gemini Platform per-user usage is not applicable." % pid)
     pol, err = run.iam_policy(pid)
     if err is not None:
         return skipped(cid, "logging", *title, err, what="the IAM policy of %s (resourcemanager.projects.getIamPolicy)"
@@ -608,11 +608,11 @@ def audit_config_check(run, pid: str) -> dict:
     data = {"log_types": sorted(t for t in types if t), "source": source}
     if {"DATA_READ", "DATA_WRITE"} <= types:
         return check(cid, "logging", "pass", *title,
-                     "DATA_READ and DATA_WRITE audit logs are enabled for Vertex AI (%s)." % source, data=data)
+                     "DATA_READ and DATA_WRITE audit logs are enabled for Gemini Platform (%s)." % source, data=data)
     missing = sorted({"DATA_READ", "DATA_WRITE"} - types)
     return check(cid, "logging", "warn", *title,
-                 "Vertex AI Data Access audit logs (%s) are off on %s (also checked folder/org inheritance): per-user "
-                 "Vertex AI usage and caps cannot be measured. Run prepare.sh with --enable-data-access-logs (merges "
+                 "Gemini Platform Data Access audit logs (%s) are off on %s (also checked folder/org inheritance): per-user "
+                 "Gemini Platform usage and caps cannot be measured. Run prepare.sh with --enable-data-access-logs (merges "
                  "auditConfigs without clobbering existing ones)." % (", ".join(missing), pid),
                  impact=["gemini_platform", "usage"], auto_fixable=True, data=data, docs_url=DOCS["audit"],
                  commands=["scripts/prepare.sh --project %s --managed-projects %s --enable-data-access-logs" % (
@@ -621,7 +621,7 @@ def audit_config_check(run, pid: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Vertex AI inference request metadata logging (per project)
+# Gemini Platform inference request metadata logging (per project)
 # ---------------------------------------------------------------------------
 
 VERTEX_LOGGING_READER_ROLE = "gcpAiCapsVertexLoggingReader"
@@ -639,12 +639,12 @@ def vertex_inference_logging_check(run, pid: str) -> dict:
     """logging.vertex_inference_logging: is `aiplatform.googleapis.com/inference_request` logging ENABLED?
 
     Same semantics as services.vertex_logging.status (v1beta1 fetchPublisherModelConfig). Disabled is a warning,
-    never a failure: Antigravity / Gemini Enterprise usage keeps working, only Vertex AI token usage is missing."""
-    title = ("Vertex AI 추론 요청 메타데이터 로깅", "Vertex AI inference request metadata logging")
+    never a failure: Antigravity / Gemini Enterprise usage keeps working, only Gemini Platform token usage is missing."""
+    title = ("Gemini Platform 추론 요청 메타데이터 로깅", "Gemini Platform inference request metadata logging")
     cid = "logging.vertex_inference_logging"
     if run.api_enabled(pid, "aiplatform.googleapis.com") is False:
         return check(cid, "logging", "info", *title,
-                     "aiplatform.googleapis.com is not enabled on %s; Vertex AI inference logging is not applicable."
+                     "aiplatform.googleapis.com is not enabled on %s; Gemini Platform inference logging is not applicable."
                      % pid, data={"enabled": None, "state": None, "readable": False, "applicable": False})
     endpoint = vlog._endpoint(run.ctx)  # pylint: disable=protected-access
     url = "%s/projects/%s:fetchPublisherModelConfig" % (endpoint, urllib.parse.quote(pid, safe=""))
@@ -673,10 +673,10 @@ def vertex_inference_logging_check(run, pid: str) -> dict:
     data = {"enabled": state == "ENABLED", "state": state, "readable": True, "endpoint": endpoint}
     if state == "ENABLED":
         return check(cid, "logging", "pass", *title,
-                     "Inference request metadata logging is ENABLED on %s (%s entries carry Vertex AI token counts)."
+                     "Inference request metadata logging is ENABLED on %s (%s entries carry Gemini Platform token counts)."
                      % (pid, VERTEX_INFERENCE_LOG), data=data)
     return check(cid, "logging", "warn", *title,
-                 "Inference request metadata logging is %s on %s: Vertex AI token usage, cost and caps cannot be "
+                 "Inference request metadata logging is %s on %s: Gemini Platform token usage, cost and caps cannot be "
                  "measured for this project (Antigravity / Gemini Enterprise are unaffected). prepare.sh enables it "
                  "(ENABLE_VERTEX_INFERENCE_LOGGING=true, default), or run the command below. Entries are ingested "
                  "into Cloud Logging, so Cloud Logging ingestion/storage pricing applies." % (state, pid),

@@ -102,7 +102,7 @@ variable "reuse_dataset" {
 variable "enable_data_access_logs" {
   type        = bool
   default     = false
-  description = "Enable Vertex AI (aiplatform.googleapis.com) ADMIN_READ/DATA_READ/DATA_WRITE audit logs on the hub and every managed project."
+  description = "Enable Gemini Platform (aiplatform.googleapis.com) ADMIN_READ/DATA_READ/DATA_WRITE audit logs on the hub and every managed project."
 }
 
 variable "dataset_location" {
@@ -294,13 +294,13 @@ variable "pricing_sync_schedule" {
 variable "enable_vertex_inference_logging" {
   type        = bool
   default     = true
-  description = "Enable Vertex AI inference request metadata logging (aiplatform.googleapis.com/inference_request, the per-request Vertex AI token source) on the hub and every managed project. No native Terraform resource exists (hashicorp/terraform-provider-google#30642), so a terraform_data local-exec calls the v1beta1 setPublisherModelConfig REST method with curl (needs bash + curl where terraform runs, and aiplatform.endpoints.setPublisherModelConfig for the Terraform identity). Cloud Logging ingestion/storage pricing applies to the entries."
+  description = "Enable Gemini Platform inference request metadata logging (aiplatform.googleapis.com/inference_request, the per-request Gemini Platform token source) on the hub and every managed project. No native Terraform resource exists (hashicorp/terraform-provider-google#30642), so a terraform_data local-exec calls the v1beta1 setPublisherModelConfig REST method with curl (needs bash + curl where terraform runs, and aiplatform.endpoints.setPublisherModelConfig for the Terraform identity). Cloud Logging ingestion/storage pricing applies to the entries."
 }
 
 variable "vertex_logging_endpoint" {
   type        = string
   default     = "https://aiplatform.googleapis.com/v1beta1"
-  description = "v1beta1 Vertex AI endpoint used to enable inference request metadata logging (e.g. a Private Service Connect endpoint under VPC Service Controls)."
+  description = "v1beta1 Gemini Platform (formerly Gemini Platform) endpoint used to enable inference request metadata logging (e.g. a Private Service Connect endpoint under VPC Service Controls)."
   validation {
     condition     = can(regex("^https://[A-Za-z0-9.-]+(:[0-9]+)?/v1beta1$", var.vertex_logging_endpoint))
     error_message = "vertex_logging_endpoint must look like https://HOST/v1beta1."
@@ -326,7 +326,7 @@ variable "cap_scope" {
 variable "vertex_user_header_label" {
   type        = string
   default     = ""
-  description = "Optional VERTEX_USER_HEADER_LABEL: custom request header label carrying the end user in Vertex AI inference request logs."
+  description = "Optional VERTEX_USER_HEADER_LABEL: custom request header label carrying the end user in Gemini Platform inference request logs."
 }
 
 variable "metered_surfaces" {
@@ -343,4 +343,10 @@ variable "model_violation_block_scope" {
     condition     = contains(["", "project", "all"], var.model_violation_block_scope)
     error_message = "model_violation_block_scope must be empty, project or all."
   }
+}
+
+variable "service_account_subjects" {
+  type        = bool
+  default     = false
+  description = "Treat service accounts as policy subjects (usage attribution from the inference log principal, caps, rules, IAM Deny). The hub runtime and enforcer service accounts are always protected."
 }

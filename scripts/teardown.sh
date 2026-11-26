@@ -55,6 +55,6 @@ del gcloud run services delete "$SERVICE_NAME" --region="$REGION" --project="$HU
 echo "==> Teardown complete (BigQuery datasets and the GCS state bucket were preserved)."
 echo "    IAM grants of ${API_SA} / ${ENFORCER_SA} remain; remove them with 'gcloud projects remove-iam-policy-binding'"
 echo "    (and 'gcloud organizations remove-iam-policy-binding' for org roles) if the service accounts are deleted."
-echo "    Vertex AI inference request metadata logging stays ENABLED (there is no DELETE; set state DISABLED with"
+echo "    Gemini Platform inference request metadata logging stays ENABLED (there is no DELETE; set state DISABLED with"
 echo "    setPublisherModelConfig to stop it) and the custom role ${VERTEX_READER_ROLE_ID} remains in each project"
 echo "    ('gcloud iam roles delete ${VERTEX_READER_ROLE_ID} --project=P')."

@@ -4,7 +4,7 @@ Sources (all are Cloud Logging logs, read from the Log Router BigQuery sink or d
 
 - Antigravity: `businessaicode.googleapis.com/inference_response` - one entry per request with the person
   (`labels.user_id`), the model (`labels.model_id`) and Gemini `usageMetadata`-style token counts.
-- Vertex AI / Agent Platform tokens: `aiplatform.googleapis.com/inference_request` (inference request metadata logs,
+- Gemini Platform tokens: `aiplatform.googleapis.com/inference_request` (inference request metadata logs,
   enabled per project with `setPublisherModelConfig`). Resource labels carry project / location / publisher / model
   (`model_user_id`); the payload carries `generateContentDetails.usageMetadata` (Gemini) or
   `rawPredictDetails.usageMetadata` (Claude), `trafficType` and captured custom header labels.
@@ -612,7 +612,7 @@ def antigravity_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str |
 
 
 # ---------------------------------------------------------------------------
-# Vertex AI (Agent Platform): inference request metadata logs + Data Access audit correlation
+# Gemini Platform: inference request metadata logs + Data Access audit correlation
 # ---------------------------------------------------------------------------
 
 def header_label_key(ctx) -> str:
@@ -829,7 +829,8 @@ def _bq_vertex_audit(ctx, dsrc, start: dt.datetime, end: dt.datetime) -> list[di
         "SELECT TIMESTAMP_TRUNC(ts, MINUTE) AS minute, email, model, publisher, project, COUNT(*) AS requests, "
         "MAX(ts) AS last_ts FROM v WHERE email IS NOT NULL AND %s GROUP BY minute, email, model, publisher, project"
         % (dsrc.cte("da_src", start="w_start", end="w_end"), ts, principal, model_sql, pub_sql, proj_sql,
-           service, method, MODEL_CALL_METHODS, human_sql("email"))
+           service, method, MODEL_CALL_METHODS,
+           "email LIKE '%@%'" if identity.service_account_subjects() else human_sql("email"))
     )
     rows = ctx.query(sql, _window_params(start, end), "usage")
     out = []
@@ -913,6 +914,11 @@ def attribute_vertex(inf_rows: list[dict], audit_rows: list[dict], directory: di
         if person:
             yield person, "header_label", row, row["counts"]
             continue
+        if identity.service_account_subjects() and identity.is_service_account(row.get("principal")):
+            sa = identity.person_key(row.get("principal"))
+            if sa:
+                yield sa, "log_identity", row, row["counts"]
+                continue
         weights: dict[str, int] = {}
         m = row.get("minute")
         if m is not None:
@@ -998,7 +1004,7 @@ def _vertex_audit_only(ctx, audit_rows: list[dict], *, email: str | None, rng) -
 
 def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None = None, rng=None,
                  fresh: bool = False, directory: dict | None = None) -> UsageResult:
-    """Vertex AI usage with tokens from inference request logs and per-user attribution (see module docstring)."""
+    """Gemini Platform usage with tokens from inference request logs and per-user attribution (see module docstring)."""
     mode = (ctx.config.get("caps") or {}).get("usage_source") or "auto"
     inf_rows = audit_rows = None
     truncated = False
@@ -1016,13 +1022,13 @@ def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None
                 inf_rows = res["inf"][1]
                 ctx.add_source(src.label)
             else:
-                ctx.warn_error(src.label, res["inf"][1], "Vertex AI inference request logs")
+                ctx.warn_error(src.label, res["inf"][1], "Gemini Platform inference request logs")
         if "aud" in res:
             if res["aud"][0] and res["aud"][1] is not None:
                 audit_rows = res["aud"][1]
                 ctx.add_source(dsrc.label)
             elif not res["aud"][0]:
-                ctx.warn_error(dsrc.label, res["aud"][1], "Vertex AI Data Access audit logs")
+                ctx.warn_error(dsrc.label, res["aud"][1], "Gemini Platform Data Access audit logs")
     if inf_rows is None and mode in ("auto", "logging"):
         try:
             inf_rows, log_audit, truncated = _logging_vertex(ctx, start, end)
@@ -1030,13 +1036,13 @@ def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None
             ctx.add_source("api:logging.entries")
         except GcpError as err:
             if mode == "logging":
-                ctx.warn_error("api:logging.entries", err, "Vertex AI inference request logs")
+                ctx.warn_error("api:logging.entries", err, "Gemini Platform inference request logs")
             inf_rows = None
     if not inf_rows:
-        # No inference request entries while audit logs show Vertex AI calls -> logging is not enabled / routed.
+        # No inference request entries while audit logs show Gemini Platform calls -> logging is not enabled / routed.
         if audit_rows:
             ctx.warn("gemini_platform", "inference_logs_missing",
-                     "Vertex AI inference request metadata logging is not enabled or not routed: per-user request "
+                     "Gemini Platform inference request metadata logging is not enabled or not routed: per-user request "
                      "counts come from Data Access audit logs but token counts and costs are unavailable. Run "
                      "POST /v1/projects/{project}/vertex-logging:enable or scripts/prepare.sh.")
             return _vertex_audit_only(ctx, audit_rows, email=email, rng=rng)
@@ -1143,7 +1149,7 @@ def _gemini_enterprise_usage(ctx, start: dt.datetime, end: dt.datetime, *, email
 def collect_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None = None,
                   rng=None, surface: str | None = None, fresh: bool = False,
                   surfaces: list[str] | tuple[str, ...] | None = None) -> UsageResult:
-    """Collects unified usage across Antigravity, Vertex AI and Gemini Enterprise (logs only)."""
+    """Collects unified usage across Antigravity, Gemini Platform and Gemini Enterprise (logs only)."""
     wanted = set(surfaces) if surfaces else set(config.VALID_SERVICES)
     if surface not in (None, "", "all"):
         wanted &= {surface}
@@ -1165,7 +1171,7 @@ def collect_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | Non
             vx = vertex_usage(ctx, start, end, email=email, rng=rng, fresh=fresh,
                               directory=user_directory(ctx, set(combined.users)))
         except GcpError as err:
-            ctx.warn_error("gemini_platform", err, "Vertex AI usage")
+            ctx.warn_error("gemini_platform", err, "Gemini Platform usage")
             vx = None
         if vx is not None and vx.ok:
             any_ok = True

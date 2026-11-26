@@ -30,7 +30,7 @@ vpc_network                 = ""
 vpc_subnet                  = ""
 vpc_egress                  = "all-traffic"
 
-# Vertex AI inference request metadata logging (aiplatform.googleapis.com/inference_request = Vertex AI token source).
+# Gemini Platform inference request metadata logging (aiplatform.googleapis.com/inference_request = Gemini Platform token source).
 # No native Terraform resource exists (hashicorp/terraform-provider-google#30642): a local-exec curl calls the v1beta1
 # setPublisherModelConfig method per project (needs bash + curl). Cloud Logging ingestion/storage pricing applies.
 enable_vertex_inference_logging   = true

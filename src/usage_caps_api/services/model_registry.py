@@ -1,9 +1,9 @@
 """Model catalog: admin-API style `GET /v1/models` and `GET /v1/models/{model_id}` - fully dynamic.
 
 There is NO built-in model list. The catalog is the union of:
-  1. Live Vertex AI Model Garden discovery (v1beta1 `publishers/{publisher}/models`) for every configured publisher
+  1. Live Gemini Platform Model Garden discovery (v1beta1 `publishers/{publisher}/models`) for every configured publisher
      plus every publisher observed in logs. Models that disappear from Model Garden are kept with `delisted_at`.
-  2. Every model observed in usage logs on any surface (Antigravity `labels.model_id`, Vertex AI inference request
+  2. Every model observed in usage logs on any surface (Antigravity `labels.model_id`, Gemini Platform inference request
      `resource.labels.model_user_id`, Data Access audit `resourceName`, Gemini Enterprise activity) - recorded with
      first_seen / last_seen, the surfaces / projects it was used on and the number of users. A model used for the
      first time triggers the `model.first_seen` webhook, so brand-new models are tracked the day they are used

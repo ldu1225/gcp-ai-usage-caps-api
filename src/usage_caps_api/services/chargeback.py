@@ -1,11 +1,11 @@
 """Monthly user x project chargeback report with exact integer-cent allocation (logs x official SKU prices).
 
-- Usage: log token counts on every surface (Antigravity, Vertex AI incl. audit-correlated attribution, Gemini
+- Usage: log token counts on every surface (Antigravity, Gemini Platform incl. audit-correlated attribution, Gemini
   Enterprise requests) - the Cloud Billing export is never read.
 - Price: official Cloud Billing Catalog SKU prices (or contract overrides), see services/pricing.py.
 - A user assigned to several projects gets one fact per (user, project); all user, project and grand totals are summed
   from the exact same integer-cent facts, guaranteeing zero rounding drift across rollups.
-- Vertex AI usage that could not be attributed to a person is reported per project under `unattributed` so project
+- Gemini Platform usage that could not be attributed to a person is reported per project under `unattributed` so project
   totals stay complete.
 """
 

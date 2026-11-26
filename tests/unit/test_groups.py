@@ -310,3 +310,37 @@ class SurfaceAliasTests(_GroupBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServiceAccountSubjectTests(_GroupBase):
+    cfg_overrides = config.deep_merge(_GroupBase.cfg_overrides, {
+        "hub": {"service_account_subjects": True, "runtime_service_account": "caps-api@hub.iam.gserviceaccount.com"}})
+    SA = "caps-e2e-tester@test-ai-project.iam.gserviceaccount.com"
+
+    def tearDown(self):
+        from usage_caps_api import identity
+        identity.configure()
+
+    def test_service_account_is_metered_capped_and_denied(self):
+        from tests.unit.support import make_vertex_entry
+        from usage_caps_api import identity
+        self.assertEqual(identity.deny_principal(self.SA),
+                         "principal://iam.googleapis.com/projects/-/serviceAccounts/" + self.SA)
+        self.assertIsNone(identity.person_key("caps-api@hub.iam.gserviceaccount.com"))  # hub SA protected
+        now = dt.datetime.now(dt.timezone.utc)
+        self.gcp.log_entries += [make_vertex_entry(principal=self.SA, ts=now, insert_id="sa%d" % i) for i in range(3)]
+        st, r = self.req("PUT", "/v1/caps/users/%s" % self.SA, {"type": "limit", "request_cap": 2})
+        self.assertEqual(st, 200, r)
+        st, cap = self.req("GET", "/v1/caps/users/%s" % self.SA)
+        self.assertEqual((cap["status"], cap["usage"]["requests"]), ("over_cap", 3))
+        st, run = self.req("POST", "/v1/caps/enforce", {"dryRun": False})
+        self.assertEqual(run["plan"]["suspend"], [self.SA])
+        self.assertIn("principal://iam.googleapis.com/projects/-/serviceAccounts/" + self.SA, self.denied_at(HUB))
+        st, res = self.req("POST", "/v1/users/%s/unblock" % self.SA, {})
+        self.assertEqual(res["status"], "active")
+        self.assertNotIn("principal://iam.googleapis.com/projects/-/serviceAccounts/" + self.SA, self.denied_at(HUB))
+
+    def test_disabled_by_default(self):
+        from usage_caps_api import identity
+        identity.configure()
+        self.assertIsNone(identity.person_key(self.SA))

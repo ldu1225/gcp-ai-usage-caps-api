@@ -19,7 +19,8 @@ from .readiness_core import ACM_V1, COMPUTE_V1, DNS_V1, DOCS, check, skipped
 PRODUCT_SERVICES = ("logging.googleapis.com", "bigquery.googleapis.com", "iam.googleapis.com",
                     "orgpolicy.googleapis.com", "cloudquotas.googleapis.com", "discoveryengine.googleapis.com",
                     "aiplatform.googleapis.com", "pubsub.googleapis.com", "cloudresourcemanager.googleapis.com",
-                    "monitoring.googleapis.com", "serviceusage.googleapis.com", "businessaicode.googleapis.com")
+                    "monitoring.googleapis.com", "serviceusage.googleapis.com", "businessaicode.googleapis.com",
+                    "cloudidentity.googleapis.com")
 # Services the hub itself needs inside its own perimeter.
 HUB_SERVICES = PRODUCT_SERVICES + ("storage.googleapis.com", "run.googleapis.com", "secretmanager.googleapis.com",
                                    "artifactregistry.googleapis.com", "cloudbuild.googleapis.com",

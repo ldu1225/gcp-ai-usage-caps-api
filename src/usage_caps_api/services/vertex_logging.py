@@ -1,6 +1,6 @@
-"""Vertex AI inference request metadata logging (`aiplatform.googleapis.com/inference_request`) per managed project.
+"""Gemini Platform inference request metadata logging (`aiplatform.googleapis.com/inference_request`) per managed project.
 
-This log is the only log-based source of per-request Vertex AI token counts (Gemini `generateContent` /
+This log is the only log-based source of per-request Gemini Platform token counts (Gemini `generateContent` /
 `streamGenerateContent` and Claude `rawPredict` / `streamRawPredict`). It is OFF by default and has no organization-
 level switch, so the hub enables it project by project (v1beta1 `setPublisherModelConfig` with
 `inferenceEventLoggingConfig.state = ENABLED`; reads use `fetchPublisherModelConfig`).

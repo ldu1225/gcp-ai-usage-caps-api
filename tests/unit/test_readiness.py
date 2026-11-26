@@ -37,7 +37,7 @@ ALL_SERVICES = {
     "iamcredentials.googleapis.com", "cloudresourcemanager.googleapis.com", "serviceusage.googleapis.com",
     "logging.googleapis.com", "bigquery.googleapis.com", "cloudbilling.googleapis.com",
     "billingbudgets.googleapis.com", "orgpolicy.googleapis.com", "cloudquotas.googleapis.com",
-    "monitoring.googleapis.com", "accesscontextmanager.googleapis.com", "aiplatform.googleapis.com",
+    "monitoring.googleapis.com", "accesscontextmanager.googleapis.com", "cloudidentity.googleapis.com", "aiplatform.googleapis.com",
     "discoveryengine.googleapis.com", "businessaicode.googleapis.com",
 }
 RUNTIME_ROLES = ["roles/browser", "roles/serviceusage.serviceUsageConsumer", "roles/logging.viewer",

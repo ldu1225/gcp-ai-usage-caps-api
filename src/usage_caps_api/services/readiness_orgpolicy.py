@@ -50,7 +50,7 @@ TITLES = {
     "gcp.restrictServiceUsage": ("서비스 사용 제한", "Restricted service usage"),
     "serviceuser.services": ("서비스 사용 제한(레거시)", "Restricted services (legacy)"),
     "cloudbuild.allowedWorkerPools": ("Cloud Build 워커 풀 제한", "Cloud Build worker pools"),
-    "vertexai.allowedModels": ("Vertex AI 허용 모델 정책", "Vertex AI allowed models policy"),
+    "vertexai.allowedModels": ("Gemini Platform 허용 모델 정책", "Gemini Platform allowed models policy"),
     "storage.publicAccessPrevention": ("버킷 공개 차단", "Storage public access prevention"),
     "storage.uniformBucketLevelAccess": ("균일 버킷 접근", "Uniform bucket-level access"),
     "iam.disableServiceAccountKeyCreation": ("서비스 계정 키 생성 금지", "Service account key creation disabled"),
@@ -428,7 +428,7 @@ def _allowed_models(run, pid, pol) -> list[dict]:
     }
     run.set_fact(pid, "allowed_models", data)
     if not p.get("set"):
-        detail = "Not set: every Vertex AI model is allowed. The model governance API manages this constraint."
+        detail = "Not set: every Gemini Platform model is allowed. The model governance API manages this constraint."
     elif data["set_at_ancestor"]:
         detail = ("Effective values come from a folder/organization policy (%d allowed, %d denied, all=%s). Project-"
                   "level policies written by the model governance API merge with it when inheritFromParent=true "

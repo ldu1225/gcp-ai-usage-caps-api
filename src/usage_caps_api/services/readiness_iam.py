@@ -49,7 +49,7 @@ RUNTIME_PERMISSIONS = (
     ("monitoring.timeSeries.list", "roles/monitoring.viewer", "optional", "quota_management", "all"),
     ("discoveryengine.engines.get", "roles/discoveryengine.viewer", "optional", "gemini_enterprise", "all"),
     ("discoveryengine.engines.update", "roles/discoveryengine.editor", "optional", "gemini_enterprise", "all"),
-    # Vertex AI inference request metadata logging state (readiness + GET /v1/projects/{p}/vertex-logging). No
+    # Gemini Platform inference request metadata logging state (readiness + GET /v1/projects/{p}/vertex-logging). No
     # read-only predefined role is documented to hold it, so the installer creates a one-permission custom role.
     ("aiplatform.endpoints.fetchPublisherModelConfig", VERTEX_LOGGING_READER, "optional", "vertex_inference_logging",
      "all"),
@@ -87,7 +87,7 @@ DEPLOYER_MANAGED = (
     ("logging.sinks.create", "roles/logging.configWriter"),
     ("logging.sinks.get", "roles/logging.configWriter"),
 )
-# Optional installer permissions on every project: enabling Vertex AI inference request metadata logging
+# Optional installer permissions on every project: enabling Gemini Platform inference request metadata logging
 # (prepare.sh) and creating the gcpAiCapsVertexLoggingReader custom role (deploy.sh). Missing ones only warn: the
 # installer skips those steps and prints the commands.
 DEPLOYER_OPTIONAL = (
@@ -145,7 +145,7 @@ ROLE_PERMISSIONS = {
     "roles/discoveryengine.viewer": {"discoveryengine.engines.get"},
     "roles/discoveryengine.editor": {"discoveryengine.engines.get", "discoveryengine.engines.update"},
     "roles/discoveryengine.admin": {"discoveryengine.engines.get", "discoveryengine.engines.update"},
-    # Vertex AI Administrator / User hold the publisher model config permissions (User: per Google's
+    # Gemini Platform Administrator / User hold the publisher model config permissions (User: per Google's
     # request-response logging guidance; not exhaustively verified for fetch).
     "roles/aiplatform.admin": {VERTEX_FETCH, VERTEX_SET},
     "roles/aiplatform.user": {VERTEX_FETCH, VERTEX_SET},
@@ -363,7 +363,7 @@ def deployer_permission_check(run, pid: str) -> dict | None:
     if not missing:
         roles = list(dict.fromkeys(r for _, r in missing_opt))
         return check(cid, "iam", "warn", *title,
-                     "The caller lacks optional permissions on %s: %s. The installer cannot enable Vertex AI inference "
+                     "The caller lacks optional permissions on %s: %s. The installer cannot enable Gemini Platform inference "
                      "request metadata logging and/or create the %s custom role there (it warns and continues). "
                      "Grant: %s." % (pid, ", ".join(p for p, _ in missing_opt), VERTEX_LOGGING_READER_ID,
                                       ", ".join(roles)),

@@ -4,7 +4,7 @@ A Cloud Logging sink (one per managed project, or one aggregated folder/organiza
 entries to Pub/Sub, which pushes each entry to this endpoint with a Google OIDC token:
 
 - Antigravity `businessaicode.googleapis.com/inference_response` (person in `labels.user_id`)
-- Vertex AI `aiplatform.googleapis.com/inference_request` (person from the custom header label; entries without a
+- Gemini Platform `aiplatform.googleapis.com/inference_request` (person from the custom header label; entries without a
   header label are handled by the scheduled cycle, which correlates them with Data Access audit logs)
 
 Per event: per-user model rules (allow/deny list, RPM/TPM) are checked first (default action: block + notify), then
@@ -23,7 +23,7 @@ import logging
 import threading
 import urllib.parse
 
-from .. import timeutil
+from .. import identity, timeutil
 from ..auth import INTERNAL_SCOPE
 from ..gcp import GcpError
 from ..httpkit import ApiError
@@ -64,7 +64,7 @@ def _item(person, project, ts, key, model, publisher, surface, counts) -> dict:
 
 def entry_usage(entry: dict, log_id: str, projects: list[str], *, vertex_log_id: str | None = None,
                 header_label: str = "user", directory: dict | None = None, long_ctx: int = 200000) -> dict | None:
-    """Normalizes one pushed log entry (Antigravity or Vertex AI) into a usage item, or None when not applicable."""
+    """Normalizes one pushed log entry (Antigravity or Gemini Platform) into a usage item, or None when not applicable."""
     name = entry.get("logName")
     if not isinstance(name, str) or "/logs/" not in name:
         return None
@@ -89,6 +89,8 @@ def entry_usage(entry: dict, log_id: str, projects: list[str], *, vertex_log_id:
         if parsed is None:
             return None
         person = usage_svc.resolve_user_label(parsed.get("user_label"), directory or {})
+        if person is None and identity.service_account_subjects() and identity.is_service_account(parsed.get("principal")):
+            person = identity.person_key(parsed.get("principal"))
         if person is None or parsed["ts"] is None:
             return None
         key = parsed["key"] or "%s|%s|%s|%d" % (project, person, iso(parsed["ts"]), parsed["counts"]["total_tokens"])

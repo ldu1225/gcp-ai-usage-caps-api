@@ -86,10 +86,11 @@ init_defaults() {
   KEEP_LOG_SINKS=0
   DRY_RUN=0
   PREFLIGHT_LANG="${CAPS_API_LANG:-ko}"
-  # v1.2: Vertex AI inference request metadata logging (token source of Vertex AI usage), enabled by prepare.sh on
+  # v1.2: Gemini Platform inference request metadata logging (token source of Gemini Platform usage), enabled by prepare.sh on
   # every project unless ENABLE_VERTEX_INFERENCE_LOGGING=false / --no-vertex-inference-logging.
   ENABLE_VERTEX_INFERENCE_LOGGING="${ENABLE_VERTEX_INFERENCE_LOGGING:-true}"
   VERTEX_LOGGING_ENDPOINT="${VERTEX_LOGGING_ENDPOINT:-https://aiplatform.googleapis.com/v1beta1}"
+  SERVICE_ACCOUNT_SUBJECTS="${SERVICE_ACCOUNT_SUBJECTS:-}"
   # Optional runtime settings passed to Cloud Run only when set (environment or flags).
   ENFORCEMENT_BACKEND="${ENFORCEMENT_BACKEND:-iam_deny}"
   CAP_SCOPE="${CAP_SCOPE:-}"
@@ -118,7 +119,7 @@ COMMON_FLAGS_HELP='Common options (accepted by prepare.sh, deploy.sh, install.sh
   --per-project-datasets        Legacy: a dataset in every project
   --reuse-dataset P:D           Adopt an existing dataset (no dataset is created)
   --reuse-sinks                 Adopt existing sinks detected by preflight instead of creating ours
-  --enable-data-access-logs     Merge Vertex AI DATA_READ/DATA_WRITE audit configs into every project (never clobbers)
+  --enable-data-access-logs     Merge Gemini Platform DATA_READ/DATA_WRITE audit configs into every project (never clobbers)
   --org-id ID                   Organization id (default: detected)
   --grant-org-roles             Grant org-level roles (Deny Admin/Reviewer, Org Policy Admin; folder/org roles)
   --deny-attachment projects|scope
@@ -128,7 +129,7 @@ COMMON_FLAGS_HELP='Common options (accepted by prepare.sh, deploy.sh, install.sh
   --worker-pool projects/P/locations/R/workerPools/W   --image IMAGE (prebuilt, skip build)
   --quota-contact-email EMAIL   Contact for quota increase requests
   --model-violation-action ACT  Default block_service
-  --no-vertex-inference-logging Do not enable Vertex AI inference request metadata logging (default: enabled on
+  --no-vertex-inference-logging Do not enable Gemini Platform inference request metadata logging (default: enabled on
                                 every project; env ENABLE_VERTEX_INFERENCE_LOGGING=false)
   --enforcement-backend iam_deny|notify_only   (env ENFORCEMENT_BACKEND, default iam_deny)
   --cap-scope total|per_project --metered-surfaces A,B --vertex-user-header-label L
@@ -513,7 +514,7 @@ ensure_aggregated_bq_sink() {
   fi
 }
 
-# ensure_pubsub_sink SOURCE_PROJECT: routes Antigravity inference_response and Vertex AI inference_request logs to the
+# ensure_pubsub_sink SOURCE_PROJECT: routes Antigravity inference_response and Gemini Platform inference_request logs to the
 # ONE hub topic (an existing sink is updated to the current filter).
 ensure_pubsub_sink() {
   local src="$1" dest writer
@@ -540,7 +541,7 @@ ensure_pubsub_sink() {
 enable_data_access_logs() {
   local project="$1" file changed attempt
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
-    echo "[dry-run] enable Vertex AI Data Access audit logs (ADMIN_READ, DATA_READ, DATA_WRITE) on ${project} (merge into existing auditConfigs)"
+    echo "[dry-run] enable Gemini Platform Data Access audit logs (ADMIN_READ, DATA_READ, DATA_WRITE) on ${project} (merge into existing auditConfigs)"
     return 0
   fi
   for attempt in 1 2 3 4; do
@@ -571,12 +572,12 @@ PYAUDIT
 )"
     if [[ "$changed" != "yes" ]]; then
       rm -f "$file"
-      info "${project}: Vertex AI Data Access audit logs already enabled"
+      info "${project}: Gemini Platform Data Access audit logs already enabled"
       return 0
     fi
     if gcloud projects set-iam-policy "$project" "$file" --quiet >/dev/null 2>&1; then
       rm -f "$file"
-      info "${project}: Vertex AI Data Access audit logs enabled (existing auditConfigs kept)"
+      info "${project}: Gemini Platform Data Access audit logs enabled (existing auditConfigs kept)"
       return 0
     fi
     rm -f "$file"
@@ -586,7 +587,7 @@ PYAUDIT
 }
 
 # ---------------------------------------------------------------------------
-# Vertex AI inference request metadata logging (aiplatform.googleapis.com/inference_request)
+# Gemini Platform inference request metadata logging (aiplatform.googleapis.com/inference_request)
 # ---------------------------------------------------------------------------
 # There is no gcloud command and no Terraform resource (hashicorp/terraform-provider-google#30642) for this setting:
 # it is the v1beta1 project-level PublisherModelConfig, written with setPublisherModelConfig and read with
@@ -596,10 +597,10 @@ VERTEX_READER_ROLE_ID="gcpAiCapsVertexLoggingReader"
 VERTEX_READER_PERMISSION="aiplatform.endpoints.fetchPublisherModelConfig"
 
 vertex_logging_cost_note() {
-  info "Cost note: every Vertex AI request then writes ONE small metadata entry (model, token counts, latency; no"
+  info "Cost note: every Gemini Platform request then writes ONE small metadata entry (model, token counts, latency; no"
   info "prompts/responses) to Cloud Logging in the project that served it. Cloud Logging ingestion/storage pricing"
   info "applies (_Default bucket, 30-day retention) plus the copy routed to BigQuery by ${AI_SINK:-the AI log sink}."
-  info "Disable with --no-vertex-inference-logging (Vertex AI token usage is then not measured)."
+  info "Disable with --no-vertex-inference-logging (Gemini Platform token usage is then not measured)."
 }
 
 # _csv_has LIST ITEM -> 0 when ITEM is in the comma-separated LIST
@@ -617,30 +618,30 @@ enable_vertex_inference_logging() {
     echo "[dry-run] ${manual}  # setPublisherModelConfig (409 = already enabled)"
     return 0
   fi
-  command -v curl >/dev/null || { warn "curl not found; enable Vertex AI inference logging on ${project} manually: ${manual}"; return 0; }
+  command -v curl >/dev/null || { warn "curl not found; enable Gemini Platform inference logging on ${project} manually: ${manual}"; return 0; }
   token="$(gcloud auth print-access-token 2>/dev/null || true)"
   [[ -n "$token" ]] || { warn "no access token (gcloud auth print-access-token); enable on ${project} manually: ${manual}"; return 0; }
   out="$(mktemp)"
   code="$(curl -sS -o "$out" -w '%{http_code}' --max-time 30 -H "Authorization: Bearer ${token}" "$fetch_url" 2>/dev/null || echo 000)"
   if [[ "$code" == "200" ]] && grep -Eq '"state"[[:space:]]*:[[:space:]]*"ENABLED"' "$out"; then
     rm -f "$out"
-    info "${project}: Vertex AI inference request metadata logging already ENABLED"
+    info "${project}: Gemini Platform inference request metadata logging already ENABLED"
     return 0
   fi
   code="$(curl -sS -o "$out" -w '%{http_code}' --max-time 60 -X POST -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" "$set_url" -d "$VERTEX_LOGGING_BODY" 2>/dev/null || echo 000)"
   case "$code" in
-    2??) info "${project}: Vertex AI inference request metadata logging ENABLED (effective within a few minutes)" ;;
-    409) info "${project}: Vertex AI inference request metadata logging already ENABLED (409)" ;;
+    2??) info "${project}: Gemini Platform inference request metadata logging ENABLED (effective within a few minutes)" ;;
+    409) info "${project}: Gemini Platform inference request metadata logging already ENABLED (409)" ;;
     *)
       if grep -Eq 'SERVICE_DISABLED|has not been used|it is disabled' "$out" 2>/dev/null; then
-        warn "${project}: aiplatform.googleapis.com is disabled (Vertex AI unused there); inference logging not enabled"
+        warn "${project}: aiplatform.googleapis.com is disabled (Gemini Platform unused there); inference logging not enabled"
       elif grep -Eq 'VPC Service Controls|SECURITY_POLICY_VIOLATED' "$out" 2>/dev/null; then
         warn "${project}: blocked by VPC Service Controls (aiplatform.googleapis.com); add an ingress rule for this caller, then: ${manual}"
       elif [[ "$code" == "403" ]]; then
         warn "${project}: permission denied (needs aiplatform.endpoints.setPublisherModelConfig, e.g. roles/aiplatform.admin); run: ${manual}"
       else
-        warn "${project}: could not enable Vertex AI inference logging (HTTP ${code}); run: ${manual}"
+        warn "${project}: could not enable Gemini Platform inference logging (HTTP ${code}); run: ${manual}"
       fi ;;
   esac
   rm -f "$out"
@@ -654,7 +655,7 @@ ensure_vertex_reader_role() {
   if ! probe gcloud iam roles describe "$VERTEX_READER_ROLE_ID" --project="$project"; then
     run_quiet gcloud iam roles create "$VERTEX_READER_ROLE_ID" --project="$project" \
       --title="GCP AI Caps Vertex logging reader" \
-      --description="Read Vertex AI inference request logging state (GCP AI Usage Caps API)" \
+      --description="Read Gemini Platform inference request logging state (GCP AI Usage Caps API)" \
       --permissions="$VERTEX_READER_PERMISSION" --stage=GA --quiet \
       || run_quiet gcloud iam roles undelete "$VERTEX_READER_ROLE_ID" --project="$project" --quiet \
       || { warn "could not create custom role ${VERTEX_READER_ROLE_ID} on ${project} (needs iam.roles.create); the vertex logging status shows as unreadable"; return 0; }
@@ -670,7 +671,7 @@ ensure_vertex_reader_org_role() {
   if ! probe gcloud iam roles describe "$VERTEX_READER_ROLE_ID" --organization="$org"; then
     run_quiet gcloud iam roles create "$VERTEX_READER_ROLE_ID" --organization="$org" \
       --title="GCP AI Caps Vertex logging reader" \
-      --description="Read Vertex AI inference request logging state (GCP AI Usage Caps API)" \
+      --description="Read Gemini Platform inference request logging state (GCP AI Usage Caps API)" \
       --permissions="$VERTEX_READER_PERMISSION" --stage=GA --quiet \
       || { warn "could not create organization custom role ${VERTEX_READER_ROLE_ID} on ${org} (needs roles/iam.organizationRoleAdmin)"; return 0; }
   fi

@@ -33,7 +33,7 @@ Usage:
 
 Installer options:
   --preflight-only          Only run the environment readiness check (nothing is created)
-  --prepare-only            Only enable APIs, create/adopt the dataset, sinks, Data Access logs and Vertex AI
+  --prepare-only            Only enable APIs, create/adopt the dataset, sinks, Data Access logs and Gemini Platform
                             inference request metadata logging (--no-vertex-inference-logging to skip it)
 
 Run scripts/prepare.sh --help for every common option (scope, datasets, adoption, VPC, org roles, ...).

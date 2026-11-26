@@ -7,7 +7,7 @@ import os
 import signal
 import sys
 
-from . import __version__, auth, config, timeutil
+from . import __version__, auth, config, identity, timeutil
 from .cache import TTLCache
 from .gcp import Gcp
 from .httpkit import ApiError, BaseHandler, Router, Server, now_iso, parse_json_object, parse_query
@@ -186,7 +186,7 @@ ROUTER.route("GET", "/v1/models/{model_id}/access", scope="models:read", rate="g
 ROUTER.route("GET", "/v1/usage/models", scope=("usage:read", "models:read"), range=True,
              rate="general")(model_registry.usage_by_model)
 
-# -- Model access policies (Vertex AI, Org Policy vertexai.allowedModels) -----
+# -- Model access policies (Gemini Platform, Org Policy vertexai.allowedModels) -----
 ROUTER.route("GET", "/v1/model-access", scope="models:read", rate="general")(model_access.list_policies)
 ROUTER.route("POST", "/v1/model-access/bulk-apply", scope="models:write", rate="enforce")(model_access.bulk_apply)
 ROUTER.route("POST", "/v1/model-access/reconcile", scope="models:write", rate="enforce")(model_access.reconcile_handler)
@@ -264,6 +264,10 @@ class App:
     def __init__(self, *, environ=None, cfg=None, gcp=None, store=None, verifier=None, webhook_sender=None):
         self.environ = os.environ if environ is None else environ
         self.config = cfg if cfg is not None else config.load_config(self.environ)
+        hub_cfg = self.config.get("hub") or {}
+        identity.configure(service_account_subjects=bool(hub_cfg.get("service_account_subjects")),
+                           protected=(hub_cfg.get("runtime_service_account"), hub_cfg.get("enforcer_service_account"),
+                                      auth.runtime_service_account(self.environ)))
         self.gcp = gcp if gcp is not None else Gcp()
         self.registry = SchemaRegistry(self.gcp)
         self.cache = TTLCache(1024)

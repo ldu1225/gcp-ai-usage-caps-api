@@ -4,7 +4,7 @@
   No app => `gemini_enterprise.available=false` (info, not a failure: GE features answer not_applicable).
 - Antigravity (AI developer tools): Discovery Engine v1alpha `devToolsConfig` in global/us/eu (+ configured locations)
   and recent `businessaicode.googleapis.com/inference_response` logs (Metadata logging on).
-- Vertex AI: aiplatform API state per project, and Model Garden publisher models reachability (global with regional
+- Gemini Platform: aiplatform API state per project, and Model Garden publisher models reachability (global with regional
   fallback) once per run.
 """
 
@@ -162,7 +162,7 @@ def antigravity(run, pid: str) -> tuple[list[dict], dict]:
 
 
 def gemini_platform(run, pid: str) -> tuple[dict, dict]:
-    title = ("Vertex AI 사용 가능", "Vertex AI available")
+    title = ("Gemini Platform 사용 가능", "Gemini Platform available")
     api = run.api_enabled(pid, "aiplatform.googleapis.com")
     if api is None:
         cap = {"available": None, "reason": "unknown", "apps": [], "locations": []}
@@ -171,7 +171,7 @@ def gemini_platform(run, pid: str) -> tuple[dict, dict]:
     if not api:
         cap = {"available": False, "reason": "api_disabled", "apps": [], "locations": []}
         return check("surface.gemini_platform", "surfaces", "info", *title,
-                     "aiplatform.googleapis.com is not enabled on %s: Vertex AI usage/model governance is not_applicable."
+                     "aiplatform.googleapis.com is not enabled on %s: Gemini Platform usage/model governance is not_applicable."
                      % pid, impact=["gemini_platform"], data=cap), cap
     locs = list(run.fact(run.hub, "vertex_locations") or ["global"])
     cap = {"available": True, "reason": "api_enabled", "apps": [], "locations": locs}
@@ -181,7 +181,7 @@ def gemini_platform(run, pid: str) -> tuple[dict, dict]:
 
 def vertex_models_check(run) -> dict:
     """surface.gemini_platform.models (cross-project): Model Garden publisher models reachable."""
-    title = ("Vertex AI 모델 카탈로그 접근", "Vertex AI model catalog reachable")
+    title = ("Gemini Platform 모델 카탈로그 접근", "Gemini Platform model catalog reachable")
     _, err = run.try_call("GET", "%s/v1beta1/publishers/google/models" % AIPLATFORM, params={"pageSize": 1})
     if err is None:
         run.set_fact(run.hub, "vertex_locations", ["global"])

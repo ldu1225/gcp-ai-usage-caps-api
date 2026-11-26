@@ -12,8 +12,8 @@
 # MANY managed projects (var.managed_projects; or folder/organization scope via var.scope_type/var.scope_ids):
 # - Log Router sinks (BigQuery -> central dataset, Pub/Sub -> hub topic), writer identities granted on the hub only
 # - least-privilege roles for the runtime and enforcer service accounts (or folder/org-level grants)
-# - optional Vertex AI Data Access audit logs (google_project_iam_audit_config)
-# - Vertex AI inference request metadata logging (var.enable_vertex_inference_logging, local-exec REST call) and the
+# - optional Gemini Platform Data Access audit logs (google_project_iam_audit_config)
+# - Gemini Platform inference request metadata logging (var.enable_vertex_inference_logging, local-exec REST call) and the
 #   one-permission custom role gcpAiCapsVertexLoggingReader for the runtime service account
 #
 # Existing resources are adopted instead of duplicated: var.reuse_dataset = "PROJECT:DATASET" reads the dataset with a
@@ -83,6 +83,7 @@ locals {
     "cloudquotas.googleapis.com",
     "monitoring.googleapis.com",
     "aiplatform.googleapis.com",
+    "cloudidentity.googleapis.com",
   ], var.spend_caps_enabled ? ["billingbudgets.googleapis.com"] : [])
 
   managed_apis = concat([
@@ -162,7 +163,7 @@ locals {
     "log_id(\"discoveryengine.googleapis.com/gen_ai_user_message\")",
   ])
 
-  # Real-time usage events: Antigravity inference responses + Vertex AI inference request metadata.
+  # Real-time usage events: Antigravity inference responses + Gemini Platform inference request metadata.
   realtime_filter = join(" OR ", [
     "log_id(\"businessaicode.googleapis.com/inference_response\")",
     "log_id(\"aiplatform.googleapis.com/inference_request\")",
@@ -210,6 +211,7 @@ locals {
     METERED_SURFACES              = join(",", var.metered_surfaces)
     MODEL_VIOLATION_BLOCK_SCOPE   = var.model_violation_block_scope
     VERTEX_LOGGING_ENDPOINT       = var.vertex_logging_endpoint
+    SERVICE_ACCOUNT_SUBJECTS      = var.service_account_subjects ? "true" : "false"
   }
 }
 
@@ -380,7 +382,7 @@ resource "google_bigquery_dataset_iam_member" "sink_writer" {
   member     = each.value.writer_identity
 }
 
-# Optional: Vertex AI Data Access audit logs in every project (per-user Vertex AI usage). This resource is
+# Optional: Gemini Platform Data Access audit logs in every project (per-user Gemini Platform usage). This resource is
 # authoritative for the aiplatform.googleapis.com audit config only; other services' configs are untouched.
 resource "google_project_iam_audit_config" "vertex_data_access" {
   for_each = var.enable_data_access_logs ? toset(local.sink_projects) : toset([])
@@ -397,8 +399,8 @@ resource "google_project_iam_audit_config" "vertex_data_access" {
   }
 }
 
-# Vertex AI inference request metadata logging (aiplatform.googleapis.com/inference_request): the only log-based
-# source of per-request Vertex AI token counts. There is NO native Terraform resource for the project-level
+# Gemini Platform inference request metadata logging (aiplatform.googleapis.com/inference_request): the only log-based
+# source of per-request Gemini Platform token counts. There is NO native Terraform resource for the project-level
 # PublisherModelConfig (hashicorp/terraform-provider-google#30642), so each project is enabled with the v1beta1
 # setPublisherModelConfig REST method through a local-exec (bash + curl on the machine running terraform; the access
 # token of the provider credentials is passed via the environment and never written to state). An identical write
@@ -428,11 +430,11 @@ resource "terraform_data" "vertex_inference_logging" {
         -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: application/json" "$SET_URL" \
         -d '{"publisherModelConfig":{"inferenceEventLoggingConfig":{"state":"ENABLED"}}}' || echo 000)"
       case "$code" in
-        2??) echo "$PROJECT: Vertex AI inference request metadata logging ENABLED" ;;
-        409) echo "$PROJECT: Vertex AI inference request metadata logging already ENABLED (409)" ;;
+        2??) echo "$PROJECT: Gemini Platform inference request metadata logging ENABLED" ;;
+        409) echo "$PROJECT: Gemini Platform inference request metadata logging already ENABLED (409)" ;;
         *)
           if grep -Eq 'SERVICE_DISABLED|has not been used|it is disabled' "$out"; then
-            echo "warning: $PROJECT: aiplatform.googleapis.com is disabled (Vertex AI unused); logging not enabled" >&2
+            echo "warning: $PROJECT: aiplatform.googleapis.com is disabled (Gemini Platform unused); logging not enabled" >&2
           else
             echo "error: $PROJECT: setPublisherModelConfig failed (HTTP $code): $(head -c 400 "$out")" >&2
             rm -f "$out"
@@ -452,7 +454,7 @@ resource "google_project_iam_custom_role" "vertex_logging_reader" {
   project     = each.value
   role_id     = local.vertex_logging_reader_role_id
   title       = "GCP AI Caps Vertex logging reader"
-  description = "Read Vertex AI inference request logging state (GCP AI Usage Caps API)"
+  description = "Read Gemini Platform inference request logging state (GCP AI Usage Caps API)"
   permissions = ["aiplatform.endpoints.fetchPublisherModelConfig"]
   stage       = "GA"
 }

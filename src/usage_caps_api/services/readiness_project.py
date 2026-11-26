@@ -32,8 +32,10 @@ HUB_APIS = (
     ("cloudquotas.googleapis.com", "required", ["quota_management"], "quota management (QuotaInfo/QuotaPreference)"),
     ("monitoring.googleapis.com", "required", ["quota_management"], "quota usage time series"),
     ("accesscontextmanager.googleapis.com", "optional", ["readiness"], "VPC Service Controls perimeter lookup"),
+    ("cloudidentity.googleapis.com", "optional", ["groups"],
+     "Google Group membership sync for groups (runtime SA needs the Workspace Groups Reader admin role)"),
     ("aiplatform.googleapis.com", "required", ["gemini_platform", "model_governance"],
-     "Vertex AI model catalog, inference request metadata logging & Data Access audit logs"),
+     "Gemini Platform model catalog, inference request metadata logging & Data Access audit logs"),
     ("discoveryengine.googleapis.com", "surface", ["gemini_enterprise"], "Gemini Enterprise apps"),
     ("businessaicode.googleapis.com", "surface", ["antigravity"], "Antigravity (AI developer tools)"),
 )
@@ -55,7 +57,7 @@ def managed_apis(run) -> tuple:
         ("bigquery.googleapis.com", "optional" if run.central else "required", ["usage"],
          "per-project audit dataset" if not run.central else "not needed with the central hub dataset"),
         ("aiplatform.googleapis.com", "surface", ["gemini_platform"],
-         "Vertex AI usage (inference request metadata logs)"),
+         "Gemini Platform usage (inference request metadata logs)"),
         ("discoveryengine.googleapis.com", "surface", ["gemini_enterprise"], "Gemini Enterprise apps"),
         ("businessaicode.googleapis.com", "surface", ["antigravity"], "Antigravity (AI developer tools)"),
     ]

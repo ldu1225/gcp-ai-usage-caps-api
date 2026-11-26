@@ -1,4 +1,4 @@
-"""Model access policies across every managed project (Vertex AI Model Garden via Organization Policy).
+"""Model access policies across every managed project (Gemini Platform Model Garden via Organization Policy).
 
 Mechanism: list constraint `constraints/vertexai.allowedModels` (Organization Policy API v2).
     GET    https://orgpolicy.googleapis.com/v2/{scope}/policies/vertexai.allowedModels
