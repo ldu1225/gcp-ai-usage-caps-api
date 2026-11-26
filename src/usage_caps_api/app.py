@@ -12,7 +12,7 @@ from .cache import TTLCache
 from .gcp import Gcp
 from .httpkit import ApiError, BaseHandler, Router, Server, now_iso, parse_json_object, parse_query
 from .schema import SchemaRegistry
-from .services import (audit, base as svc_base, caps, chargeback, model_access, model_registry, operations,
+from .services import (audit, base as svc_base, caps, chargeback, groups, model_access, model_registry, operations,
                        pricing_sync, quotas, readiness, spend_caps, surface_models, usage, usage_events,
                        user_model_rules, vertex_logging, webhooks)
 from .store import make_doc_store
@@ -131,6 +131,29 @@ ROUTER.route("POST", "/v1/users/{email}/block", scope="users:write", rate="write
 ROUTER.route("POST", "/v1/users/{email}/unblock", scope="users:write", rate="write")(caps.unblock_user)
 ROUTER.route("GET", "/v1/users/{email}/projects", scope="usage:read", range=True,
              rate="general")(usage.get_user_projects)
+
+# -- Groups (first-class policy subjects, same capabilities as users) ---------
+ROUTER.route("GET", "/v1/groups", scope=("caps:read", "users:write"), rate="general")(groups.list_groups)
+ROUTER.route("POST", "/v1/groups", scope="users:write", rate="write")(groups.create_group)
+ROUTER.route("GET", "/v1/groups/{group_id}", scope=("caps:read", "users:write"), rate="general")(groups.get_group)
+ROUTER.route("PATCH", "/v1/groups/{group_id}", scope="users:write", rate="write")(groups.patch_group)
+ROUTER.route("DELETE", "/v1/groups/{group_id}", scope="users:write", rate="write")(groups.delete_group)
+ROUTER.route("POST", "/v1/groups/{group_id}/members", scope="users:write", rate="write")(groups.update_members)
+ROUTER.route("POST", "/v1/groups/{group_id}/exclusions", scope="users:write", rate="write")(groups.update_exclusions)
+ROUTER.route("POST", "/v1/groups/{group_id}/sync", scope="users:write", rate="enforce")(groups.sync_group)
+ROUTER.route("POST", "/v1/groups/{group_id}/block", scope="users:write", rate="write")(groups.block_group)
+ROUTER.route("POST", "/v1/groups/{group_id}/unblock", scope="users:write", rate="write")(groups.unblock_group)
+ROUTER.route("GET", "/v1/groups/{group_id}/model-rules", scope="models:read", rate="general")(groups.get_group_model_rule)
+ROUTER.route("PUT", "/v1/groups/{group_id}/model-rules", scope="models:write", rate="write")(groups.put_group_model_rule)
+ROUTER.route("DELETE", "/v1/groups/{group_id}/model-rules", scope="models:write",
+             rate="write")(groups.delete_group_model_rule)
+ROUTER.route("GET", "/v1/caps/groups", scope="caps:read", rate="general")(groups.list_group_caps)
+ROUTER.route("GET", "/v1/caps/groups/{group_id}", scope="caps:read", rate="general")(groups.get_group_cap)
+ROUTER.route("PUT", "/v1/caps/groups/{group_id}", scope="caps:write", rate="write")(groups.put_group_cap)
+ROUTER.route("DELETE", "/v1/caps/groups/{group_id}", scope="caps:write", rate="write")(groups.delete_group_cap)
+ROUTER.route("GET", "/v1/usage/groups", scope="usage:read", range=True, rate="general")(groups.list_group_usage)
+ROUTER.route("GET", "/v1/usage/groups/{group_id}", scope="usage:read", range=True, rate="general")(groups.get_group_usage)
+ROUTER.route("GET", "/v1/users/{email}/groups", scope=("usage:read", "caps:read"), rate="general")(groups.get_user_groups)
 
 ROUTER.route("GET", "/v1/caps/projects", scope="caps:read", rate="general")(spend_caps.list_project_caps)
 ROUTER.route("PUT", "/v1/caps/projects/{project_id}", scope="caps:write", rate="write")(spend_caps.put_project_cap)
@@ -310,7 +333,7 @@ class App:
                 result = fn(ctx)
                 if isinstance(result, dict) and ctx.warnings:
                     result = dict(result, warnings=ctx.warnings)
-                created = path in ("/v1/admin/api-keys", "/v1/admin/webhooks") or (
+                created = path in ("/v1/admin/api-keys", "/v1/admin/webhooks", "/v1/groups") or (
                     path == "/v1/quota-requests" and isinstance(result, dict) and result.get("object") == "quota_request"
                     and result.get("status") != "dry_run" and not result.get("idempotent_replay"))
                 status = 201 if (method == "POST" and created) else 200

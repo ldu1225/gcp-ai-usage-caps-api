@@ -41,6 +41,11 @@ SUPPORTED_EVENTS = (
     "quota_request.created",
     "quota_request.updated",
     "readiness.degraded",
+    "group.cap_threshold_reached",
+    "group.cap_exceeded",
+    "group.blocked",
+    "group.unblocked",
+    "group.membership_changed",
 )
 SUPPORTED_EVENTS_SET = frozenset(SUPPORTED_EVENTS)
 MAX_WEBHOOKS = 50

@@ -1,4 +1,4 @@
-"""Model catalog: OpenAI / Anthropic style `GET /v1/models` and `GET /v1/models/{model_id}` - fully dynamic.
+"""Model catalog: admin-API style `GET /v1/models` and `GET /v1/models/{model_id}` - fully dynamic.
 
 There is NO built-in model list. The catalog is the union of:
   1. Live Vertex AI Model Garden discovery (v1beta1 `publishers/{publisher}/models`) for every configured publisher

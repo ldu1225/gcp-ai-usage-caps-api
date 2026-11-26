@@ -289,6 +289,27 @@ def handle_usage_event(ctx) -> dict:
                         limit=p_lim, project=item["project"])
         over_any = over_any or bool(p_over)
 
+    # 3) Shared group pools the person belongs to (pooled usage of all members + this request)
+    for gid, pool in sorted((internal.get("group_pools") or {}).items()):
+        if person not in set(pool.get("members") or ()) or pool.get("scope") != "total":
+            continue
+        g_lim = pool.get("limit") or {}
+        g_cost_raw = (pool.get("usage") or {}).get("estimated_cost")
+        g_cost = None if g_cost_raw is None else round(float(g_cost_raw) + float(added_cost or 0.0), 6)
+        g_over, g_ratio, _ = caps_svc.cap_check(
+            int((pool.get("usage") or {}).get("total_tokens") or 0) + added["total_tokens"],
+            int((pool.get("usage") or {}).get("requests") or 0) + added["requests"],
+            int(g_lim.get("token_cap") or 0), int(g_lim.get("request_cap") or 0), g_cost,
+            float(g_lim.get("cost_cap") or 0.0))
+        if g_ratio is not None:
+            for thr in thresholds:
+                if g_ratio * 100.0 >= thr:
+                    webhooks.notify_once(ctx, "%s|%s|%d" % (gid, win["start_iso"] or "all", thr),
+                                         "group.cap_exceeded" if thr >= 100 else "group.cap_threshold_reached",
+                                         {"group": gid, "threshold_pct": thr, "utilization_pct": round(g_ratio * 100, 2),
+                                          "limit": g_lim, "period_start": win["start_iso"], "trigger": "usage_event"})
+        over_any = over_any or bool(g_over)
+
     if not over_any:
         return _ack("under_cap")
     if (policy.get("enforcement_mode") or "manual") != "auto":

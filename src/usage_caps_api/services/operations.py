@@ -5,7 +5,7 @@ Google Cloud applies several governance changes asynchronously:
   * IAM Deny v2 policies: typically 1-2 minutes (eventually consistent).
   * Cloud Quotas preferences: decreases are applied quickly; increases may need Google review (hours to days).
 
-Every such write returns an `operation` object (OpenAI/Anthropic "batch" style polling): GET /v1/operations/{id}.
+Every such write returns an `operation` object (long-running operation polling): GET /v1/operations/{id}.
 """
 
 from __future__ import annotations

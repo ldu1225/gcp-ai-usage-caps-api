@@ -1,6 +1,7 @@
 """Scheduled governance cycle run after every spend-cap enforcement cycle (Cloud Run Enforcer Job / API).
 
 Steps (each isolated; one failure never stops the others):
+  0. Google Group membership sync (hourly, Cloud Identity API).
   1. Per-user model rules safety net (detect disallowed model use / exceeded per-model limits -> block + notify).
   2. Quota request status refresh (pending -> approved / partially_approved / denied) + webhooks.
   3. Rate-limit headroom thresholds (hourly) -> `rate_limit.threshold_reached` webhooks.
@@ -37,11 +38,12 @@ def _step(name: str, fn) -> dict:
 
 
 def run(ctx, *, dry_run: bool = False, trigger: str = "scheduler") -> dict:
-    from . import model_access, quotas, user_model_rules
+    from . import groups, model_access, quotas, user_model_rules
     out = {"model_rules": _step("model_rules", lambda: user_model_rules.evaluate_all(ctx, dry_run=dry_run,
                                                                                      trigger=trigger))}
     if dry_run:
         return out
+    out["group_sync"] = _step("group_sync", lambda: groups.sync_all(ctx))
     out["quota_requests"] = _step("quota_requests", lambda: quotas.refresh_pending(ctx))
     out["rate_limit_thresholds"] = _step("rate_limit_thresholds", lambda: quotas.check_thresholds(ctx))
     out["project_caps"] = _step("project_caps", lambda: notify_enforced_project_caps(ctx))

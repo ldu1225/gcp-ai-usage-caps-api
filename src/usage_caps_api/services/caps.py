@@ -20,7 +20,7 @@ import threading
 from .. import config, identity, timeutil
 from ..gcp import GcpError
 from ..httpkit import ApiError, now_iso, paginate_list
-from . import audit, enforcers, pricing as pricing_svc, usage as usage_svc, webhooks
+from . import audit, enforcers, groups as groups_svc, pricing as pricing_svc, usage as usage_svc, webhooks
 from .base import iso, to_int
 
 LOG = logging.getLogger("usage_caps_api.caps")
@@ -535,13 +535,20 @@ def _norm_rec(rec):
 
 
 def _load_user_caps_state(ctx) -> dict:
+    """User-caps state with group rules / blocks materialized per effective member (see services/groups.py)."""
     doc, _ = ctx.store.load(USER_CAPS_DOC)
-    doc = dict(doc)
-    for section in ("rules", "blocks"):
+    return groups_svc.expand_state(ctx, _state_from_doc(doc))
+
+
+def _state_from_doc(doc: dict) -> dict:
+    doc = dict(doc or {})
+    for section in ("rules", "blocks", "group_rules", "group_blocks"):
         doc[section] = {k: _norm_rec(v) for k, v in (doc.get(section) or {}).items()}
     return {
         "rules": dict(doc.get("rules") or {}),
         "blocks": dict(doc.get("blocks") or {}),
+        "group_rules": dict(doc.get("group_rules") or {}),
+        "group_blocks": dict(doc.get("group_blocks") or {}),
         "suspensions": dict(doc.get("suspensions") or {}),
         "last_run": doc.get("last_run"),
         "usage_events": doc.get("usage_events"),
@@ -627,9 +634,13 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
     active_rules = {em: r for em, r in state["rules"].items() if isinstance(r, dict) and not _rule_expired(r, now)}
     active_blocks = {em: b for em, b in state["blocks"].items() if isinstance(b, dict) and not _rule_expired(b, now)}
     suspensions = state["suspensions"]
+    member_of = state.get("_membership") or {}
+    pools = groups_svc.pool_status(state, usage_res, pricing, policy, cap_check, pricing_svc.estimate_cost)
+    pool_people = {p for pool in pools.values() for p in pool["members"]}
 
     all_people = sorted(set(usage_res.users.keys()) | set(active_rules.keys()) | set(active_blocks.keys()) |
-                        set(suspensions.keys()) | set(deny_by_person.keys()) | set(deny_projects.keys()))
+                        set(suspensions.keys()) | set(deny_by_person.keys()) | set(deny_projects.keys()) |
+                        pool_people)
     def_cost = float(policy.get("cost_cap") or 0.0)
     def_tok = int(policy.get("token_cap") or 0)
     def_req = int(policy.get("request_cap") or 0)
@@ -727,6 +738,24 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
                 "blocked_services": p_blocked,
             })
 
+        # Shared group pools: pooled usage of all effective members against the group cap.
+        pool_tags: list[str] = []
+        if usage_res.ok and not (rule and rule.get("type") == "allow"):
+            for gid in member_of.get(email, []):
+                pool = pools.get(gid)
+                if not pool:
+                    continue
+                if pool["over_all"]:
+                    over_t = True
+                    pool_tags.append("group:" + gid)
+                elif pool["over_projects"]:
+                    for p in pool["over_projects"]:
+                        if p not in over_projects:
+                            over_projects.append(p)
+                    pool_tags.append("group:" + gid)
+                if pool["utilization_pct"] is not None:
+                    ratios.append(pool["utilization_pct"] / 100.0)
+
         if not usage_res.ok:
             over = None
         else:
@@ -774,7 +803,7 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
             "status": status,
             "status_scope": status_scope,
             "block_source": ((mblock or {}).get("source") or "manual") if mblock else
-                            ("rule" if (rule and rule.get("type") == "block") else
+                            (((rule or {}).get("source") or "rule") if (rule and rule.get("type") == "block") else
                              ("auto_cap" if status == "suspended" else None)),
             "expired_block": bool(raw_block and _rule_expired(raw_block, now) and not mblock),
             "blocked_services": blocked_svcs,
@@ -782,8 +811,9 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
             "block_in_sync": (_block_in_sync(block_src, def_svcs, blocked_global, blocked_projects_raw)
                               if (block_src and backend == "iam_deny") else True),
             "over_cap": over,
-            "over_cap_reasons": reasons if over_t else sorted({r for pr_ in project_rows if pr_["over_cap"]
-                                                              for r in pr_["over_cap_reasons"]}),
+            "over_cap_reasons": (list(reasons) if over_t else sorted({r for pr_ in project_rows if pr_["over_cap"]
+                                                                      for r in pr_["over_cap_reasons"]})) +
+                                [t for t in pool_tags if t not in reasons],
             "over_scope": over_scope,
             "utilization_pct": util_pct,
             "cap_scope": scope,
@@ -796,6 +826,9 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
             "multi_project": sum(1 for pr_ in project_rows if pr_["usage"]["requests"]) > 1,
             "restore_at": restore_at,
             "rule": rule,
+            "rule_source": (rule or {}).get("source") or ("user" if rule else "policy"),
+            "groups": list(member_of.get(email, [])),
+            "group_pools": [g for g in member_of.get(email, []) if g in pools],
             "manual_block": mblock,
             "suspension": susp,
         })
@@ -826,6 +859,7 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
             "timezone": win["timezone"],
         },
         "users": rows,
+        "group_pools": [{k: v for k, v in pool.items() if k != "members"} for _, pool in sorted(pools.items())],
         "gates": gates,
         "plan": plan,
         "last_run": state.get("last_run"),
@@ -838,6 +872,7 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
         "pricing": pricing,
         "deny_state": deny_state,
         "state": state,
+        "group_pools": pools,
     }
     return payload, internal
 
@@ -1016,18 +1051,24 @@ def _desired_by_attachment(ctx, policy: dict, state: dict, deny_state: enforcers
                            usage_res: usage_svc.UsageResult | None = None,
                            add_suspensions: list[str] = (), suspend_projects: dict | None = None,
                            add_blocks: list[str] = (), restores: list[str] = (),
-                           restore_projects: dict | None = None) -> dict[str, dict[str, frozenset[str]]]:
+                           restore_projects: dict | None = None,
+                           group_restores: dict | None = None) -> dict[str, dict[str, frozenset[str]]]:
     """Computes desired {attachment_point: {deny_principal_uri: frozenset(services)}} for IAM Deny v2.
 
     Global entries (projects=None) apply to every scope attachment point; project-scoped entries apply only to the
-    `projects/{id}` attachment point of the listed projects."""
+    `projects/{id}` attachment point of the listed projects. Group policies are expanded per member first.
+    `group_restores` ({person: {group ids}}) lifts entries caused by those groups (unblock, member removal,
+    exclusion) while re-applying the person's own blocks, rules and suspensions."""
     now = utcnow()
+    state = groups_svc.expand_state(ctx, state, now)
     def_svcs = frozenset(policy.get("default_block_services") or config.VALID_SERVICES)
     rules = {em: r for em, r in (state.get("rules") or {}).items() if isinstance(r, dict) and not _rule_expired(r, now)}
     blocks = {em: b for em, b in (state.get("blocks") or {}).items() if isinstance(b, dict) and not _rule_expired(b, now)}
+    suspensions = state.get("suspensions") or {}
     logged_principals = (usage_res.principals if usage_res is not None else {}) or {}
     suspend_projects = suspend_projects or {}
     restore_projects = restore_projects or {}
+    group_restores = group_restores or {}
     scope_aps = set(enforcers.attachment_points(ctx))
     aps = [st.attachment for st in deny_state.attachments]
 
@@ -1036,6 +1077,15 @@ def _desired_by_attachment(ctx, policy: dict, state: dict, deny_state: enforcers
             return ap in scope_aps
         pid = enforcers.attachment_project(ap)
         return pid is not None and pid in projects
+
+    def own_suspension(em: str, lifted: set) -> dict | None:
+        susp = suspensions.get(em)
+        if not isinstance(susp, dict) or _suspension_ended(susp, now):
+            return None
+        reasons = [r for r in (susp.get("reasons") or []) if isinstance(r, str)]
+        if reasons and all(r.startswith("group:") and r[6:] in lifted for r in reasons):
+            return None
+        return susp
 
     current: dict[str, dict[str, set[str]]] = {
         ap: {em: set(svcs) for em, svcs in deny_state.services_at(ap).items()} for ap in aps}
@@ -1046,6 +1096,11 @@ def _desired_by_attachment(ctx, policy: dict, state: dict, deny_state: enforcers
         for em, projs in restore_projects.items():
             if applies(ap, projs):
                 cur.pop(em, None)
+        for em, lifted in group_restores.items():
+            cur.pop(em, None)
+            susp = own_suspension(em, set(lifted or ()))
+            if susp is not None and applies(ap, susp.get("projects")):
+                cur[em] = set((rules.get(em) or {}).get("services") or def_svcs)
         for em in add_suspensions:
             if applies(ap, suspend_projects.get(em)):
                 rule = rules.get(em) or {}
@@ -1238,8 +1293,14 @@ def unblock_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) 
                 ctx, policy, doc, deny_client=deny_client,
                 force_unblock=email if not remaining_holder["any"] else None,
             )
+        expanded = _load_user_caps_state(ctx)
+        group_left = []
+        for src in (expanded["blocks"].get(email), expanded["rules"].get(email)):
+            if isinstance(src, dict) and str(src.get("source") or "").startswith("group:") and \
+                    (src is expanded["blocks"].get(email) or src.get("type") == "block"):
+                group_left.append(src["source"][6:])
 
-    status = "blocked" if remaining_holder["any"] else "active"
+    status = "blocked" if (remaining_holder["any"] or group_left) else "active"
     audit.write_audit(ctx, "user.unblocked", target=email,
                       details={"unblocked_services": target_services or list(config.VALID_SERVICES),
                                "unblocked_projects": target_projects or "all",
@@ -1259,6 +1320,9 @@ def unblock_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) 
         "blocked_services": remaining_holder["services"],
         "blocked_projects": remaining_holder["projects"] if remaining_holder["any"] else None,
         "unblocked_projects": target_projects,
+        "remaining_group_blocks": group_left,
+        "hint": ("Still blocked by group policy %s. Add the user to POST /v1/groups/{group_id}/exclusions, remove "
+                 "the user from the group, or unblock the group." % ", ".join(group_left)) if group_left else None,
         "reason": reason or None,
         "enforcement": enforcement,
     }
@@ -1267,7 +1331,9 @@ def unblock_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) 
 def _reconcile_direct_change(ctx, policy: dict, state_doc: dict, *,
                              deny_client: enforcers.DenyPolicyClient | None = None,
                              force_unblock: str | None = None,
-                             restore_projects: dict | None = None) -> dict:
+                             restore_projects: dict | None = None,
+                             group_restores: dict | None = None) -> dict:
+    state_doc = groups_svc.expand_state(ctx, _state_from_doc(state_doc))
     backend = policy.get("enforcement_backend") or "iam_deny"
     breakglass = force_unblock or restore_projects
     if backend == "notify_only" and not breakglass:
@@ -1319,6 +1385,7 @@ def _reconcile_direct_change(ctx, policy: dict, state_doc: dict, *,
         ctx, policy, state_doc, deny_state,
         restores=[force_unblock] if force_unblock else (),
         restore_projects=restore_projects,
+        group_restores=group_restores,
     )
     res = enforcers.apply(ctx, deny_state, {}, dry_run=False, client=deny_client, per_attachment=per_ap)
     return {
@@ -1350,6 +1417,16 @@ def enforce_cycle(ctx, *, trigger: str = "api", dry_run: bool = False,
         # 1. Threshold webhooks (80%, 100%, ...) — evaluated even in manual mode!
         thresholds = sorted(int(t) for t in (policy.get("webhook_thresholds") or [80, 100]))
         if not dry_run:
+            for gid, pool in sorted((internal.get("group_pools") or {}).items()):
+                pct = pool.get("utilization_pct")
+                for thr in thresholds:
+                    if pct is not None and pct >= thr:
+                        webhooks.notify_once(
+                            ctx, "%s|%s|%d" % (gid, win["start_iso"] or "all", thr),
+                            "group.cap_exceeded" if thr >= 100 else "group.cap_threshold_reached",
+                            {"group": gid, "threshold_pct": thr, "utilization_pct": pct, "usage": pool["usage"],
+                             "limit": pool["limit"], "over_projects": pool["over_projects"],
+                             "member_count": pool["member_count"], "period_start": win["start_iso"]})
             for u in payload["users"]:
                 if (u.get("rule") or {}).get("type") == "allow":
                     continue

@@ -13,7 +13,7 @@ support wildcards and is limited to 500 values, so this API stores the customer'
 `<family>-*`) and expands it against the model catalog at write time; `POST /v1/model-access/reconcile` (also run by
 the scheduled enforcer) re-expands intents when new model versions appear.
 
-OpenAI analogue: project model permissions (allow_list / deny_list). Differences: GCP enforces per project/folder/org
+Admin-API analogue: project model permissions (allow_list / deny_list). Differences: GCP enforces per project/folder/org
 (not per user), propagation takes minutes, and Gemini Enterprise / Antigravity have separate surface controls.
 """
 

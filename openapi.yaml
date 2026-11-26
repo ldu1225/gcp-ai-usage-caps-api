@@ -1,10 +1,11 @@
 openapi: 3.1.0
 info:
   title: GCP AI Usage & Spend Caps API
-  version: 1.2.0
+  version: 1.3.0
   description: |
     Headless M2M REST API for enterprise AI management portals to query per-user Google Cloud AI
-    usage & estimated costs (Antigravity, Vertex AI / Agent Platform, Gemini Enterprise) and
+    usage & estimated costs (Antigravity, Gemini Platform - Gemini Enterprise Agent Platform, formerly Gemini Platform -,
+    Gemini Enterprise) and
     enforce user-level and project-level Spend Caps via IAM Deny v2 and Cloud Billing Spend Caps.
 
     ### Authentication
@@ -14,20 +15,22 @@ info:
     - **GCP Service Account OIDC**: `Authorization: Bearer <RS256 Google OIDC ID Token>` with
       audience matching `PUBLIC_BASE_URL` (used by Cloud Scheduler, Pub/Sub push, and internal GCP callers).
 
-    ### Operational Notes vs OpenAI / Anthropic Admin APIs
+    ### Operational Notes (differences from other AI vendor admin APIs)
     - **IAM Deny v2 Propagation**: Block/unblock changes are eventually consistent and typically
       take **1-2 minutes** to propagate across Google Cloud (requests already in flight complete).
     - **Cost Measurement (no Billing Export)**: per-user cost = token counts from logs (Antigravity
-      inference logs, Vertex AI inference request metadata logs, Gemini Enterprise activity) x official
+      inference logs, Gemini Platform inference request metadata logs, Gemini Enterprise activity) x official
       Cloud Billing Catalog SKU prices (input / output incl. thinking / cached / cache-write, long-context,
       Flex / Priority / Batch tiers) or contract overrides. The Cloud Billing export is never read; amounts
       are list-price estimates (credits, CUDs and taxes excluded). See `GET /v1/pricing`.
-    - **Vertex AI per-user attribution**: Vertex AI inference logs carry only a service-account principal.
+    - **Gemini Platform per-user attribution**: Gemini Platform (formerly Gemini Platform) inference logs carry only a service-account principal.
       Portals should send the header `x-goog-agent-platform-observability-label-user: <email|uid>`; otherwise
       tokens are split across same-minute Data Access audit callers, and anything left is reported as
       project-level `unattributed` usage (never dropped).
     - **Dynamic models**: there is no built-in model list. `GET /v1/models` = live Model Garden + every model
       observed in logs; new models trigger the `model.first_seen` webhook.
+    - **Groups**: groups have the same capabilities as users (caps per member or as a shared pool, block,
+      exceptions, model rules, usage). Resolution order: user > group (priority) > global policy.
     - **Multi-project users**: usage, caps (`cap_scope`, `project_caps`, `project_defaults`) and blocks
       (`projects: [...]`) work per (user, project); one hub governs every managed project.
     - **Project Spend Cap Lift**: Lifting an `ENFORCED` Google Cloud Billing Spend Cap takes up to
@@ -46,6 +49,8 @@ tags:
   - name: Usage & Billing
   - name: Spend Caps
   - name: User Block / Unblock
+  - name: Groups
+    description: Groups are policy subjects with the same capabilities as users (caps, blocks, exceptions, model rules, usage).
   - name: Project Spend Caps
   - name: Audit
   - name: Internal
@@ -210,7 +215,7 @@ paths:
         Requires scope `usage:read`. Log token counts x official SKU prices (no Billing Export). One fact per
         (user, project) - users assigned to several projects are split per project. Uses integer-cent exact
         allocation (largest remainder) so per-user, per-project, and grand totals always agree to the cent.
-        Vertex AI usage without a person is listed per project under `unattributed`.
+        Gemini Platform usage without a person is listed per project under `unattributed`.
       parameters:
         - name: month
           in: query
@@ -472,6 +477,312 @@ paths:
         "200":
           description: Enforcement run outcome including safety gates G1-G7 and execution plan
 
+  # ---------------------------------------------------------------------------
+  # Groups: first-class policy subjects (same capabilities as users)
+  # ---------------------------------------------------------------------------
+  /v1/groups:
+    get:
+      tags: [Groups]
+      summary: List groups (ordered by priority)
+      description: |
+        Requires `caps:read` or `users:write`. A group is a set of people: explicit `members` plus members synced
+        from a Google Group (`google_group`, Cloud Identity API), minus `excluded` people. Policy resolution order is
+        user rule > group rule (lowest `priority`, then id) > global policy / default rule.
+      parameters:
+        - { name: member, in: query, schema: { type: string }, description: Only groups whose effective members include this person }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Cursor" }
+      responses:
+        "200":
+          description: Groups
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/ListEnvelope" }
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/Group" } }
+    post:
+      tags: [Groups]
+      summary: Create a group
+      description: Requires `users:write`. When `google_group` is set, members are synced immediately and hourly.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GroupInput" }
+      responses:
+        "201": { description: Created group, content: { application/json: { schema: { $ref: "#/components/schemas/Group" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /v1/groups/{group_id}:
+    get:
+      tags: [Groups]
+      summary: Get a group with its cap rule, block and model rule
+      description: Requires `caps:read` or `users:write`.
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      responses:
+        "200": { description: Group, content: { application/json: { schema: { $ref: "#/components/schemas/Group" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [Groups]
+      summary: Update group attributes (members / excluded replace the whole list)
+      description: |
+        Requires `users:write`. Membership changes are applied to IAM Deny immediately when the group carries an
+        enforced policy (block, block/allow rule or shared pool): removed members are restored, new members blocked.
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GroupInput" }
+      responses:
+        "200": { description: Updated group, content: { application/json: { schema: { $ref: "#/components/schemas/Group" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [Groups]
+      summary: Delete a group and every group policy (caps, block, model rule)
+      description: Requires `users:write`. Group-derived blocks and pool suspensions are lifted for all members.
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      responses:
+        "200": { description: Deleted }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/groups/{group_id}/members:
+    post:
+      tags: [Groups]
+      summary: Add or remove explicit members
+      description: Requires `users:write`. Emits `group.membership_changed`.
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PeopleDelta" }
+      responses:
+        "200": { description: "Updated group incl. effective_added, effective_removed and enforcement" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /v1/groups/{group_id}/exclusions:
+    post:
+      tags: [Groups]
+      summary: Add or remove exceptions (people the group policy never applies to)
+      description: |
+        Requires `users:write`. Excluded people are removed from the effective membership even if they are explicit
+        members or members of the synced Google Group. Excluding a blocked or pool-suspended member restores access
+        immediately (the person's own user-level blocks and caps still apply).
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PeopleDelta" }
+      responses:
+        "200": { description: Updated group }
+
+  /v1/groups/{group_id}/sync:
+    post:
+      tags: [Groups]
+      summary: Sync members from the linked Google Group now
+      description: |
+        Requires `users:write`. Uses Cloud Identity `groups:lookup` and `memberships:searchTransitiveMemberships`
+        (nested groups resolved; service accounts ignored). Needs the Cloud Identity API and the runtime service
+        account in the Google Workspace "Groups Reader" admin role. Runs hourly in the governance cycle.
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      responses:
+        "200":
+          description: Sync result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  synced: { type: boolean }
+                  members: { type: integer }
+                  added: { type: array, items: { type: string } }
+                  removed: { type: array, items: { type: string } }
+                  error: { type: string }
+                  hint: { type: string }
+
+  /v1/groups/{group_id}/block:
+    post:
+      tags: [Groups]
+      summary: Block every effective member (IAM Deny v2)
+      description: |
+        Requires `users:write`. Applies to all managed projects or only `projects`. Members with a user-level `allow`
+        rule are not affected; members with their own block keep it. New members are blocked as soon as they join.
+        Changes propagate within ~1-2 minutes. Emits `group.blocked`.
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                services: { type: array, items: { $ref: "#/components/schemas/Surface" } }
+                projects: { type: array, items: { type: string } }
+                reason: { type: string, maxLength: 200 }
+                until: { type: ["string", "null"], format: date-time }
+      responses:
+        "200":
+          description: Group block applied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [group_block] }
+                  group: { type: string }
+                  members_blocked: { type: array, items: { type: string } }
+                  members_not_affected: { type: array, items: { type: string } }
+                  enforcement: { type: object }
+
+  /v1/groups/{group_id}/unblock:
+    post:
+      tags: [Groups]
+      summary: Lift the group block (and a type=block group cap rule)
+      description: |
+        Requires `users:write`. Members are restored unless they still have their own block, another group's block
+        or an active personal suspension (`members_still_blocked`). Emits `group.unblocked`.
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { reason: { type: string } } }
+      responses:
+        "200": { description: Group unblocked }
+
+  /v1/groups/{group_id}/model-rules:
+    get:
+      tags: [Groups, Model Rules]
+      summary: Get the group model rule
+      description: Requires `models:read`.
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      responses:
+        "200": { description: Group model rule (null when none) }
+    put:
+      tags: [Groups, Model Rules]
+      summary: Set the group model rule (allow/deny list, per-model limits, on_violation)
+      description: |
+        Requires `models:write`. Same body as `PUT /v1/users/{email}/model-rules`. Resolution: user rule > group rule
+        (priority) > default rule; `mode: inherit` keeps the base list and overrides only limits and actions.
+        Violations by members are blocked (default) and always notified via `user.model_violation`.
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200": { description: Saved group model rule }
+    delete:
+      tags: [Groups, Model Rules]
+      summary: Delete the group model rule
+      description: Requires `models:write`.
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      responses:
+        "200": { description: Deleted }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/caps/groups:
+    get:
+      tags: [Groups, Spend Caps]
+      summary: List group spend caps with pooled usage, utilization and member status counts
+      description: Requires `caps:read`.
+      parameters:
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Cursor" }
+      responses:
+        "200":
+          description: Group caps
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/ListEnvelope" }
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/GroupCap" } }
+
+  /v1/caps/groups/{group_id}:
+    get:
+      tags: [Groups, Spend Caps]
+      summary: Get one group's spend cap status
+      description: Requires `caps:read`.
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      responses:
+        "200": { description: Group cap, content: { application/json: { schema: { $ref: "#/components/schemas/GroupCap" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [Groups, Spend Caps]
+      summary: Set the group spend cap (per-member or shared pool) or an allow/block override
+      description: |
+        Requires `caps:write`.
+        - `pool: per_member` - every member without a user rule gets this cap individually.
+        - `pool: shared` - one budget for the pooled usage of all effective members; when it is reached every member
+          (except user-level `allow`) is suspended in all managed projects (`scope: total`) or only in the over-cap
+          projects (`scope: per_project` / `project_caps`). Each member's own cap still applies in addition.
+        - `type: allow` / `type: block` - group-wide override (a user rule still wins).
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GroupCapRule" }
+      responses:
+        "200": { description: Saved group cap rule }
+        "400": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [Groups, Spend Caps]
+      summary: Remove the group spend cap (members fall back to their own rule or the global policy)
+      description: Requires `caps:write`.
+      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      responses:
+        "200": { description: Deleted }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/usage/groups:
+    get:
+      tags: [Groups, Usage & Billing]
+      summary: Usage and estimated cost rolled up per group
+      description: Requires `usage:read`. Same counters, model / surface / project breakdown as `/v1/usage/users`.
+      parameters:
+        - { $ref: "#/components/parameters/Start" }
+        - { $ref: "#/components/parameters/End" }
+        - { name: surface, in: query, schema: { type: string, enum: [all, antigravity, gemini_platform, gemini_enterprise] } }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Cursor" }
+      responses:
+        "200": { description: Group usage rows }
+
+  /v1/usage/groups/{group_id}:
+    get:
+      tags: [Groups, Usage & Billing]
+      summary: Usage of one group with per-member ranking and daily time series
+      description: Requires `usage:read`.
+      parameters:
+        - { $ref: "#/components/parameters/GroupId" }
+        - { $ref: "#/components/parameters/Start" }
+        - { $ref: "#/components/parameters/End" }
+        - { name: surface, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Group usage }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/users/{email}/groups:
+    get:
+      tags: [Groups]
+      summary: Groups of a person and the resulting policy sources
+      description: |
+        Requires `usage:read` or `caps:read`. Returns effective groups (priority order), groups the person is
+        excluded from, and which subject currently drives the cap rule, block and model rule
+        (`user`, `group:<id>`, `policy` / `default`).
+      parameters: [{ $ref: "#/components/parameters/Email" }]
+      responses:
+        "200": { description: User groups }
+
   /v1/caps/projects:
     get:
       tags: [Project Spend Caps]
@@ -663,6 +974,11 @@ paths:
                       - quota_request.created
                       - quota_request.updated
                       - readiness.degraded
+                      - group.cap_threshold_reached
+                      - group.cap_exceeded
+                      - group.blocked
+                      - group.unblocked
+                      - group.membership_changed
                 enabled: { type: boolean, default: true }
       responses:
         "201":
@@ -688,9 +1004,9 @@ paths:
   /v1/models:
     get:
       tags: [Models]
-      summary: List models (OpenAI/Anthropic-style model list)
+      summary: List models (dynamic model catalog)
       description: |
-        Requires `models:read`. No built-in model list: catalog = live Vertex AI Model Garden discovery (configured
+        Requires `models:read`. No built-in model list: catalog = live Gemini Platform Model Garden discovery (configured
         publishers + every publisher seen in logs; delisted models kept with `delisted_at`) + every model observed in
         usage logs on any surface (`source=observed`, with first/last seen, surfaces, projects, users) + official SKU
         pricing + lifecycle. `include=access` adds the per-surface access decision for `project`; `include=usage`
@@ -737,7 +1053,7 @@ paths:
       summary: Retrieve a model with access decisions for every managed project
       description: |
         Requires `models:read`. `model_id` is a Model Garden / log model id (see `GET /v1/models`); pass
-        `?publisher=` when ambiguous. `access_by_project` shows Vertex AI (Org Policy), Gemini Enterprise (per app)
+        `?publisher=` when ambiguous. `access_by_project` shows Gemini Platform (Org Policy), Gemini Enterprise (per app)
         and Antigravity (per location, read-only) decisions.
       parameters:
         - $ref: "#/components/parameters/ModelId"
@@ -765,7 +1081,7 @@ paths:
       description: |
         Requires `usage:read` or `models:read`. Every model seen in any log is listed (including models not in Model
         Garden, `catalog_status=observed_only`). Optional `group_by=user|project|surface|traffic` breakdown;
-        unattributed Vertex AI usage is included per model.
+        unattributed Gemini Platform usage is included per model.
       parameters:
         - $ref: "#/components/parameters/Start"
         - $ref: "#/components/parameters/End"
@@ -781,7 +1097,7 @@ paths:
         default: { $ref: "#/components/responses/Error" }
 
   # ===========================================================================
-  # Model access policies (Vertex AI Model Garden via Org Policy vertexai.allowedModels)
+  # Model access policies (Gemini Platform Model Garden via Org Policy vertexai.allowedModels)
   # ===========================================================================
   /v1/model-access:
     get:
@@ -1240,7 +1556,7 @@ paths:
         Requires `admin`. Exhaustive checks: project/billing, APIs, organization policies (resource locations, domain
         restricted sharing, Cloud Run ingress/egress, CMEK, restricted services, vertexai.allowedModels), VPC Service
         Controls (incl. hub<->spoke cross-perimeter), network (PGA, NAT), BigQuery datasets/tables (adoption of existing
-        ones), log sinks (incl. aggregated), Data Access audit logs, Gemini Enterprise / Antigravity / Vertex AI
+        ones), log sinks (incl. aggregated), Data Access audit logs, Gemini Enterprise / Antigravity / Gemini Platform
         presence, IAM permissions, IAM Deny capacity, Pub/Sub/Scheduler/Cloud Run, Cloud Quotas. Each check carries a
         bilingual title, impact and remediation commands; `remediation_script` aggregates every fix.
       parameters:
@@ -1266,7 +1582,7 @@ paths:
       tags: [Readiness]
       summary: What this control plane can do in one managed project
       description: |
-        Requires `models:read`, `quotas:read` or `caps:read`. Per-surface availability (Vertex AI, Gemini Enterprise
+        Requires `models:read`, `quotas:read` or `caps:read`. Per-surface availability (Gemini Platform, Gemini Enterprise
         apps, Antigravity), whether model policies / IAM Deny / Cloud Quotas are writable, and the effective
         `vertexai.allowedModels` policy. Served from the last readiness report or lightweight probes.
       parameters:
@@ -1350,10 +1666,10 @@ paths:
   /v1/projects/{project_id}/vertex-logging:
     get:
       tags: [Readiness]
-      summary: Vertex AI inference request metadata logging status for one managed project
+      summary: Gemini Platform inference request metadata logging status for one managed project
       description: |
         Requires `usage:read` or `admin`. Reads v1beta1 `fetchPublisherModelConfig`. This log
-        (`aiplatform.googleapis.com/inference_request`) is the only log-based source of Vertex AI token counts.
+        (`aiplatform.googleapis.com/inference_request`) is the only log-based source of Gemini Platform token counts.
       parameters:
         - { name: project_id, in: path, required: true, schema: { type: string } }
       responses:
@@ -1363,7 +1679,7 @@ paths:
   /v1/projects/{project_id}/vertex-logging/enable:
     post:
       tags: [Readiness]
-      summary: Enable Vertex AI inference request metadata logging (project-wide)
+      summary: Enable Gemini Platform inference request metadata logging (project-wide)
       description: |
         Requires `admin`. Calls v1beta1 `setPublisherModelConfig` with `inferenceEventLoggingConfig.state=ENABLED`.
         Needs `aiplatform.endpoints.setPublisherModelConfig` on the project. Cloud Logging ingestion charges apply.
@@ -1380,7 +1696,7 @@ paths:
   /v1/vertex-logging/enable:
     post:
       tags: [Readiness]
-      summary: Enable Vertex AI inference request metadata logging on many managed projects
+      summary: Enable Gemini Platform inference request metadata logging on many managed projects
       description: Requires `admin`. `dryRun` defaults to true.
       requestBody:
         content:
@@ -1440,6 +1756,7 @@ components:
     AppId: { name: app_id, in: path, required: true, schema: { type: string }, example: "my-project~global~corp-assistant" }
     Email: { name: email, in: path, required: true, schema: { type: string }, example: "alice%40company.com" }
     ProjectId: { name: project_id, in: path, required: true, schema: { type: string } }
+    GroupId: { name: group_id, in: path, required: true, schema: { type: string, pattern: "^[a-z][a-z0-9-]{1,62}$" }, example: eng-platform }
     LimitId: { name: limit_id, in: path, required: true, schema: { type: string, pattern: "^rl_[0-9a-f]{16}$" } }
 
   securitySchemes:
@@ -1468,6 +1785,95 @@ components:
                   message: { type: string }
 
   schemas:
+    Surface:
+      type: string
+      description: "AI surface. `vertex_ai` is accepted as a legacy alias of `gemini_platform`."
+      enum: [antigravity, gemini_platform, gemini_enterprise]
+
+    GroupInput:
+      type: object
+      properties:
+        id: { type: string, pattern: "^[a-z][a-z0-9-]{1,62}$", description: "Required on create; immutable" }
+        name: { type: string, maxLength: 120 }
+        description: { type: string, maxLength: 500 }
+        priority: { type: integer, minimum: 0, maximum: 100000, default: 100, description: "Lower wins when a person is in several groups" }
+        members: { type: array, items: { type: string }, description: "Emails or workforce principals" }
+        excluded: { type: array, items: { type: string }, description: "Exceptions: never subject to the group policy" }
+        google_group: { type: ["string", "null"], description: "Google Group email to sync members from (Cloud Identity)" }
+
+    PeopleDelta:
+      type: object
+      properties:
+        add: { type: array, items: { type: string } }
+        remove: { type: array, items: { type: string } }
+
+    Group:
+      type: object
+      properties:
+        object: { type: string, enum: [group] }
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        priority: { type: integer }
+        members: { type: array, items: { type: string } }
+        google_group: { type: ["string", "null"] }
+        synced_members: { type: array, items: { type: string } }
+        synced_at: { type: ["string", "null"], format: date-time }
+        sync_error: { type: ["string", "null"] }
+        excluded: { type: array, items: { type: string } }
+        effective_members: { type: array, items: { type: string }, description: "(members + synced_members) - excluded" }
+        member_count: { type: integer }
+        cap_rule: { oneOf: [{ $ref: "#/components/schemas/GroupCapRule" }, { type: "null" }] }
+        block: { type: ["object", "null"] }
+        model_rule: { type: ["object", "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        updated_by: { type: string }
+
+    GroupCapRule:
+      type: object
+      properties:
+        type: { type: string, enum: [limit, allow, block], default: limit }
+        pool: { type: string, enum: [per_member, shared], default: per_member }
+        cost_cap: { type: ["number", "null"], minimum: 0 }
+        token_cap: { type: ["integer", "null"], minimum: 0 }
+        request_cap: { type: ["integer", "null"], minimum: 0 }
+        scope: { type: ["string", "null"], enum: [total, per_project, null] }
+        project_caps:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/CapTriplet" }
+        services: { type: array, items: { $ref: "#/components/schemas/Surface" } }
+        projects: { type: ["array", "null"], items: { type: string }, description: "type=block only" }
+        until: { type: ["string", "null"], format: date-time }
+        note: { type: string, maxLength: 200 }
+
+    GroupCap:
+      type: object
+      properties:
+        object: { type: string, enum: [group_cap] }
+        group: { type: string }
+        name: { type: string }
+        priority: { type: integer }
+        rule: { type: ["object", "null"] }
+        block: { type: ["object", "null"] }
+        pool: { type: ["string", "null"], enum: [per_member, shared, null] }
+        member_count: { type: integer }
+        member_status:
+          type: object
+          properties:
+            active: { type: integer }
+            over_cap: { type: integer }
+            suspended: { type: integer }
+            blocked: { type: integer }
+        usage: { type: object, description: "Pooled usage of all effective members in the current cap window" }
+        limit: { type: ["object", "null"] }
+        remaining: { type: ["object", "null"] }
+        utilization_pct: { type: ["number", "null"] }
+        over_cap: { type: ["boolean", "null"] }
+        over_projects: { type: array, items: { type: string } }
+        members: { type: array, items: { type: object } }
+        period: { type: object }
+
     DateRangeMeta:
       type: object
       properties:
@@ -1685,7 +2091,16 @@ components:
           items: { $ref: "#/components/schemas/ProjectCapStatus" }
         over_cap_reasons:
           type: array
-          items: { type: string, enum: [cost, tokens, requests] }
+          description: "cost | tokens | requests, plus group:<id> when a shared group pool is exhausted"
+          items: { type: string }
+        rule_source:
+          type: string
+          description: "Subject that defines the effective cap rule: user, group:<id> or policy"
+        groups: { type: array, items: { type: string }, description: "Effective groups in priority order" }
+        group_pools: { type: array, items: { type: string }, description: "Shared-pool groups this user counts against" }
+        block_source:
+          type: ["string", "null"]
+          description: "manual, model_policy, rule, group:<id> or auto_cap"
         utilization_pct: { type: ["number", "null"] }
         limit: { type: object }
         usage: { type: object }
@@ -1703,7 +2118,7 @@ components:
 
     Model:
       type: object
-      description: OpenAI/Anthropic-compatible model object extended with GCP surfaces, lifecycle, pricing and access.
+      description: Admin-API style model object extended with GCP surfaces, lifecycle, pricing and access.
       properties:
         object: { type: string, enum: [model] }
         id: { type: string, example: "<model-id-from-model-garden-or-logs>" }

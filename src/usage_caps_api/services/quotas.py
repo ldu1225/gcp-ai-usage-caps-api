@@ -1,7 +1,6 @@
 """Rate limits & quota management across every managed project (Cloud Quotas API + Cloud Monitoring).
 
-OpenAI analogue: GET/POST /v1/organization/projects/{id}/rate_limits (RPM/TPM per model) and usage-tier increases.
-Anthropic analogue: Rate Limits API (read) + Console increase requests.
+Admin-API analogue: per-project, per-model RPM/TPM rate limits (read / lower) and limit increase requests.
 
 Google Cloud mechanics:
   * Limits:     Cloud Quotas API `QuotaInfo` (cloudquotas.googleapis.com/v1 .../services/{service}/quotaInfos), with
@@ -9,7 +8,7 @@ Google Cloud mechanics:
                 per base model). Current value = default + approved preferences.
   * Usage:      Cloud Monitoring `serviceruntime.googleapis.com/quota/rate/net_usage` (consumer_quota) -> peak usage
                 and headroom %.
-  * Changes:    `QuotaPreference` create/patch. Decreases (capping a project below its limit, like OpenAI's project
+  * Changes:    `QuotaPreference` create/patch. Decreases (capping a project below its limit, like a vendor admin API's project
                 rate-limit override) apply quickly; increases are reviewed by Google (pending -> approved /
                 partially_approved / denied, hours to days) and are tracked as quota requests with webhooks.
 """

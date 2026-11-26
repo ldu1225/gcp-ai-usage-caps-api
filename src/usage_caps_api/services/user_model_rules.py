@@ -1,10 +1,11 @@
 """Per-user model rules: allow/deny lists and per-model rate/volume limits, enforced by detection + IAM Deny block.
 
 Google Cloud cannot restrict *which model* an individual user may call (IAM Deny conditions cannot target a model and
-Organization Policy works per project/folder/org). This module closes that gap the same way OpenAI/Anthropic-style
-per-key limits feel to a customer portal:
+Organization Policy works per project/folder/org). This module closes that gap the same way per-key limits of
+other AI vendor admin APIs feel to a customer portal:
 
-  1. Rules: a workspace `default` rule plus optional per-user overrides:
+  1. Rules: a workspace `default` rule, optional per-group rules (resolved by group priority) and per-user
+     overrides (user > group > default):
        {mode: allow_list|deny_list|unrestricted|inherit, models: [patterns], surfaces: [...],
         limits: [{model, rpm, tpm, daily_requests, daily_tokens, monthly_tokens, monthly_cost}],
         on_violation: block_service|notify, block_services: [...], block_minutes, until, note}
@@ -148,10 +149,14 @@ def validate_rule(ctx, body: dict, *, is_default: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 
 def load_rules(ctx) -> dict:
+    from . import groups as groups_svc
     doc, _ = ctx.store.load(RULES_DOC)
+    groups = groups_svc.load_groups(ctx)
     return {
         "default": doc.get("default") if isinstance(doc.get("default"), dict) else None,
         "rules": {k: v for k, v in (doc.get("rules") or {}).items() if isinstance(v, dict)},
+        "group_rules": {k: v for k, v in (doc.get("group_rules") or {}).items() if isinstance(v, dict) and k in groups},
+        "membership": groups_svc.membership(groups),
         "actioned": dict(doc.get("actioned") or {}),
     }
 
@@ -163,20 +168,40 @@ def _expired(rule: dict | None, now: dt.datetime) -> bool:
     return until is not None and now >= until
 
 
+def _has_rules(state: dict) -> bool:
+    return bool(state.get("default") or state.get("rules") or state.get("group_rules"))
+
+
 def effective_rule(state: dict, email: str, now: dt.datetime | None = None) -> tuple[dict | None, str]:
+    """Resolution: user rule > first group rule (group priority) > workspace default.
+    A rule with mode=inherit keeps the base allow/deny list and overrides only limits / actions."""
     now = now or utcnow()
     user = state["rules"].get(email)
     if user and not _expired(user, now) and user.get("mode") != "inherit":
         return user, "user"
     default = state.get("default")
+    base, base_src = (default, "default") if (default and not _expired(default, now)) else (None, "none")
+    for gid in (state.get("membership") or {}).get(email, []):
+        grule = (state.get("group_rules") or {}).get(gid)
+        if not grule or _expired(grule, now):
+            continue
+        if grule.get("mode") == "inherit":
+            merged = dict(base or {"mode": "unrestricted", "models": [], "surfaces": list(config.VALID_SERVICES)})
+            for k in ("limits", "on_violation", "block_services", "block_minutes"):
+                if grule.get(k):
+                    merged[k] = grule[k]
+            base, base_src = merged, "group:%s+%s" % (gid, base_src)
+        else:
+            base, base_src = grule, "group:" + gid
+        break
     if user and not _expired(user, now) and user.get("mode") == "inherit":
-        merged = dict(default or {"mode": "unrestricted", "models": [], "surfaces": list(config.VALID_SERVICES)})
+        merged = dict(base or {"mode": "unrestricted", "models": [], "surfaces": list(config.VALID_SERVICES)})
         for k in ("limits", "on_violation", "block_services", "block_minutes"):
             if user.get(k):
                 merged[k] = user[k]
-        return merged, "user+default"
-    if default and not _expired(default, now):
-        return default, "default"
+        return merged, "user+" + (base_src if base_src != "none" else "default")
+    if base is not None:
+        return base, base_src
     return None, "none"
 
 
@@ -295,7 +320,7 @@ def apply_violations(ctx, found: list[dict], *, trigger: str, dry_run: bool = Fa
     state = load_rules(ctx)
     actioned = state["actioned"]
     caps_doc, _ = ctx.store.load(caps_svc.USER_CAPS_DOC)
-    caps_rules = caps_doc.get("rules") or {}
+    caps_rules = caps_svc._load_user_caps_state(ctx)["rules"]  # pylint: disable=protected-access (group-aware)
     budget_min = max(1, int(policy.get("change_budget_min") or 10))
     budget = max(budget_min, int(math.ceil(float(policy.get("change_budget_ratio") or 0.2) * max(1, population))))
     to_block: dict[str, dict] = {}
@@ -464,13 +489,13 @@ def evaluate_all(ctx, *, dry_run: bool = False, now: dt.datetime | None = None, 
     from . import caps as caps_svc, pricing as pricing_svc, usage as usage_svc
     now = now or utcnow()
     state = load_rules(ctx)
-    if not state["default"] and not state["rules"]:
+    if not _has_rules(state):
         return {"object": "model_rule_evaluation", "evaluated": 0, "violations": [], "blocked": [], "skipped": "no_rules"}
     policy = caps_svc.effective_policy(ctx)
     period = caps_svc._period_info(ctx, policy, now)  # pylint: disable=protected-access
     day_start, day_id = _day_window(ctx, now)
     need_month = any(any(k.startswith("monthly") for lim in (r or {}).get("limits") or [] for k in lim)
-                     for r in [state["default"], *state["rules"].values()] if r)
+                     for r in [state["default"], *state["rules"].values(), *state["group_rules"].values()] if r)
     day_usage = usage_svc.collect_usage(ctx.child(params={}), day_start, now, fresh=True)
     month_usage = usage_svc.collect_usage(ctx.child(params={}), period["start"], now) if need_month else None
     pricing = pricing_svc.resolve_pricing(ctx, policy) if need_month else None
@@ -533,7 +558,7 @@ def check_event(ctx, item: dict, recent_items: list[dict]) -> dict | None:
     """Real-time check for one Antigravity inference event. recent_items: the user's events seen in the last minutes."""
     now = utcnow()
     state = load_rules(ctx)
-    if not state["default"] and not state["rules"]:
+    if not _has_rules(state):
         return None
     email = item["person"]
     rule, source = effective_rule(state, email, now)
@@ -773,4 +798,8 @@ def users_affected_by_model(ctx, model: str) -> list[dict]:
         if rule.get("mode") in ("allow_list", "deny_list"):
             v = access_violation(rule, model, "antigravity") or access_violation(rule, model, "gemini_platform")
             out.append({"scope": "user", "email": email, "decision": "denied" if v else "allowed"})
+    for gid, rule in sorted(state["group_rules"].items()):
+        if rule.get("mode") in ("allow_list", "deny_list"):
+            v = access_violation(rule, model, "antigravity") or access_violation(rule, model, "gemini_platform")
+            out.append({"scope": "group", "group": gid, "decision": "denied" if v else "allowed"})
     return out[:200]

@@ -66,7 +66,7 @@ _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class ApiError(Exception):
-    """Error rendered in OpenAI/Anthropic Admin API style: {"error": {"type", "code", "message"}}."""
+    """Error rendered in the common AI admin API style: {"error": {"type", "code", "message"}}."""
 
     def __init__(self, code: str, message: str, status: int | None = None, headers=None, error_type: str | None = None):
         super().__init__(message)
@@ -177,7 +177,7 @@ def parse_json_object(raw: bytes) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Cursor pagination (OpenAI / Anthropic Admin API style)
+# Cursor pagination (common AI admin API style)
 # ---------------------------------------------------------------------------
 
 def encode_cursor(offset: int) -> str:
