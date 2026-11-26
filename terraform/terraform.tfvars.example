@@ -1,0 +1,21 @@
+project_id      = "my-gcp-project-id"
+region          = "asia-northeast3"
+container_image = "asia-northeast3-docker.pkg.dev/my-gcp-project-id/ai-usage-caps/gcp-ai-usage-caps-api:latest"
+
+# Optional multi-project / org scope
+linked_projects  = []
+scope_type       = "projects"
+scope_ids        = []
+organization_id  = ""
+grant_org_roles  = false
+
+# Optional billing export & project hard spend caps
+billing_account_id = ""
+spend_caps_enabled = false
+
+# Enforcement defaults
+enforcement_backend  = "iam_deny"
+enforcement_mode     = "manual"
+realtime_enforcement = true
+workspace_timezone   = "Asia/Seoul"
+cap_currency         = "USD"

@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+data/
+config.local.yaml
+deploy.*.env
+deploy.env
+.env
+*.tfstate
+*.tfstate.*
+.terraform/
+terraform/terraform.tfvars
+.pytest_cache/
+.DS_Store

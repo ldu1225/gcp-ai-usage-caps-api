@@ -1,0 +1,780 @@
+openapi: 3.1.0
+info:
+  title: GCP AI Usage & Spend Caps API
+  version: 1.0.0
+  description: |
+    Headless M2M REST API for enterprise AI management portals to query per-user Google Cloud AI
+    usage & estimated costs (Antigravity, Vertex AI / Agent Platform, Gemini Enterprise) and
+    enforce user-level and project-level Spend Caps via IAM Deny v2 and Cloud Billing Spend Caps.
+
+    ### Authentication
+    - **Scoped API Key**: `Authorization: Bearer gcpai_<id>_<secret>` (salted SHA-256 hashed at rest).
+      Scopes: `usage:read`, `caps:read`, `caps:write`, `users:write`, `admin`.
+    - **GCP Service Account OIDC**: `Authorization: Bearer <RS256 Google OIDC ID Token>` with
+      audience matching `PUBLIC_BASE_URL` (used by Cloud Scheduler, Pub/Sub push, and internal GCP callers).
+
+    ### Operational Notes vs OpenAI / Anthropic Admin APIs
+    - **IAM Deny v2 Propagation**: Block/unblock changes are eventually consistent and typically
+      take **1-2 minutes** to propagate across Google Cloud (requests already in flight complete).
+    - **Cost Measurement**: GCP Cloud Billing exports have no per-user dimension; per-user cost is
+      computed from observed per-model tokens (uncached input, cached input, output/thinking) using
+      actual Billing Export effective prices -> Cloud Billing Catalog -> manual overrides.
+    - **Project Spend Cap Lift**: Lifting an `ENFORCED` Google Cloud Billing Spend Cap takes up to
+      **~1 hour** for Google Cloud to resume Agent Platform traffic.
+
+servers:
+  - url: https://your-api-service.run.app
+    description: Cloud Run deployment URL
+
+security:
+  - BearerApiKey: []
+  - GoogleOidcBearer: []
+
+tags:
+  - name: System
+  - name: Usage & Billing
+  - name: Spend Caps
+  - name: User Block / Unblock
+  - name: Project Spend Caps
+  - name: Audit
+  - name: Internal
+  - name: Admin
+
+paths:
+  /v1/health:
+    get:
+      tags: [System]
+      summary: Health & readiness check
+      description: Returns basic liveness without auth, and storage/enforcement details when authenticated.
+      security: []
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  service: { type: string, example: gcp-ai-usage-caps-api }
+                  version: { type: string, example: 1.0.0 }
+                  timestamp: { type: string, format: date-time }
+
+  /v1/openapi.yaml:
+    get:
+      tags: [System]
+      summary: Download OpenAPI 3.1 specification
+      security: []
+      responses:
+        "200":
+          description: OpenAPI 3.1 YAML specification
+          content:
+            application/yaml:
+              schema:
+                type: string
+
+  /v1/usage/users:
+    get:
+      tags: [Usage & Billing]
+      summary: List per-user AI usage and estimated cost
+      description: Requires scope `usage:read`.
+      parameters:
+        - name: start
+          in: query
+          schema: { type: string, format: date, example: "2026-11-01" }
+        - name: end
+          in: query
+          schema: { type: string, format: date, example: "2026-11-26" }
+        - name: granularity
+          in: query
+          schema: { type: string, enum: [day, week], default: day }
+        - name: project
+          in: query
+          schema: { type: string, description: "Filter by GCP project ID or 'all'" }
+        - name: surface
+          in: query
+          schema: { type: string, enum: [all, antigravity, vertex_ai, gemini_enterprise] }
+        - name: email
+          in: query
+          schema: { type: string, description: "Exact email or Workforce Identity principal" }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Paginated list of per-user usage records
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [list] }
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/UserUsage" }
+                  has_more: { type: boolean }
+                  next_cursor: { type: ["string", "null"] }
+                  total: { type: integer }
+                  currency: { type: string }
+                  range: { $ref: "#/components/schemas/DateRangeMeta" }
+                  summary:
+                    type: object
+                    properties:
+                      active_users: { type: integer }
+                      total_requests: { type: integer }
+                      total_tokens: { type: integer }
+                      total_estimated_cost: { type: ["number", "null"] }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /v1/usage/users/{email}:
+    get:
+      tags: [Usage & Billing]
+      summary: Get detailed usage, time series, and current cap burn rate for one user
+      description: Requires scope `usage:read`.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema: { type: string }
+        - name: start
+          in: query
+          schema: { type: string, format: date }
+        - name: end
+          in: query
+          schema: { type: string, format: date }
+        - name: granularity
+          in: query
+          schema: { type: string, enum: [day, week], default: day }
+        - name: project
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: User usage details, time series, and active cap status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [user_usage] }
+                  range: { $ref: "#/components/schemas/DateRangeMeta" }
+                  user: { $ref: "#/components/schemas/UserUsage" }
+                  timeseries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        date: { type: string, format: date }
+                        requests: { type: integer }
+                        total_tokens: { type: integer }
+                  current_cap: { $ref: "#/components/schemas/UserCap" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /v1/billing/users:
+    get:
+      tags: [Usage & Billing]
+      summary: Monthly user & project chargeback report
+      description: |
+        Requires scope `usage:read`. Uses integer-cent exact allocation (largest remainder) so
+        per-user, per-project, and grand totals always agree to the cent.
+      parameters:
+        - name: month
+          in: query
+          schema: { type: string, pattern: "^[0-9]{4}-[0-9]{2}$", example: "2026-11" }
+        - name: project
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Monthly chargeback report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [list] }
+                  month: { type: string }
+                  currency: { type: string }
+                  allocation_mode: { type: string, enum: [credit_share, list] }
+                  complete: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/UserBillingRow" }
+                  by_project:
+                    type: array
+                    items: { $ref: "#/components/schemas/ProjectBillingRow" }
+                  totals: { type: object }
+                  has_more: { type: boolean }
+                  next_cursor: { type: ["string", "null"] }
+                  total: { type: integer }
+
+  /v1/caps/policy:
+    get:
+      tags: [Spend Caps]
+      summary: Get global default spend cap policy
+      description: Requires scope `caps:read`.
+      responses:
+        "200":
+          description: Current global spend cap policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CapPolicy" }
+    put:
+      tags: [Spend Caps]
+      summary: Update global default spend cap policy
+      description: Requires scope `caps:write`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CapPolicyUpdate" }
+      responses:
+        "200":
+          description: Updated global spend cap policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CapPolicy" }
+
+  /v1/caps/users:
+    get:
+      tags: [Spend Caps]
+      summary: List per-user spend cap limits, usage, utilization%, and status
+      description: Requires scope `caps:read`.
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [active, over_cap, suspended, blocked] }
+        - name: email
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Paginated per-user spend cap status list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [list] }
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/UserCap" }
+                  has_more: { type: boolean }
+                  next_cursor: { type: ["string", "null"] }
+                  total: { type: integer }
+                  period: { type: object }
+                  summary:
+                    type: object
+                    properties:
+                      total: { type: integer }
+                      active: { type: integer }
+                      over_cap: { type: integer }
+                      suspended: { type: integer }
+                      blocked: { type: integer }
+
+  /v1/caps/users/{email}:
+    get:
+      tags: [Spend Caps]
+      summary: Get spend cap status for a specific user
+      description: Requires scope `caps:read`.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: User cap status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserCap" }
+    put:
+      tags: [Spend Caps]
+      summary: Set individual spend cap or allow/block override for a user
+      description: Requires scope `caps:write`.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                type: { type: string, enum: [limit, allow, block], default: limit }
+                cost_cap: { type: number, minimum: 0 }
+                token_cap: { type: integer, minimum: 0 }
+                request_cap: { type: integer, minimum: 0 }
+                services:
+                  type: array
+                  items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }
+                until: { type: ["string", "null"], format: date-time }
+                note: { type: string, maxLength: 200 }
+      responses:
+        "200":
+          description: Saved individual user cap rule
+    delete:
+      tags: [Spend Caps]
+      summary: Remove individual spend cap override (revert to global policy)
+      description: Requires scope `caps:write`.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Rule deleted
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/users/{email}/block:
+    post:
+      tags: [User Block / Unblock]
+      summary: Immediately block a user on selected Google Cloud AI services
+      description: Requires scope `users:write`. Updates IAM Deny v2 policy (or triggers Enforcer Job).
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                services:
+                  type: array
+                  items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }
+                  default: [antigravity, vertex_ai, gemini_enterprise]
+                reason: { type: string, maxLength: 200 }
+                until: { type: ["string", "null"], format: date-time }
+      responses:
+        "200":
+          description: User block recorded and enforced
+
+  /v1/users/{email}/unblock:
+    post:
+      tags: [User Block / Unblock]
+      summary: Immediately unblock a user on selected or all AI services
+      description: Requires scope `users:write`.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                services:
+                  type: array
+                  items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }
+                  description: "Omit to unblock across all services"
+                reason: { type: string, maxLength: 200 }
+      responses:
+        "200":
+          description: User unblocked
+
+  /v1/caps/enforce:
+    post:
+      tags: [Spend Caps]
+      summary: Evaluate spend cap policy (G1-G7 safety gates) and enforce blocks/restores
+      description: Requires scope `caps:write` or authorized OIDC Service Account. Defaults to `dryRun: true`.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dryRun: { type: boolean, default: true }
+      responses:
+        "200":
+          description: Enforcement run outcome including safety gates G1-G7 and execution plan
+
+  /v1/caps/projects:
+    get:
+      tags: [Project Spend Caps]
+      summary: List project-level spend cap configs and Cloud Billing Spend Cap states
+      description: Requires scope `caps:read`.
+      responses:
+        "200":
+          description: Project spend cap status list
+
+  /v1/caps/projects/{project_id}:
+    put:
+      tags: [Project Spend Caps]
+      summary: Configure and optionally apply a monthly USD project spend cap
+      description: Requires scope `caps:write`. Uses Cloud Billing Budget API v1 spendCap for Agent Platform.
+      parameters:
+        - name: project_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [monthly_usd]
+              properties:
+                monthly_usd: { type: number, minimum: 0 }
+                action: { type: string, enum: [hard_cap, notify], default: hard_cap }
+                apply: { type: boolean, default: true }
+                dryRun: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Project spend cap saved and applied/planned
+
+  /v1/caps/projects/{project_id}/lift:
+    post:
+      tags: [Project Spend Caps]
+      summary: Lift an ENFORCED Google Cloud project spend cap for the remainder of the month
+      description: Requires scope `caps:write`. Sets `spendCap.inputState = AWAITING_NEXT_PERIOD`.
+      parameters:
+        - name: project_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Spend cap lift status
+
+  /v1/audit-logs:
+    get:
+      tags: [Audit]
+      summary: Query API governance & block/unblock audit trail
+      description: Requires scope `caps:read` or `admin`.
+      parameters:
+        - name: action
+          in: query
+          schema: { type: string }
+        - name: target
+          in: query
+          schema: { type: string }
+        - name: actor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Paginated audit entries
+
+  /v1/internal/usage-event:
+    post:
+      tags: [Internal]
+      summary: Pub/Sub push receiver for real-time inference log events
+      description: Authenticated via Google OIDC Bearer token from Pub/Sub push subscription.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                message:
+                  type: object
+                  properties:
+                    data: { type: string, description: "Base64-encoded Cloud Logging JSON entry" }
+                subscription: { type: string }
+      responses:
+        "200":
+          description: Event acknowledged
+        "503":
+          description: Temporary throttle; Pub/Sub retries delivery
+
+  /v1/internal/pricing/sync:
+    post:
+      tags: [Internal]
+      summary: Sync official Cloud Billing Catalog token prices & FX rates
+      description: Requires OIDC scheduler SA or `admin` scope.
+      responses:
+        "200":
+          description: Pricing sync summary
+
+  /v1/admin/api-keys:
+    get:
+      tags: [Admin]
+      summary: List scoped M2M API keys (metadata only)
+      description: Requires scope `admin`.
+      responses:
+        "200":
+          description: List of API key records (never contains plaintext secrets)
+    post:
+      tags: [Admin]
+      summary: Issue a new scoped M2M API key (plaintext returned once)
+      description: Requires scope `admin`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, scopes]
+              properties:
+                name: { type: string, maxLength: 120 }
+                scopes:
+                  type: array
+                  items: { type: string, enum: [usage:read, caps:read, caps:write, users:write, admin] }
+                expires_at: { type: ["string", "null"], format: date-time }
+      responses:
+        "201":
+          description: Newly created API key (save the `key` field immediately)
+
+  /v1/admin/api-keys/{key_id}:
+    delete:
+      tags: [Admin]
+      summary: Revoke an API key immediately
+      description: Requires scope `admin`.
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: API key revoked
+
+  /v1/admin/webhooks:
+    get:
+      tags: [Admin]
+      summary: List configured outbound webhooks
+      description: Requires scope `admin`.
+      responses:
+        "200":
+          description: List of outbound webhooks (without signing secret)
+    post:
+      tags: [Admin]
+      summary: Register a signed outbound webhook
+      description: Requires scope `admin`. Returns `secret` once for verifying `X-Signature-256`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                name: { type: string }
+                url: { type: string, format: uri }
+                events:
+                  type: array
+                  items:
+                    type: string
+                    enum:
+                      - cap.threshold_reached
+                      - cap.exceeded
+                      - user.blocked
+                      - user.unblocked
+                      - project_cap.enforced
+                      - project_cap.lifted
+                enabled: { type: boolean, default: true }
+      responses:
+        "201":
+          description: Webhook registered
+
+  /v1/admin/webhooks/{webhook_id}:
+    delete:
+      tags: [Admin]
+      summary: Delete an outbound webhook
+      description: Requires scope `admin`.
+      parameters:
+        - name: webhook_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Webhook deleted
+
+components:
+  securitySchemes:
+    BearerApiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: "gcpai_<id>_<secret>"
+    GoogleOidcBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: "JWT (RS256 Google OIDC)"
+
+  responses:
+    Error:
+      description: Standard error response
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  type: { type: string }
+                  code: { type: string }
+                  message: { type: string }
+
+  schemas:
+    DateRangeMeta:
+      type: object
+      properties:
+        start: { type: string, format: date }
+        end: { type: string, format: date }
+        granularity: { type: string, enum: [day, week] }
+        timezone: { type: string }
+
+    UserUsage:
+      type: object
+      properties:
+        email: { type: string }
+        uid: { type: string }
+        surfaces:
+          type: array
+          items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }
+        requests: { type: integer }
+        input_tokens: { type: integer }
+        output_tokens: { type: integer }
+        cached_tokens: { type: integer }
+        total_tokens: { type: integer }
+        estimated_cost: { type: ["number", "null"] }
+        cost_partial: { type: boolean }
+        currency: { type: ["string", "null"] }
+        by_model:
+          type: array
+          items:
+            type: object
+            properties:
+              model: { type: string }
+              surface: { type: string }
+              requests: { type: integer }
+              input_tokens: { type: integer }
+              output_tokens: { type: integer }
+              cached_tokens: { type: integer }
+              total_tokens: { type: integer }
+              estimated_cost: { type: ["number", "null"] }
+              cost_partial: { type: boolean }
+        by_surface: { type: object }
+        by_project:
+          type: array
+          items: { type: object }
+        last_active: { type: ["string", "null"], format: date-time }
+
+    UserBillingRow:
+      type: object
+      properties:
+        email: { type: string }
+        uid: { type: string }
+        requests: { type: integer }
+        input_tokens: { type: integer }
+        output_tokens: { type: integer }
+        cached_tokens: { type: integer }
+        total_tokens: { type: integer }
+        cost: { type: ["number", "null"] }
+        credit_applied: { type: ["number", "null"] }
+        chargeable: { type: ["number", "null"] }
+        projects: { type: array, items: { type: object } }
+
+    ProjectBillingRow:
+      type: object
+      properties:
+        project: { type: string }
+        active_users: { type: integer }
+        requests: { type: integer }
+        total_tokens: { type: integer }
+        cost: { type: ["number", "null"] }
+        credit_applied: { type: ["number", "null"] }
+        chargeable: { type: ["number", "null"] }
+
+    CapPolicy:
+      type: object
+      properties:
+        object: { type: string, enum: [cap_policy] }
+        cost_cap: { type: number }
+        token_cap: { type: integer }
+        request_cap: { type: integer }
+        currency: { type: string }
+        period: { type: string, enum: [daily, weekly, monthly, custom, all] }
+        window: { type: string, enum: [calendar, rolling] }
+        reset_timezone: { type: string }
+        reset_day: { type: integer }
+        reset_weekday: { type: integer }
+        reset_time: { type: string }
+        cycle_days: { type: integer }
+        cycle_start: { type: string }
+        enforcement_mode: { type: string, enum: [manual, auto] }
+        enforcement_backend: { type: string, enum: [iam_deny, notify_only] }
+        default_block_services:
+          type: array
+          items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }
+        webhook_thresholds:
+          type: array
+          items: { type: integer }
+        current_window: { type: object }
+
+    CapPolicyUpdate:
+      type: object
+      properties:
+        cost_cap: { type: number, minimum: 0 }
+        token_cap: { type: integer, minimum: 0 }
+        request_cap: { type: integer, minimum: 0 }
+        currency: { type: string }
+        period: { type: string, enum: [daily, weekly, monthly, custom, all] }
+        window: { type: string, enum: [calendar, rolling] }
+        reset_timezone: { type: string }
+        reset_day: { type: integer, minimum: 1, maximum: 31 }
+        reset_weekday: { type: integer, minimum: 0, maximum: 6 }
+        reset_time: { type: string, pattern: "^([01]?[0-9]|2[0-3]):[0-5][0-9]$" }
+        enforcement_mode: { type: string, enum: [manual, auto] }
+        enforcement_backend: { type: string, enum: [iam_deny, notify_only] }
+        default_block_services:
+          type: array
+          items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }
+        webhook_thresholds:
+          type: array
+          items: { type: integer, minimum: 1, maximum: 100 }
+
+    UserCap:
+      type: object
+      properties:
+        email: { type: string }
+        uid: { type: string }
+        status: { type: string, enum: [active, over_cap, suspended, blocked] }
+        blocked_services:
+          type: array
+          items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }
+        over_cap: { type: ["boolean", "null"] }
+        over_cap_reasons:
+          type: array
+          items: { type: string, enum: [cost, tokens, requests] }
+        utilization_pct: { type: ["number", "null"] }
+        limit: { type: object }
+        usage: { type: object }
+        remaining: { type: object }
+        restore_at: { type: ["string", "null"], format: date-time }
+        rule: { type: ["object", "null"] }
