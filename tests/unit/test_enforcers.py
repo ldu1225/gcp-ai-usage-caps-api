@@ -28,11 +28,11 @@ class EnforcersTests(unittest.TestCase):
         self.assertTrue(st0.readable)
         self.assertEqual(st0.principals, frozenset())
 
-        # Block Alice on antigravity only, Bob on antigravity + vertex_ai, Workforce user on all 3
+        # Block Alice on antigravity only, Bob on antigravity + gemini_platform, Workforce user on all 3
         desired = {
             p_alice: frozenset(["antigravity"]),
-            p_bob: frozenset(["antigravity", "vertex_ai"]),
-            p_wf: frozenset(["antigravity", "vertex_ai", "gemini_enterprise"]),
+            p_bob: frozenset(["antigravity", "gemini_platform"]),
+            p_wf: frozenset(["antigravity", "gemini_platform", "gemini_enterprise"]),
         }
         res = enforcers.apply(ctx, st0, desired)
         self.assertTrue(res["applied"])
@@ -43,10 +43,10 @@ class EnforcersTests(unittest.TestCase):
         self.assertTrue(st1.readable)
         by_person = st1.services_by_person
         self.assertEqual(by_person["alice@company.com"], frozenset(["antigravity"]))
-        self.assertEqual(by_person["bob@company.com"], frozenset(["antigravity", "vertex_ai"]))
+        self.assertEqual(by_person["bob@company.com"], frozenset(["antigravity", "gemini_platform"]))
         self.assertEqual(
             by_person["principal://iam.googleapis.com/locations/global/workforcepools/corp-pool/subject/user-42"],
-            frozenset(["antigravity", "vertex_ai", "gemini_enterprise"]),
+            frozenset(["antigravity", "gemini_platform", "gemini_enterprise"]),
         )
 
         # Clear all -> deletes the managed deny policy cleanly

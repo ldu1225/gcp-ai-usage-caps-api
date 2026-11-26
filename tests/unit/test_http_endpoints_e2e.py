@@ -106,14 +106,14 @@ class HttpEndpointsE2ETests(unittest.TestCase):
 
             # 8) Manual service-selective block & partial unblock for Alice
             st, blk, _ = srv.request("POST", "/v1/users/alice%40company.com/block",
-                                     body={"services": ["antigravity", "vertex_ai"], "reason": "security review"},
+                                     body={"services": ["antigravity", "gemini_platform"], "reason": "security review"},
                                      token=admin_token)
             self.assertEqual(st, 200)
-            self.assertEqual(blk["blocked_services"], ["antigravity", "vertex_ai"])
+            self.assertEqual(blk["blocked_services"], ["antigravity", "gemini_platform"])
 
-            # Unblock only vertex_ai -> antigravity stays blocked!
+            # Unblock only gemini_platform -> antigravity stays blocked!
             st, part_unblk, _ = srv.request("POST", "/v1/users/alice%40company.com/unblock",
-                                            body={"services": ["vertex_ai"]}, token=admin_token)
+                                            body={"services": ["gemini_platform"]}, token=admin_token)
             self.assertEqual(st, 200)
             self.assertEqual(part_unblk["status"], "blocked")
             self.assertEqual(part_unblk["blocked_services"], ["antigravity"])

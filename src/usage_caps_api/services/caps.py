@@ -53,7 +53,7 @@ def _validate_services(raw, *, default=None, allow_empty: bool = False) -> list[
         raise ApiError("bad_request", "Field 'services' must be a list of service names.")
     out = []
     for item in raw:
-        s = str(item or "").strip().lower()
+        s = config.normalize_service(item)
         if s not in config.VALID_SERVICES:
             raise ApiError("bad_request", "Invalid service '%s'. Valid services: %s."
                            % (s, ", ".join(config.VALID_SERVICES)))
@@ -528,8 +528,17 @@ def evaluate_gates_and_plan(users: list[dict], *, deny_readable: bool, telemetry
 # Status computation across all known users
 # ---------------------------------------------------------------------------
 
+def _norm_rec(rec):
+    if isinstance(rec, dict) and rec.get("services"):
+        return dict(rec, services=config.normalize_services(rec["services"]))
+    return rec
+
+
 def _load_user_caps_state(ctx) -> dict:
     doc, _ = ctx.store.load(USER_CAPS_DOC)
+    doc = dict(doc)
+    for section in ("rules", "blocks"):
+        doc[section] = {k: _norm_rec(v) for k, v in (doc.get(section) or {}).items()}
     return {
         "rules": dict(doc.get("rules") or {}),
         "blocks": dict(doc.get("blocks") or {}),

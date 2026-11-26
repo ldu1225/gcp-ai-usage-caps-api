@@ -25,14 +25,14 @@ VERTEX_INFERENCE_TABLE = "aiplatform_googleapis_com_inference_request"
 # Table prefixes per surface, in order of preference (the first prefix with tables is used for freshness).
 AI_TABLES = {
     "antigravity": ("businessaicode_googleapis_com_inference_response",),
-    "vertex_ai": (VERTEX_INFERENCE_TABLE, "cloudaudit_googleapis_com_data_access"),
+    "gemini_platform": (VERTEX_INFERENCE_TABLE, "cloudaudit_googleapis_com_data_access"),
     "gemini_enterprise": ("discoveryengine_googleapis_com_gen_ai_user_message",
                           "discoveryengine_googleapis_com_gemini_enterprise_user_activity"),
 }
 NEEDED_LOGS = {
     "antigravity": ("businessaicode.googleapis.com/inference_response",),
     # Tokens come from inference_request; per-user attribution of Vertex AI calls also needs the Data Access audit log.
-    "vertex_ai": (VERTEX_INFERENCE_LOG, "cloudaudit.googleapis.com/data_access"),
+    "gemini_platform": (VERTEX_INFERENCE_LOG, "cloudaudit.googleapis.com/data_access"),
     "gemini_enterprise": ("discoveryengine.googleapis.com/gen_ai_user_message",
                           "discoveryengine.googleapis.com/gemini_enterprise_user_activity"),
 }
@@ -614,7 +614,7 @@ def audit_config_check(run, pid: str) -> dict:
                  "Vertex AI Data Access audit logs (%s) are off on %s (also checked folder/org inheritance): per-user "
                  "Vertex AI usage and caps cannot be measured. Run prepare.sh with --enable-data-access-logs (merges "
                  "auditConfigs without clobbering existing ones)." % (", ".join(missing), pid),
-                 impact=["vertex_ai", "usage"], auto_fixable=True, data=data, docs_url=DOCS["audit"],
+                 impact=["gemini_platform", "usage"], auto_fixable=True, data=data, docs_url=DOCS["audit"],
                  commands=["scripts/prepare.sh --project %s --managed-projects %s --enable-data-access-logs" % (
                      run.hub, pid) if not run.is_hub(pid) else
                            "scripts/prepare.sh --project %s --enable-data-access-logs" % run.hub])
@@ -665,7 +665,7 @@ def vertex_inference_logging_check(run, pid: str) -> dict:
                                                                        VERTEX_LOGGING_READER_ROLE)]
         return skipped(cid, "logging", *title, err,
                        what="the publisher model config of %s (aiplatform.endpoints.fetchPublisherModelConfig)" % pid,
-                       impact=["vertex_ai"], commands=cmds, docs_url=DOCS["vertex_inference_logging"],
+                       impact=["gemini_platform"], commands=cmds, docs_url=DOCS["vertex_inference_logging"],
                        data={"enabled": None, "state": None, "readable": False,
                              "error": getattr(err, "kind", "error")})
     # NOT_FOUND: no publisher model config was ever written on the project -> logging is off.
@@ -680,5 +680,5 @@ def vertex_inference_logging_check(run, pid: str) -> dict:
                  "measured for this project (Antigravity / Gemini Enterprise are unaffected). prepare.sh enables it "
                  "(ENABLE_VERTEX_INFERENCE_LOGGING=true, default), or run the command below. Entries are ingested "
                  "into Cloud Logging, so Cloud Logging ingestion/storage pricing applies." % (state, pid),
-                 impact=["vertex_ai", "usage"], auto_fixable=True, commands=enable_cmds, data=data,
+                 impact=["gemini_platform", "usage"], auto_fixable=True, commands=enable_cmds, data=data,
                  docs_url=DOCS["vertex_inference_logging"])

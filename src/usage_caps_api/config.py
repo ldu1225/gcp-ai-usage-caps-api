@@ -35,7 +35,24 @@ ENFORCEMENT_JOB_RE = re.compile(
 )
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
-VALID_SERVICES = ("antigravity", "vertex_ai", "gemini_enterprise")
+VALID_SERVICES = ("antigravity", "gemini_platform", "gemini_enterprise")
+# `gemini_platform` = Gemini Enterprise Agent Platform ("Gemini platform", formerly Vertex AI). The legacy surface id
+# `vertex_ai` is still accepted on input and in stored documents and is normalized to `gemini_platform`.
+SERVICE_ALIASES = {"vertex_ai": "gemini_platform", "vertex": "gemini_platform", "agent_platform": "gemini_platform"}
+
+
+def normalize_service(value):
+    s = str(value or "").strip().lower()
+    return SERVICE_ALIASES.get(s, s)
+
+
+def normalize_services(values) -> list:
+    out = []
+    for v in values or ():
+        n = normalize_service(v)
+        if n and n not in out:
+            out.append(n)
+    return out
 ENFORCEMENT_MODES = ("manual", "auto")
 ENFORCEMENT_BACKENDS = ("iam_deny", "notify_only")
 MODEL_VIOLATION_ACTIONS = ("block_service", "notify")

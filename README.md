@@ -58,7 +58,7 @@
 | 📊 **사용량·비용** | 사용자/프로젝트/모델/트래픽 티어별 요청·입력/출력/캐시/사고 토큰·추정 비용, 월별 차지백, 귀속 불가분(`unattributed`) 별도 표시 | OpenAI Usage API처럼 사용자 단위 리포트 |
 | 💲 **공식 단가** | Cloud Billing Catalog SKU 매일 동기화(입력·출력·캐시 읽기/쓰기·장문·Flex/Priority/Batch), 계약 단가 override, `GET /v1/pricing` | 재무팀이 검증 가능한 근거(SKU 이름) |
 | 💰 **지출 캡** | 사용자/전역 캡(금액·토큰·요청), **전체 합산 또는 프로젝트별 캡**, 80/100% 알림, 자동·수동 차단, 기간 자동 리셋, 프로젝트 하드캡 | 예산 초과 사용자 자동 차단 (초과한 프로젝트에서만) |
-| 🚫 **차단/해제** | 서비스(`antigravity`·`vertex_ai`·`gemini_enterprise`) × **프로젝트 단위** 즉시 차단·해제, 만료 시각 | 보안 사고 시 원클릭 차단 |
+| 🚫 **차단/해제** | 서비스(`antigravity`·`gemini_platform`·`gemini_enterprise`) × **프로젝트 단위** 즉시 차단·해제, 만료 시각 | 보안 사고 시 원클릭 차단 |
 | 🧠 **모델 거버넌스** | 동적 카탈로그, 프로젝트/폴더/조직 허용·차단, GE 앱 모델 ON/OFF, **사용자별 모델 규칙(차단 우선·알림 필수)** | “이 팀은 Google 모델만”, “인턴은 특정 계열 금지” |
 | 🔎 **모델 추적** | 로그에서 처음 관측된 모델 자동 등록, Model Garden 신규/제외 감지 | 신규 모델 사용을 당일 인지 |
 | ⏱️ **Rate Limit·쿼터** | 모델·리전별 RPM/TPM 한도·사용량·헤드룸, 하향(캡), **상향 요청 API 직접 제출**, 상태 추적 | 쿼터 부족을 포털에서 바로 해결 |
@@ -144,7 +144,7 @@ Vertex AI 토큰 수는 **추론 요청 메타데이터 로그**(`aiplatform.goo
 | 1 | **포털이 보낸 커스텀 헤더 라벨** `x-goog-agent-platform-observability-label-user: <이메일 또는 uid>` | 정확 | `header_label` |
 | 2 | **Data Access 감사 로그 상관**: 같은 프로젝트·같은 모델·같은 분(±1분)의 사람 호출자에게 요청 수 비율로 토큰을 비례 배분 | 근사 | `audit_correlated` |
 | 3 | 위 둘 다 불가 → 프로젝트 단위 **`unattributed`** 로 보존 (절대 버리지 않음) | 프로젝트 합계 정확 | `unattributed` |
-| – | 추론 로그 미활성 시 → 감사 로그의 사용자별 **요청 수만** 집계 (`token_sources.vertex_ai = requests_only`) | 토큰·비용 없음 | – |
+| – | 추론 로그 미활성 시 → 감사 로그의 사용자별 **요청 수만** 집계 (`token_sources.gemini_platform = requests_only`) | 토큰·비용 없음 | – |
 
 Antigravity 로그는 사용자 ID를 직접 담고 있으므로 `log_identity`로 집계됩니다.
 
@@ -203,7 +203,7 @@ def generate(user_email: str, prompt: str) -> dict:
 ```json
 "telemetry": {
   "attribution": {"log_identity": 18234, "header_label": 9120, "audit_correlated": 412, "unattributed": 37},
-  "token_sources": {"antigravity": "logs", "vertex_ai": "logs", "gemini_enterprise": "requests_only"},
+  "token_sources": {"antigravity": "logs", "gemini_platform": "logs", "gemini_enterprise": "requests_only"},
   "unattributed_projects": ["team-c-batch"], "telemetry_ok": true, "truncated": false
 }
 ```
@@ -237,7 +237,7 @@ curl -s -X PUT "$BASE/v1/caps/users/alice%40company.com" -H "Authorization: Bear
 
 # 프로젝트 한정 차단 / 해제 (다른 프로젝트는 계속 사용 가능)
 curl -s -X POST "$BASE/v1/users/alice%40company.com/block" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"services":["vertex_ai"],"projects":["team-b-prod"],"reason":"프로젝트 예산 소진"}'
+  -d '{"services":["gemini_platform"],"projects":["team-b-prod"],"reason":"프로젝트 예산 소진"}'
 curl -s -X POST "$BASE/v1/users/alice%40company.com/unblock" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"projects":["team-b-prod"]}'
 
@@ -250,12 +250,12 @@ curl -s "$BASE/v1/users/alice%40company.com/projects?start=2026-11-01&end=2026-1
 ```json
 {
   "email": "alice@company.com", "status": "suspended", "status_scope": "projects", "cap_scope": "total",
-  "multi_project": true, "over_scope": ["team-b-prod"], "blocked_projects": {"team-b-prod": ["vertex_ai"]},
+  "multi_project": true, "over_scope": ["team-b-prod"], "blocked_projects": {"team-b-prod": ["gemini_platform"]},
   "projects": [
     {"project": "team-a-prod", "status": "active",    "limit": {"cost_cap": 150, "source": "user_project_cap"},
      "usage": {"estimated_cost": 61.2}, "remaining": {"cost": 88.8}, "blocked_services": []},
     {"project": "team-b-prod", "status": "suspended", "limit": {"cost_cap": 50, "source": "user_project_cap"},
-     "usage": {"estimated_cost": 50.4}, "remaining": {"cost": 0}, "blocked_services": ["vertex_ai"]}
+     "usage": {"estimated_cost": 50.4}, "remaining": {"cost": 0}, "blocked_services": ["gemini_platform"]}
   ]
 }
 ```

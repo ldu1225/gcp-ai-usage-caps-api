@@ -332,7 +332,7 @@ variable "vertex_user_header_label" {
 variable "metered_surfaces" {
   type        = list(string)
   default     = []
-  description = "Optional METERED_SURFACES (e.g. [\"antigravity\", \"vertex_ai\", \"gemini_enterprise\"]); empty = application default."
+  description = "Optional METERED_SURFACES (e.g. [\"antigravity\", \"gemini_platform\", \"gemini_enterprise\"]); empty = application default."
 }
 
 variable "model_violation_block_scope" {

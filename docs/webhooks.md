@@ -186,12 +186,12 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 발생 경로에 따라 필드가 다릅니다(`trigger`로 구분). 모든 경로에 **`projects`**(차단이 적용된 프로젝트 목록, 전체면 `"all"`)가 포함됩니다.
 
 ```json
-{"email": "alice@example.com", "services": ["vertex_ai"], "projects": ["team-b-prod"], "reason": "policy breach drill",
+{"email": "alice@example.com", "services": ["gemini_platform"], "projects": ["team-b-prod"], "reason": "policy breach drill",
  "until": "2026-11-27T00:00:00Z", "trigger": "manual", "actor": "key:1a2b3c4d5e6f"}
 ```
 
 ```json
-{"email": "bob@example.com", "services": ["antigravity", "vertex_ai", "gemini_enterprise"], "projects": "all",
+{"email": "bob@example.com", "services": ["antigravity", "gemini_platform", "gemini_enterprise"], "projects": "all",
  "trigger": "auto_cap", "until": "2026-12-01T00:00:00Z", "reasons": ["cost"]}
 ```
 
@@ -209,8 +209,8 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 ### 6.3 `user.unblocked`
 
 ```json
-{"email": "alice@example.com", "unblocked_services": ["vertex_ai"], "unblocked_projects": ["team-b-prod"],
- "remaining_services": ["vertex_ai"], "remaining_projects": ["team-a-prod"],
+{"email": "alice@example.com", "unblocked_services": ["gemini_platform"], "unblocked_projects": ["team-b-prod"],
+ "remaining_services": ["gemini_platform"], "remaining_projects": ["team-a-prod"],
  "reason": "drill complete", "trigger": "manual", "actor": "key:1a2b3c4d5e6f"}
 ```
 
@@ -218,7 +218,7 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 {"email": "bob@example.com", "trigger": "auto_reset"}
 ```
 
-- `manual`: `services`를 지정하지 않으면 `unblocked_services`는 모든 서비스(`antigravity`, `vertex_ai`,
+- `manual`: `services`를 지정하지 않으면 `unblocked_services`는 모든 서비스(`antigravity`, `gemini_platform`,
   `gemini_enterprise`). `projects`를 지정하지 않으면 `unblocked_projects`는 `"all"`. `remaining_services` /
   `remaining_projects`가 비어 있지 않으면 일부 서비스·프로젝트는 계속 차단 중입니다.
 - `auto_reset`: 기간 리셋으로 자동 복구(집행 주기에서 IAM 적용 성공 시).
@@ -238,7 +238,7 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 Vertex AI 조직 정책(`constraints/vertexai.allowedModels`) 적용:
 
 ```json
-{"surface": "vertex_ai", "scope": "projects/team-a", "mode": "allow_list",
+{"surface": "gemini_platform", "scope": "projects/team-a", "mode": "allow_list",
  "models": ["google/*"], "expanded_models": ["publishers/google/models/<model-a>", "publishers/google/models/<model-b>"],
  "operation_id": "op_0123456789abcdef", "actor": "key:1a2b3c4d5e6f"}
 ```
@@ -423,7 +423,7 @@ Gemini Enterprise 앱 모델 변경(단건 `PATCH /v1/gemini-enterprise/apps/{ap
 로그(어떤 서비스든)에서 **처음 사용된** 모델. 내장 모델 목록 없이 신규 모델을 사용 당일 추적합니다.
 
 ```json
-{"model": "<model-id>", "publisher": "anthropic", "surfaces": ["vertex_ai"], "projects": ["team-a-prod"],
+{"model": "<model-id>", "publisher": "anthropic", "surfaces": ["gemini_platform"], "projects": ["team-a-prod"],
  "users": 3, "first_seen": "2026-11-26T09:12:44Z", "in_model_garden": true}
 ```
 
@@ -431,7 +431,7 @@ Gemini Enterprise 앱 모델 변경(단건 `PATCH /v1/gemini-enterprise/apps/{ap
 |---|---|
 | `model` | 로그에 기록된 모델 ID(소문자 정규화, `publishers/.../models/` 접두사·`:action` 접미사 제거) |
 | `publisher` | 로그 리소스(`publishers/{p}/models/{m}`) 또는 Model Garden 기준. 알 수 없으면 `null`(이름으로 추측하지 않음) |
-| `surfaces` | `antigravity` · `vertex_ai` · `gemini_enterprise` 중 관측된 서비스 |
+| `surfaces` | `antigravity` · `gemini_platform` · `gemini_enterprise` 중 관측된 서비스 |
 | `projects` | 관측된 관리 프로젝트(최대 20개) |
 | `users` | 관측 구간의 사용자 수 |
 | `first_seen` | 로그상 최초 사용 시각 |

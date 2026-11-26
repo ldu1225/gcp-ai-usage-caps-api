@@ -35,7 +35,7 @@ Install it **once in a hub (main) project** and it governs **every managed proje
 | 📊 Usage & cost | Per user / project / model / traffic tier: requests, input/output/cached/cache-write/thinking tokens, estimated cost; monthly chargeback; unattributed usage reported separately |
 | 💲 Official prices | Daily Cloud Billing Catalog SKU sync (input, output, cache read/write, long context, Flex/Priority/Batch), contract overrides, `GET /v1/pricing` |
 | 💰 Spend caps | Global + per-user caps (cost, tokens, requests), **total or per-project**, 80/100% alerts, auto/manual enforcement, period resets, project hard caps |
-| 🚫 Block / unblock | Immediate per-service **and per-project** blocking (`antigravity`, `vertex_ai`, `gemini_enterprise`) with optional expiry |
+| 🚫 Block / unblock | Immediate per-service **and per-project** blocking (`antigravity`, `gemini_platform`, `gemini_enterprise`) with optional expiry |
 | 🧠 Model governance | Dynamic catalog; allow/deny per project/folder/org (Org Policy `vertexai.allowedModels`); Gemini Enterprise app model switches; **per-user model rules — block first, always notify** |
 | 🔎 Model tracking | First-seen models auto-registered from logs; Model Garden additions/delistings detected |
 | ⏱️ Rate limits & quotas | RPM/TPM per model & region with usage and headroom, decreases, **quota increase requests submitted directly to Google Cloud** |
@@ -104,7 +104,7 @@ Vertex AI token counts exist only in the **inference request metadata log** (`ai
 | 1 | Custom header label sent by the portal: `x-goog-agent-platform-observability-label-user: <email or uid>` | exact | `header_label` |
 | 2 | Data Access audit correlation: same project + model, same minute (±1), tokens split by each caller's request share | approximate | `audit_correlated` |
 | 3 | Otherwise kept as project-level **`unattributed`** usage (never dropped) | project totals exact | `unattributed` |
-| – | Inference logs disabled → per-user **request counts only** from audit logs (`token_sources.vertex_ai = requests_only`) | no tokens/cost | – |
+| – | Inference logs disabled → per-user **request counts only** from audit logs (`token_sources.gemini_platform = requests_only`) | no tokens/cost | – |
 
 ```bash
 # Enable the inference request log (admin key)
@@ -157,7 +157,7 @@ curl -s -X PUT $BASE/v1/caps/policy -H "Authorization: Bearer $KEY" -H "Content-
 curl -s -X PUT "$BASE/v1/caps/users/alice%40company.com" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"type":"limit","cost_cap":200,"scope":"total","project_caps":{"team-a-prod":{"cost_cap":150},"team-b-prod":{"cost_cap":50}}}'
 curl -s -X POST "$BASE/v1/users/alice%40company.com/block" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"services":["vertex_ai"],"projects":["team-b-prod"],"reason":"project budget exhausted"}'
+  -d '{"services":["gemini_platform"],"projects":["team-b-prod"],"reason":"project budget exhausted"}'
 curl -s -X POST "$BASE/v1/users/alice%40company.com/unblock" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"projects":["team-b-prod"]}'
 curl -s "$BASE/v1/users/alice%40company.com/projects?include=iam" -H "Authorization: Bearer $KEY"

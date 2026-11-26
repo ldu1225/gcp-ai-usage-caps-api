@@ -988,10 +988,10 @@ def _vertex_audit_only(ctx, audit_rows: list[dict], *, email: str | None, rng) -
             continue
         usage.records += r["requests"]
         counts = token_counts(prompt=0, cand=0, cached=0, total=0, requests=r["requests"])
-        usage.add_counts(person, counts, surface="vertex_ai", project=r.get("project") or ctx.project,
+        usage.add_counts(person, counts, surface="gemini_platform", project=r.get("project") or ctx.project,
                          model=r.get("model") or "unspecified", publisher=r.get("publisher"), ts=r.get("ts"))
         _add_daily_ts(usage, person, r.get("ts"), rng, tz, r["requests"], 0)
-    usage.token_sources["vertex_ai"] = "requests_only"
+    usage.token_sources["gemini_platform"] = "requests_only"
     usage.ok = True
     return usage
 
@@ -1035,17 +1035,17 @@ def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None
     if not inf_rows:
         # No inference request entries while audit logs show Vertex AI calls -> logging is not enabled / routed.
         if audit_rows:
-            ctx.warn("vertex_ai", "inference_logs_missing",
+            ctx.warn("gemini_platform", "inference_logs_missing",
                      "Vertex AI inference request metadata logging is not enabled or not routed: per-user request "
                      "counts come from Data Access audit logs but token counts and costs are unavailable. Run "
                      "POST /v1/projects/{project}/vertex-logging:enable or scripts/prepare.sh.")
             return _vertex_audit_only(ctx, audit_rows, email=email, rng=rng)
         if inf_rows is None:
             out = UsageResult("unavailable")
-            out.token_sources["vertex_ai"] = "unavailable"
+            out.token_sources["gemini_platform"] = "unavailable"
             return out
         empty = UsageResult("vertex")
-        empty.token_sources["vertex_ai"] = "logs"
+        empty.token_sources["gemini_platform"] = "logs"
         empty.ok = True
         return empty
     directory = directory if directory is not None else user_directory(
@@ -1057,17 +1057,17 @@ def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None
         usage.records += int(counts.get("requests") or 0)
         proj = row.get("project") or ctx.project
         if person is None:
-            usage.add_unattributed(proj, row["model"], counts, surface="vertex_ai", publisher=row.get("publisher"),
+            usage.add_unattributed(proj, row["model"], counts, surface="gemini_platform", publisher=row.get("publisher"),
                                    ts=row.get("ts"), reason="service_account" if row.get("principal") else
                                    "no_user_identity")
             continue
         if email and person != email:
             continue
-        usage.add_counts(person, counts, surface="vertex_ai", project=proj, model=row["model"],
+        usage.add_counts(person, counts, surface="gemini_platform", project=proj, model=row["model"],
                          publisher=row.get("publisher"), ts=row.get("ts"), attribution=kind)
         _add_daily_ts(usage, person, row.get("ts"), rng, tz, int(counts.get("requests") or 0),
                       int(counts.get("total_tokens") or 0))
-    usage.token_sources["vertex_ai"] = "logs"
+    usage.token_sources["gemini_platform"] = "logs"
     usage.ok = True
     return usage
 
@@ -1159,13 +1159,13 @@ def collect_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | Non
         if ok and isinstance(val, UsageResult) and val.ok:
             any_ok = True
             combined.merge(val)
-    if "vertex_ai" in wanted:
+    if "gemini_platform" in wanted:
         # Runs after the other surfaces so header-label uids can be resolved against every person already seen.
         try:
             vx = vertex_usage(ctx, start, end, email=email, rng=rng, fresh=fresh,
                               directory=user_directory(ctx, set(combined.users)))
         except GcpError as err:
-            ctx.warn_error("vertex_ai", err, "Vertex AI usage")
+            ctx.warn_error("gemini_platform", err, "Vertex AI usage")
             vx = None
         if vx is not None and vx.ok:
             any_ok = True
@@ -1251,7 +1251,7 @@ def usage_meta(usage: UsageResult) -> dict:
 def list_user_usage(ctx) -> dict:
     """GET /v1/usage/users"""
     rng = ctx.range or timeutil.parse_range(ctx.params, ctx.tz_name, ctx.ws.get("default_range_days", 14))
-    surface = (ctx.params.get("surface") or "").strip().lower()
+    surface = config.normalize_service(ctx.params.get("surface") or "")
     if surface and surface not in ("all", *config.VALID_SERVICES):
         raise ApiError("bad_request", "Parameter 'surface' must be one of: all, %s." % ", ".join(config.VALID_SERVICES))
     email_f = (ctx.params.get("email") or "").strip().lower()

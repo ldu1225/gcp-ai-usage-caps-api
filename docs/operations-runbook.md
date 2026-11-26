@@ -46,7 +46,7 @@ ADMIN_KEY=gcpai_xxxxxxxxxxxx_yyyyyyyy...   # admin 스코프 키
 | Enforcer Job 실행 이력 | `gcloud run jobs executions list --job $SVC-enforcer --region $REGION --project $HUB --limit 5` | 5분 간격 성공 실행 |
 | 스케줄러 | `gcloud scheduler jobs describe $SVC-enforce-schedule --location $REGION --project $HUB --format='value(state,lastAttemptTime,status)'` | `ENABLED`, 최근 시도 성공 |
 | **단가 동기화** | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/pricing" \| jq '.pricing_source'` / `gcloud scheduler jobs describe $SVC-pricing-sync --location $REGION --project $HUB` | `catalog_synced_at`이 24시간 이내, `official_sku_models > 0`, `billing_export: "not_used"` |
-| **Vertex AI 토큰 출처** | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/usage/users?limit=1" \| jq '.telemetry'` | `token_sources.vertex_ai = "logs"`, `attribution.unattributed`가 전체 대비 작음 |
+| **Vertex AI 토큰 출처** | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/usage/users?limit=1" \| jq '.telemetry'` | `token_sources.gemini_platform = "logs"`, `attribution.unattributed`가 전체 대비 작음 |
 | 실시간 구독 적체 | Cloud Monitoring `pubsub.googleapis.com/subscription/num_undelivered_messages` (구독 `$SVC-usage-events-push`) | 0 근처 |
 | 감사 로그 | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/audit-logs"` | 예상하지 못한 `api_key.created`, `user.blocked` 등 없음 |
 
@@ -65,7 +65,7 @@ gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=$S
 2. `fail` → `warn` 순으로 `projects[].checks[]`와 `cross_project[]`를 확인합니다. 각 체크의 `impact`가 영향받는
    기능(`usage`, `caps_enforcement`, `model_governance`, `quota_management`, `realtime`, …)입니다.
 3. `skip`은 오류가 아니라 **판단 불가**입니다. `detail`의 사유(권한, API 비활성, VPC-SC)를 해결하면 다시 평가됩니다.
-4. `capabilities[project]`로 서피스별 사용 가능 여부(`vertex_ai`, `gemini_enterprise`, `antigravity`)와
+4. `capabilities[project]`로 서피스별 사용 가능 여부(`gemini_platform`, `gemini_enterprise`, `antigravity`)와
    `org_policy_writable`, `quotas_api`, `deny_writable`을 확인합니다.
 5. `remediation_script`를 내려받아 검토 후 실행합니다.
 
@@ -89,7 +89,7 @@ sequenceDiagram
     participant U as 사용자
     Op->>API: POST /v1/caps/enforce {"dryRun": true}
     API-->>Op: plan / gates (G1-G7) 미리보기
-    Op->>API: POST /v1/users/{email}/block {"services":["vertex_ai"]}
+    Op->>API: POST /v1/users/{email}/block {"services":["gemini_platform"]}
     API->>Job: ENFORCEMENT_JOB 설정 시 Job 실행
     Job->>IAM: gcp-ai-caps-managed 정책 갱신
     Note over IAM,U: 전파 보통 1~2분
@@ -100,7 +100,7 @@ sequenceDiagram
 
 1. **드라이런**: `POST /v1/caps/enforce {"dryRun": true}`(기본값도 `true`) — 계획(`plan`)과 안전 게이트(`gates`
    G1–G7)를 확인합니다. 게이트 상세는 [enforcement-logic.md](enforcement-logic.md).
-2. **테스트 사용자 차단**: `POST /v1/users/test.user@example.com/block` `{"services":["vertex_ai"],"reason":"drill"}`.
+2. **테스트 사용자 차단**: `POST /v1/users/test.user@example.com/block` `{"services":["gemini_platform"],"reason":"drill"}`.
    응답의 `enforcement.applied`(또는 `mode: enforcer_job`)를 확인합니다.
 3. **Deny 정책 확인** (deny 읽기 권한 필요):
 
@@ -142,7 +142,7 @@ sequenceDiagram
 |---|---|
 | 자동 차단이 오작동하는 것 같다 (추가 차단만 막고 싶음) | `PUT /v1/caps/policy {"enforcement_mode":"manual"}` — 자동 정지 중단, 수동 block/unblock은 계속 IAM에 반영 |
 | 신규 차단을 전부 멈추고 소수만 풀어야 함 | `PUT /v1/caps/policy {"enforcement_backend":"notify_only"}` → `POST /v1/users/{email}/unblock`(서비스 지정 없이) 반복 → 응답 `enforcement.applied` 확인 |
-| 소수 사용자를 즉시 풀어야 함 (집행 유지) | backend `iam_deny` 그대로 `POST /v1/users/{email}/unblock`. 서비스 일부만: `{"services":["vertex_ai"]}` |
+| 소수 사용자를 즉시 풀어야 함 (집행 유지) | backend `iam_deny` 그대로 `POST /v1/users/{email}/unblock`. 서비스 일부만: `{"services":["gemini_platform"]}` |
 | 특정 사용자를 앞으로도 절대 차단하면 안 됨 | `PUT /v1/caps/users/{email} {"type":"allow"}` (캡 자동 정지·임계값 웹훅 제외) + 모델 규칙 보호: `MODEL_PROTECTED_PRINCIPALS` / `models.protected_principals` |
 | 전원을 즉시 풀고 집행을 멈춰야 함 (break-glass) | 아래 4.2 |
 
@@ -182,10 +182,10 @@ done
 | 증상 | 가능한 원인 | 확인 | 조치 |
 |---|---|---|---|
 | 사용량이 0 / 특정 서피스 데이터 없음 | 싱크 없음·비활성·writer 권한 없음, `_Default` 제외 필터, Vertex AI Data Access 로그 꺼짐, Antigravity Metadata logging 꺼짐, 서비스가 데이터세트를 잘못 가리킴 | readiness `logging.sink.bigquery`, `logging.sink.writer_access`, `logging.sink.disabled`, `logging.default_sink`, `logging.audit_config.aiplatform`, `surface.antigravity.metadata_logging`, `bq.freshness.*`; Cloud Run 환경변수 `AUDIT_PROJECT_ID`/`AUDIT_DATASET_ID` | `prepare.sh` 재실행(싱크·권한), `--enable-data-access-logs`, 콘솔에서 Metadata logging 켜기, 환경변수 수정. 새 싱크는 **생성 이후** 로그만 라우팅합니다 |
-| Vertex AI 요청 수는 있는데 토큰·비용이 0 (`token_sources.vertex_ai = "requests_only"`, 경고 `inference_logs_missing`) | 추론 요청 메타데이터 로그 꺼짐, 또는 싱크 필터에 `aiplatform.googleapis.com/inference_request` 없음(1.1 이하에서 채택한 싱크) | readiness `logging.vertex_inference_logging`, `logging.sink.bigquery`의 `data.missing`, `GET /v1/projects/{id}/vertex-logging` | `POST /v1/projects/{id}/vertex-logging/enable` 또는 `prepare.sh` 재실행. 레거시 싱크는 readiness가 제시하는 `gcloud logging sinks update ... --log-filter=...`로 필터 보강. 켠 **이후** 요청부터 토큰이 집계됩니다 |
+| Vertex AI 요청 수는 있는데 토큰·비용이 0 (`token_sources.gemini_platform = "requests_only"`, 경고 `inference_logs_missing`) | 추론 요청 메타데이터 로그 꺼짐, 또는 싱크 필터에 `aiplatform.googleapis.com/inference_request` 없음(1.1 이하에서 채택한 싱크) | readiness `logging.vertex_inference_logging`, `logging.sink.bigquery`의 `data.missing`, `GET /v1/projects/{id}/vertex-logging` | `POST /v1/projects/{id}/vertex-logging/enable` 또는 `prepare.sh` 재실행. 레거시 싱크는 readiness가 제시하는 `gcloud logging sinks update ... --log-filter=...`로 필터 보강. 켠 **이후** 요청부터 토큰이 집계됩니다 |
 | `telemetry.attribution.unattributed`가 큼 / `summary.unattributed_*` 증가 | 포털이 Vertex AI 호출에 헤더 라벨을 안 붙임, 헤더 값이 알 수 없는 uid, Data Access 감사 로그 꺼짐, 배치·서비스 계정 워크로드 | `telemetry.unattributed_projects`, `GET /v1/usage/models?group_by=project`의 `unattributed_*`, 차지백 `unattributed[].reasons` (`service_account` / `no_user_identity`) | §10.3 참고: 헤더 추가(이메일 권장), `--enable-data-access-logs`, 서비스 계정 워크로드는 프로젝트 비용으로 처리 |
 | `estimated_cost`가 `null` / `cost_partial: true` / `cost_basis: "unpriced"` | 단가 동기화 안 됨, 해당 모델 SKU가 아직 Catalog에 없음, 모델 ID와 SKU 이름 불일치 | `GET /v1/pricing` (`catalog_synced_at`, `model_key` 목록), `GET /v1/pricing?model=<model-id>` | `POST /v1/internal/pricing/sync`(관리자 키) 실행, Scheduler `$SVC-pricing-sync` 확인. 불일치는 `pricing.model_aliases`, 계약 단가는 `pricing.model_overrides`. **추측 단가로 채우지 않습니다** |
-| `GET /v1/models`가 비어 있거나 Model Garden 모델이 없음 | Model Garden 조회 실패(권한·VPC-SC·네트워크), 아직 로그 관측 없음 — **내장 목록 없음**(정상 설계) | 응답 `catalog.errors`, `catalog.model_garden_models`, readiness `surface.vertex_ai.models` | 원인 해결 후 `POST /v1/models/sync`. 로그에서 모델이 사용되면 `source: observed`로 자동 등록 |
+| `GET /v1/models`가 비어 있거나 Model Garden 모델이 없음 | Model Garden 조회 실패(권한·VPC-SC·네트워크), 아직 로그 관측 없음 — **내장 목록 없음**(정상 설계) | 응답 `catalog.errors`, `catalog.model_garden_models`, readiness `surface.gemini_platform.models` | 원인 해결 후 `POST /v1/models/sync`. 로그에서 모델이 사용되면 `source: observed`로 자동 등록 |
 | `vpcsc.denials` / API 호출이 `SECURITY_POLICY_VIOLATED`, "VPC Service Controls" 오류 | 허브와 관리 프로젝트가 다른 경계, 경계 밖 호출자(포털·설치 PC) | readiness `vpcsc.perimeter`, `vpcsc.cross_project`, `vpcsc.denials`의 `data.denials` | `vpcsc.cross_project`가 생성한 ingress/egress YAML을 기존 규칙과 병합 적용, 포털에는 액세스 수준/ingress 규칙 ([preflight-checklist.md §7](preflight-checklist.md#7-vpc-서비스-제어vpc-sc-경계-간-ingressegress-가이드)) |
 | 모델 접근 정책 변경 시 `403`/`forbidden`, `org_policy_writable=false` | 런타임 SA에 조직 수준 `roles/orgpolicy.policyAdmin` 없음, `orgpolicy.googleapis.com` 비활성, `ALLOW_ORG_POLICY_WRITES=false`, 조직 없는 프로젝트 | `iam.runtime.permissions`의 `data.missing`, `api.orgpolicy.enabled`, `capabilities.org_policy_writable` | 조직 관리자가 `roles/orgpolicy.policyAdmin` 부여 (조직 전용 역할) |
 | 쿼터 조회/요청 `403` ("lacks cloudquotas.quotas.update") | `roles/cloudquotas.admin` 없음, API 비활성 | `quotas.api` | `gcloud projects add-iam-policy-binding P --member=serviceAccount:ai-usage-caps-api@HUB.iam.gserviceaccount.com --role=roles/cloudquotas.admin`, API 활성화 |

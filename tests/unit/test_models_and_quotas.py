@@ -65,7 +65,7 @@ class ModelCatalogAndAccessTests(GovernanceTestBase):
             self.assertEqual(model["lifecycle"]["stage"], "preview")
             self.assertEqual(model["resource_name"], "publishers/google/models/gemini-next-pro-preview")
             self.assertIn("test-ai-project", model["access_by_project"])
-            self.assertEqual(model["access_by_project"]["test-ai-project"]["vertex_ai"]["decision"], "allowed")
+            self.assertEqual(model["access_by_project"]["test-ai-project"]["gemini_platform"]["decision"], "allowed")
 
             st, priced, _ = srv.request("GET", "/v1/models/gemini-test-pro", token=ADMIN)
             self.assertEqual(priced["pricing"]["input_per_1m_tokens"], 1.25)
@@ -132,7 +132,7 @@ class ModelCatalogAndAccessTests(GovernanceTestBase):
 
             # Effective access reflected in the catalog
             st, model, _ = srv.request("GET", "/v1/models/claude-test-sonnet", token=ADMIN)
-            self.assertEqual(model["access_by_project"]["test-ai-project"]["vertex_ai"]["decision"], "denied")
+            self.assertEqual(model["access_by_project"]["test-ai-project"]["gemini_platform"]["decision"], "denied")
 
             # Operation polling
             st, op, _ = srv.request("GET", "/v1/operations/%s" % res["operation"]["id"], token=ADMIN)

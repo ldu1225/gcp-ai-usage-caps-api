@@ -89,7 +89,7 @@ class NoHardcodedModelsTests(_Base):
             ids = {m["id"]: m for m in page["data"]}
             self.assertIn("zeta-omni-9", ids)
             self.assertEqual(ids["zeta-omni-9"]["publisher"], "newvendor")
-            self.assertEqual(ids["zeta-omni-9"]["surfaces"], ["vertex_ai"])
+            self.assertEqual(ids["zeta-omni-9"]["surfaces"], ["gemini_platform"])
             self.assertEqual(ids["zeta-omni-9"]["resource_name"], "publishers/newvendor/models/zeta-omni-9")
             self.assertIn("gemini-test-ultra", ids)
             first = sorted(e["data"]["model"] for e in self.events("model.first_seen"))
@@ -155,7 +155,7 @@ class VertexAttributionTests(_Base):
         ]
         ctx = _ctx(self.app)
         res = usage.collect_usage(ctx, now - dt.timedelta(hours=1), now + dt.timedelta(minutes=5),
-                                  surfaces=["vertex_ai"])
+                                  surfaces=["gemini_platform"])
         self.assertTrue(res.ok)
         lee = res.users["lee@company.com"]
         self.assertEqual((lee["requests"], lee["input_tokens"], lee["output_tokens"], lee["thoughts_tokens"]),
@@ -170,15 +170,15 @@ class VertexAttributionTests(_Base):
         self.assertEqual(un["reasons"], {"service_account": 1})
         self.assertEqual(res.attribution["header_label"], 2)
         self.assertEqual(res.attribution["unattributed"], 1)
-        self.assertEqual(res.token_sources["vertex_ai"], "logs")
+        self.assertEqual(res.token_sources["gemini_platform"], "logs")
 
     def test_inference_logs_missing_falls_back_to_audit_request_counts(self):
         now = dt.datetime.now(dt.timezone.utc)
         self.gcp.log_entries = [make_audit_entry("park@company.com", ts=now)]
         ctx = _ctx(self.app)
         res = usage.collect_usage(ctx, now - dt.timedelta(hours=1), now + dt.timedelta(minutes=1),
-                                  surfaces=["vertex_ai"])
-        self.assertEqual(res.token_sources.get("vertex_ai"), "requests_only")
+                                  surfaces=["gemini_platform"])
+        self.assertEqual(res.token_sources.get("gemini_platform"), "requests_only")
         self.assertEqual(res.users["park@company.com"]["requests"], 1)
         self.assertTrue(any(w["code"] == "inference_logs_missing" for w in ctx.warnings))
 
@@ -366,7 +366,7 @@ class MultiProjectUserTests(_Base):
     def test_project_scoped_manual_block_and_unblock(self):
         with LiveTestServer(self.app) as srv:
             st, res, _ = srv.request("POST", "/v1/users/sam%40company.com/block", token=ADMIN,
-                                     body={"projects": [TEAM_B], "services": ["vertex_ai"]})
+                                     body={"projects": [TEAM_B], "services": ["gemini_platform"]})
             self.assertEqual((st, res["scope"]), (200, "projects"), res)
             self.assertTrue(any("sam@company.com" in p for p in self.denied_at(TEAM_B)))
             self.assertFalse(any("sam@company.com" in p for p in self.denied_at(HUB)))

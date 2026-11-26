@@ -161,40 +161,40 @@ def antigravity(run, pid: str) -> tuple[list[dict], dict]:
     return out, cap
 
 
-def vertex_ai(run, pid: str) -> tuple[dict, dict]:
+def gemini_platform(run, pid: str) -> tuple[dict, dict]:
     title = ("Vertex AI 사용 가능", "Vertex AI available")
     api = run.api_enabled(pid, "aiplatform.googleapis.com")
     if api is None:
         cap = {"available": None, "reason": "unknown", "apps": [], "locations": []}
-        return check("surface.vertex_ai", "surfaces", "skip", *title,
+        return check("surface.gemini_platform", "surfaces", "skip", *title,
                      "API state of %s unknown." % pid, data=cap), cap
     if not api:
         cap = {"available": False, "reason": "api_disabled", "apps": [], "locations": []}
-        return check("surface.vertex_ai", "surfaces", "info", *title,
+        return check("surface.gemini_platform", "surfaces", "info", *title,
                      "aiplatform.googleapis.com is not enabled on %s: Vertex AI usage/model governance is not_applicable."
-                     % pid, impact=["vertex_ai"], data=cap), cap
+                     % pid, impact=["gemini_platform"], data=cap), cap
     locs = list(run.fact(run.hub, "vertex_locations") or ["global"])
     cap = {"available": True, "reason": "api_enabled", "apps": [], "locations": locs}
-    return check("surface.vertex_ai", "surfaces", "pass", *title, "aiplatform.googleapis.com is enabled on %s." % pid,
+    return check("surface.gemini_platform", "surfaces", "pass", *title, "aiplatform.googleapis.com is enabled on %s." % pid,
                  data=cap), cap
 
 
 def vertex_models_check(run) -> dict:
-    """surface.vertex_ai.models (cross-project): Model Garden publisher models reachable."""
+    """surface.gemini_platform.models (cross-project): Model Garden publisher models reachable."""
     title = ("Vertex AI 모델 카탈로그 접근", "Vertex AI model catalog reachable")
     _, err = run.try_call("GET", "%s/v1beta1/publishers/google/models" % AIPLATFORM, params={"pageSize": 1})
     if err is None:
         run.set_fact(run.hub, "vertex_locations", ["global"])
-        return check("surface.vertex_ai.models", "surfaces", "pass", *title, "Global publisher model catalog reachable.")
+        return check("surface.gemini_platform.models", "surfaces", "pass", *title, "Global publisher model catalog reachable.")
     regional = "https://%s-aiplatform.googleapis.com" % run.region
     _, err2 = run.try_call("GET", "%s/v1beta1/publishers/google/models" % regional, params={"pageSize": 1})
     if err2 is None:
         run.set_fact(run.hub, "vertex_locations", [run.region])
-        return check("surface.vertex_ai.models", "surfaces", "warn", *title,
+        return check("surface.gemini_platform.models", "surfaces", "warn", *title,
                      "Global endpoint unreachable (%s); regional endpoint %s works: the model catalog uses %s." % (
                          reason_of(err), run.region, run.region), impact=["model_governance"],
                      data={"catalog_location": run.region})
-    return check("surface.vertex_ai.models", "surfaces", "warn", *title,
+    return check("surface.gemini_platform.models", "surfaces", "warn", *title,
                  "Publisher model catalog unreachable globally (%s) and in %s (%s): the model catalog falls back to the "
                  "static list." % (reason_of(err), run.region, reason_of(err2)), impact=["model_governance"])
 
@@ -203,7 +203,7 @@ def surface_checks(run, pid: str) -> tuple[list[dict], dict]:
     """(checks, capabilities-subset) for one project."""
     ge_check, ge_cap = gemini_enterprise(run, pid)
     agy_checks, agy_cap = antigravity(run, pid)
-    vx_check, vx_cap = vertex_ai(run, pid)
-    caps = {"gemini_enterprise": ge_cap, "antigravity": agy_cap, "vertex_ai": vx_cap}
+    vx_check, vx_cap = gemini_platform(run, pid)
+    caps = {"gemini_enterprise": ge_cap, "antigravity": agy_cap, "gemini_platform": vx_cap}
     run.set_fact(pid, "surfaces", caps)
     return [vx_check, ge_check] + agy_checks, caps

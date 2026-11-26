@@ -53,7 +53,7 @@ flowchart LR
 | 서비스(`services`) | 거부 권한(deniedPermissions) |
 |---|---|
 | `antigravity` | `businessaicode.googleapis.com/locations.generateContent` |
-| `vertex_ai` | `aiplatform.googleapis.com/endpoints.predict` |
+| `gemini_platform` | `aiplatform.googleapis.com/endpoints.predict` |
 | `gemini_enterprise` | `discoveryengine.googleapis.com/assistants.assist` |
 
 * **주체(principal)**: Google 계정은 `principal://goog/subject/{email}`, Workforce Identity는 `principal://iam.googleapis.com/locations/global/workforcePools/...` 형식으로 변환합니다. 그룹·도메인·상속 역할로 받은 권한도 Deny가 우선하므로 **우회가 불가능**합니다(G5).
@@ -106,7 +106,7 @@ flowchart TD
 | **사용량 기반 복구** | 캡 상향 등으로 더 이상 초과가 아니고 G3(텔레메트리 건전) 통과 시 복구. G3 경고면 보류(`plan.withheld_restores`) |
 | **만료(`until`)** | 수동 차단·모델 규칙 차단은 만료 후 다음 집행 사이클에서 제거 |
 | `POST /unblock {"projects":["team-b-prod"]}` | 그 프로젝트의 Deny 항목만 제거. 전역 차단/정지는 “모든 관리 프로젝트 − 대상”으로 **좁혀서** 유지 |
-| `POST /unblock {"services":["vertex_ai"]}` | 해당 서비스만 제거, 나머지 서비스 차단 유지 |
+| `POST /unblock {"services":["gemini_platform"]}` | 해당 서비스만 제거, 나머지 서비스 차단 유지 |
 | `POST /unblock {}` | 수동 차단·차단 규칙·자동 정지 모두 제거, 모든 부착점에서 제거 |
 | 캡 규칙 `type=allow` | 수동 차단이 없으면 모든 부착점에서 제거(알림만) |
 | `notify_only` 백엔드 | 새 Deny 항목은 추가하지 않지만, 해제(break-glass)는 기존 항목을 제거 |

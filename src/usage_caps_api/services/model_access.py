@@ -241,10 +241,10 @@ def access_evaluator(ctx, project: str, catalog: dict | None = None):
         out = {"project_id": project}
         if eff.get("ok"):
             decision, reason = decide(eff["parsed"], pub, mid, "predict")
-            out["vertex_ai"] = {"decision": decision, "reason": reason, "enforcement": "org_policy",
+            out["gemini_platform"] = {"decision": decision, "reason": reason, "enforcement": "org_policy",
                                 "policy_mode": eff["parsed"]["mode"]}
         else:
-            out["vertex_ai"] = {"decision": "unknown", "reason": eff.get("error"), "enforcement": "org_policy"}
+            out["gemini_platform"] = {"decision": "unknown", "reason": eff.get("error"), "enforcement": "org_policy"}
         if ge_states is None:
             out["gemini_enterprise"] = {"decision": "unknown", "enforcement": "app_model_config"}
         elif not ge_states:
@@ -535,7 +535,7 @@ def apply_policy(ctx, scope: str, req: dict, *, dry_run: bool, if_match: str | N
         "mode": req["mode"], "models": req["models"], "actions": req["actions"], "values": len(values),
         "reason": req.get("reason"), "operation": op["id"]})
     webhooks.dispatch_event(ctx, "model.access_changed", {
-        "surface": "vertex_ai", "scope": scope, "mode": req["mode"], "models": req["models"],
+        "surface": "gemini_platform", "scope": scope, "mode": req["mode"], "models": req["models"],
         "expanded_models": result["expanded_models"], "operation_id": op["id"], "actor": ctx.caller.id,
     })
     return result

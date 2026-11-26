@@ -386,7 +386,7 @@ class ReadinessEngineTests(unittest.TestCase):
         cap = report["capabilities"][SPOKE]
         self.assertTrue(cap["gemini_enterprise"]["available"])
         self.assertTrue(cap["antigravity"]["available"])
-        self.assertTrue(cap["vertex_ai"]["available"])
+        self.assertTrue(cap["gemini_platform"]["available"])
         self.assertTrue(cap["org_policy_writable"])
         self.assertTrue(cap["deny_writable"])
         self.assertTrue(cap["quotas_api"])
@@ -648,7 +648,7 @@ class ReadinessEngineTests(unittest.TestCase):
         self.assertEqual(find(report, "bq.billing_export"), [])
         env = dict(line.split("=", 1) for line in preflight.env_lines(report))
         self.assertFalse([k for k in env if k.startswith("PREFLIGHT_BILLING")])
-        self.assertEqual(one(report, "bq.freshness.vertex_ai", HUB)["data"]["table"],
+        self.assertEqual(one(report, "bq.freshness.gemini_platform", HUB)["data"]["table"],
                          "hub-proj:ge_analytics.aiplatform_googleapis_com_inference_request")
         self.assertEqual(one(report, "bq.dataset.location_consistency")["status"], "pass")
 
@@ -675,7 +675,7 @@ class ReadinessEngineTests(unittest.TestCase):
         self.assertEqual(c["status"], "warn")  # never a failure
         self.assertNotIn("blocking", c)
         self.assertFalse(c["data"]["enabled"])
-        self.assertIn("vertex_ai", c["impact"])
+        self.assertIn("gemini_platform", c["impact"])
         self.assertIn("Cloud Logging", c["detail"])
         cmds = "\n".join(c["remediation"]["commands"])
         self.assertIn("https://aiplatform.googleapis.com/v1beta1/projects/spoke-proj:setPublisherModelConfig", cmds)
@@ -738,7 +738,7 @@ class ReadinessEngineTests(unittest.TestCase):
         report = self.run_report(cloud)
         c = one(report, "logging.sink.bigquery", SPOKE)
         self.assertEqual(c["status"], "warn")
-        self.assertEqual(c["data"]["missing"], ["vertex_ai"])
+        self.assertEqual(c["data"]["missing"], ["gemini_platform"])
         self.assertEqual(c["data"]["missing_logs"], ["aiplatform.googleapis.com/inference_request"])
         self.assertIn("aiplatform.googleapis.com/inference_request", c["detail"])
         self.assertTrue(c["auto_fixable"])
@@ -847,7 +847,7 @@ class ReadinessHandlerTests(unittest.TestCase):
         probe = readiness.capabilities(ctx, SPOKE)
         self.assertEqual(probe["source"], "probe")
         self.assertIs(probe["gemini_enterprise"]["available"], False)
-        for key in ("vertex_ai", "gemini_enterprise", "antigravity", "org_policy_writable", "quotas_api",
+        for key in ("gemini_platform", "gemini_enterprise", "antigravity", "org_policy_writable", "quotas_api",
                     "deny_writable"):
             self.assertIn(key, probe)
         readiness.get_readiness(ctx)
@@ -1126,7 +1126,7 @@ class ScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env, _ = _stub_env(tmp)
             env.update({"ENFORCEMENT_BACKEND": "notify_only", "CAP_SCOPE": "per_project",
-                        "VERTEX_USER_HEADER_LABEL": "end_user", "METERED_SURFACES": "vertex_ai,antigravity",
+                        "VERTEX_USER_HEADER_LABEL": "end_user", "METERED_SURFACES": "gemini_platform,antigravity",
                         "MODEL_VIOLATION_BLOCK_SCOPE": "project"})
             res = self._run("deploy.sh", ["--project", HUB, "--managed-projects", "spoke-a", "--dry-run"], env)
             self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
@@ -1135,7 +1135,7 @@ class ScriptTests(unittest.TestCase):
             self.assertNotIn("ENFORCEMENT_BACKEND=iam_deny", out)
             self.assertIn("|CAP_SCOPE=per_project", out)
             self.assertIn("|VERTEX_USER_HEADER_LABEL=end_user", out)
-            self.assertIn("|METERED_SURFACES=vertex_ai,antigravity", out)
+            self.assertIn("|METERED_SURFACES=gemini_platform,antigravity", out)
             self.assertIn("|MODEL_VIOLATION_BLOCK_SCOPE=project", out)
             res = self._run("deploy.sh", ["--project", HUB, "--dry-run", "--enforcement-backend", "iam_deny",
                                           "--cap-scope", "total"], env)

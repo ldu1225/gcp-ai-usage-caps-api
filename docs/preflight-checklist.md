@@ -40,7 +40,7 @@ flowchart TD
     P -->|"project.exists = fail"| X["해당 프로젝트 나머지 체크 생략"]
     P --> C["apis"]
     C --> D["orgpolicy / vpcsc / bigquery / logging / surfaces / iam / quotas (병렬)"]
-    D --> H["허브 전용: network, enforcement 리소스, surface.vertex_ai.models"]
+    D --> H["허브 전용: network, enforcement 리소스, surface.gemini_platform.models"]
     H --> CR["프로젝트 간(cross_project): config, 중앙 데이터세트, customConstraints, vpcsc.cross_project, vpcsc.denials, 위치 일관성, deny 상태, 스코프 권한"]
     CR --> S["summary / overall / adaptations / remediation_script"]
 ```
@@ -248,7 +248,7 @@ Check = {id, category, status, title_ko, title_en, detail, impact: [...],
          remediation: {commands: [...], docs_url?}, auto_fixable, blocking (fail일 때만), data?}
 ```
 
-`capabilities[project]`는 `vertex_ai`, `gemini_enterprise`, `antigravity`(각각 `available: true|false|null`,
+`capabilities[project]`는 `gemini_platform`, `gemini_enterprise`, `antigravity`(각각 `available: true|false|null`,
 `reason`, `apps`, `locations`), `org_policy_writable`, `quotas_api`, `deny_writable`, `allowed_models_policy`를
 담습니다. 같은 내용을 프로젝트 단위로 `GET /v1/projects/{project_id}/capabilities`에서 조회할 수 있습니다
 (`object: "capabilities"`, `generated_at`, `source: cache|probe` 추가).
@@ -312,7 +312,7 @@ curl -s -H "Authorization: Bearer $KEY" "$API/v1/projects/team-a/capabilities" \
 | `api.cloudquotas.enabled` | cloudquotas.googleapis.com | required | quota_management | QuotaInfo/QuotaPreference |
 | `api.monitoring.enabled` | monitoring.googleapis.com | required | quota_management | 쿼터 사용량 시계열 |
 | `api.accesscontextmanager.enabled` | accesscontextmanager.googleapis.com | optional | readiness | VPC-SC 경계 조회 |
-| `api.aiplatform.enabled` | aiplatform.googleapis.com | required | vertex_ai, model_governance | 모델 카탈로그, Data Access 감사 로그 |
+| `api.aiplatform.enabled` | aiplatform.googleapis.com | required | gemini_platform, model_governance | 모델 카탈로그, Data Access 감사 로그 |
 | `api.discoveryengine.enabled` | discoveryengine.googleapis.com | surface | gemini_enterprise | Gemini Enterprise 앱 |
 | `api.businessaicode.enabled` | businessaicode.googleapis.com | surface | antigravity | Antigravity (AI 개발자 도구) |
 
@@ -328,7 +328,7 @@ curl -s -H "Authorization: Bearer $KEY" "$API/v1/projects/team-a/capabilities" \
 | `api.cloudquotas.enabled` | cloudquotas.googleapis.com | required | quota_management |
 | `api.monitoring.enabled` | monitoring.googleapis.com | optional | quota_management |
 | `api.bigquery.enabled` | bigquery.googleapis.com | 중앙 모드: optional / 프로젝트별 모드: required | usage |
-| `api.aiplatform.enabled` | aiplatform.googleapis.com | surface | vertex_ai |
+| `api.aiplatform.enabled` | aiplatform.googleapis.com | surface | gemini_platform |
 | `api.discoveryengine.enabled` | discoveryengine.googleapis.com | surface | gemini_enterprise |
 | `api.businessaicode.enabled` | businessaicode.googleapis.com | surface | antigravity |
 
@@ -401,7 +401,7 @@ curl -s -H "Authorization: Bearer $KEY" "$API/v1/projects/team-a/capabilities" \
 | `bq.dataset.exists` | 데이터세트 호스트 프로젝트(중앙: 감사 프로젝트, 프로젝트별: 모든 프로젝트) | 설정된 감사 데이터세트 존재·위치·CMEK | `pass` / `warn`(없음) / `skip` | — | usage | `bq --project_id=P mk --dataset --location=R P:D` 또는 `--reuse-dataset P:D` | 예 |
 | `bq.ai_tables.discovered` | H, M | 기존 AI 로그 테이블(`businessaicode_googleapis_com_inference_response*`, `aiplatform_googleapis_com_inference_request*`, `cloudaudit_googleapis_com_data_access*`, `discoveryengine_googleapis_com_gen_ai_user_message*`, `discoveryengine_googleapis_com_gemini_enterprise_user_activity*`) | `pass`(설정 데이터세트에 존재) / `warn`(다른 데이터세트에 존재, 이 프로젝트가 데이터세트 호스트) / `info` / `skip` | — | usage. 채택 후보를 `data.adopt`(`install_flag`, `config`, `env`)로 제공 | `--reuse-dataset P:D` | 아니오 |
 | `bq.freshness.antigravity` | 데이터세트 호스트 | 최신 테이블이 7일 이내 갱신됐는지 | `pass` / `warn` / `info`(테이블 없음) / `skip` | — | antigravity | 싱크 활성·writer 권한·서피스 사용 여부 확인 | 아니오 |
-| `bq.freshness.vertex_ai` | 데이터세트 호스트 | 위와 동일 (`cloudaudit_googleapis_com_data_access`, 추론 요청 로그 테이블) | 위와 동일 | — | vertex_ai | Data Access 감사 로그 + 추론 요청 로그 활성화 | 아니오 |
+| `bq.freshness.gemini_platform` | 데이터세트 호스트 | 위와 동일 (`cloudaudit_googleapis_com_data_access`, 추론 요청 로그 테이블) | 위와 동일 | — | gemini_platform | Data Access 감사 로그 + 추론 요청 로그 활성화 | 아니오 |
 | `bq.freshness.gemini_enterprise` | 데이터세트 호스트 | 위와 동일 (discoveryengine 테이블) | 위와 동일 | — | gemini_enterprise | — | 아니오 |
 | `bq.dataset.location_consistency` | X | 감사 데이터세트들의 위치 일치 | `pass` / `warn`(데이터세트 위치 상이) | — | usage (교차 위치 조인 불가) | 중앙 데이터세트(`--central-dataset`) 또는 단일 위치 | 아니오 |
 
@@ -425,8 +425,8 @@ CRM `getIamPolicy`(프로젝트/폴더/조직의 `auditConfigs`), BigQuery `data
 | `logging.sink.disabled` | H, M | AI 로그를 라우팅할 싱크가 비활성화됨 | `warn` | — | usage | `gcloud logging sinks update S --no-disabled --project=P` | 아니오 |
 | `logging.sink.writer_access` | H, M | 싱크 writer identity가 목적지에 쓰기 권한 보유(BQ: 데이터세트 WRITER/OWNER/dataEditor/dataOwner/admin 또는 프로젝트 역할, Pub/Sub: publisher/editor/admin), 최대 10개 | `pass` / `warn` / `skip`(전부 읽기 불가) | — | usage, realtime (로그가 조용히 유실) | `bq add-iam-policy-binding --member=W --role=roles/bigquery.dataEditor P:D` / `gcloud pubsub topics add-iam-policy-binding ...` | 예 |
 | `logging.default_sink` | H, M | `_Default` 싱크 존재·활성, 제외 필터·프로젝트 제외가 AI 로그를 버리지 않는지 | `pass` / `warn`(`usage_source`=auto/logging) / `info`(bigquery) | — | usage (Cloud Logging 읽기 누락, BigQuery 싱크는 무관) | 제외 필터 수정 | 아니오 |
-| `logging.audit_config.aiplatform` | H, M | Vertex AI `DATA_READ`+`DATA_WRITE` 감사 로그(프로젝트 → 폴더/조직 상속까지 확인) | `pass` / `warn` / `info`(aiplatform 미활성) / `skip` | — | vertex_ai, usage (헤더 라벨 없는 호출의 사용자 귀속·추론 로그 미활성 시 요청 수 집계 불가) | `scripts/prepare.sh --project HUB [--managed-projects P] --enable-data-access-logs` (기존 auditConfigs 보존 병합) | 예 |
-| `logging.vertex_inference_logging` | H, M | Vertex AI **추론 요청 메타데이터 로그**(`inferenceEventLoggingConfig.state`, v1beta1 `fetchPublisherModelConfig`) 활성 여부. 설정이 한 번도 없으면(NOT_FOUND) 꺼짐으로 판정 | `pass`(ENABLED) / `warn`(꺼짐 → `PREFLIGHT_VERTEX_LOGGING_DISABLED`) / `info`(aiplatform 미활성 → 해당 없음) / `skip`(읽기 불가 — 런타임 SA에 1권한 커스텀 역할 `gcpAiCapsVertexLoggingReader` = `aiplatform.endpoints.fetchPublisherModelConfig` 부여 명령 제시) | — (경고만, 실패 아님) | vertex_ai, usage — 꺼져 있으면 Vertex AI 토큰·비용·캡을 측정할 수 없음(요청 수만, `token_sources.vertex_ai=requests_only`). Antigravity·Gemini Enterprise는 영향 없음 | `prepare.sh`가 기본으로 활성화(`ENABLE_VERTEX_INFERENCE_LOGGING=true`, 끄려면 `--no-vertex-inference-logging`). 수동: `setPublisherModelConfig` curl(제시됨) 또는 `POST /v1/projects/P/vertex-logging/enable`(런타임 SA에 `aiplatform.endpoints.setPublisherModelConfig` 필요). Cloud Logging 수집·보관 요금 발생 | 예 |
+| `logging.audit_config.aiplatform` | H, M | Vertex AI `DATA_READ`+`DATA_WRITE` 감사 로그(프로젝트 → 폴더/조직 상속까지 확인) | `pass` / `warn` / `info`(aiplatform 미활성) / `skip` | — | gemini_platform, usage (헤더 라벨 없는 호출의 사용자 귀속·추론 로그 미활성 시 요청 수 집계 불가) | `scripts/prepare.sh --project HUB [--managed-projects P] --enable-data-access-logs` (기존 auditConfigs 보존 병합) | 예 |
+| `logging.vertex_inference_logging` | H, M | Vertex AI **추론 요청 메타데이터 로그**(`inferenceEventLoggingConfig.state`, v1beta1 `fetchPublisherModelConfig`) 활성 여부. 설정이 한 번도 없으면(NOT_FOUND) 꺼짐으로 판정 | `pass`(ENABLED) / `warn`(꺼짐 → `PREFLIGHT_VERTEX_LOGGING_DISABLED`) / `info`(aiplatform 미활성 → 해당 없음) / `skip`(읽기 불가 — 런타임 SA에 1권한 커스텀 역할 `gcpAiCapsVertexLoggingReader` = `aiplatform.endpoints.fetchPublisherModelConfig` 부여 명령 제시) | — (경고만, 실패 아님) | gemini_platform, usage — 꺼져 있으면 Vertex AI 토큰·비용·캡을 측정할 수 없음(요청 수만, `token_sources.gemini_platform=requests_only`). Antigravity·Gemini Enterprise는 영향 없음 | `prepare.sh`가 기본으로 활성화(`ENABLE_VERTEX_INFERENCE_LOGGING=true`, 끄려면 `--no-vertex-inference-logging`). 수동: `setPublisherModelConfig` curl(제시됨) 또는 `POST /v1/projects/P/vertex-logging/enable`(런타임 SA에 `aiplatform.endpoints.setPublisherModelConfig` 필요). Cloud Logging 수집·보관 요금 발생 | 예 |
 
 ### 3.8 `surfaces` — AI 서피스 존재 여부
 
@@ -436,11 +436,11 @@ Vertex AI v1beta1 `publishers/google/models`(글로벌, 실패 시 허브 리전
 
 | ID | 범위 | 점검 내용 | 결과 | 차단 | 영향 |
 |---|---|---|---|---|---|
-| `surface.vertex_ai` | H, M | aiplatform API 활성화 | `pass` / `info`(미활성 → not_applicable) / `skip`(API 상태 미상) | — | vertex_ai |
+| `surface.gemini_platform` | H, M | aiplatform API 활성화 | `pass` / `info`(미활성 → not_applicable) / `skip`(API 상태 미상) | — | gemini_platform |
 | `surface.gemini_enterprise` | H, M | Gemini Enterprise 앱(engine; `appType`이 있으면 `APP_TYPE_INTRANET`만) | `pass` / `info`(API 미활성 또는 앱 없음 → not_applicable) / `skip`(모든 로케이션 읽기 불가 → `roles/discoveryengine.viewer`) | — | gemini_enterprise |
 | `surface.antigravity` | H, M | `devToolsEnabled` 또는 최근 7일 추론 로그 | `pass` / `info`(미사용) / `skip`(읽기 불가) | — | antigravity |
 | `surface.antigravity.metadata_logging` | H, M (Antigravity 사용 중일 때) | 최근 7일 `businessaicode.googleapis.com/inference_response` 로그 없음 | `warn` | — | antigravity, usage — Gemini Enterprise > Settings > AI developer tools > Compliance > **Metadata logging**(기본 꺼짐)을 켜야 함 |
-| `surface.vertex_ai.models` | H (실행당 1회) | Model Garden 게시자 모델 카탈로그 접근 | `pass` / `warn`(리전 엔드포인트만 동작 / 모두 불가 → **내장 목록 없음**: 카탈로그는 로그에서 관측된 모델만으로 구성되고 패턴 확장 범위가 줄어듦) | — | model_governance |
+| `surface.gemini_platform.models` | H (실행당 1회) | Model Garden 게시자 모델 카탈로그 접근 | `pass` / `warn`(리전 엔드포인트만 동작 / 모두 불가 → **내장 목록 없음**: 카탈로그는 로그에서 관측된 모델만으로 구성되고 패턴 확장 범위가 줄어듦) | — | model_governance |
 
 ### 3.9 `iam` — 권한
 

@@ -280,7 +280,7 @@ scripts/install.sh --project HUB_PROJECT --managed-projects PROJECT_B \
 | `--no-vertex-inference-logging` | (prepare/install) Vertex AI 추론 요청 로그 활성화 생략 (`ENABLE_VERTEX_INFERENCE_LOGGING=false`). 생략하면 Vertex AI 토큰·비용·캡을 측정할 수 없음 |
 | `--enforcement-backend iam_deny\|notify_only` | 집행 백엔드 (`ENFORCEMENT_BACKEND`) |
 | `--cap-scope total\|per_project` | 기본 캡 범위 (`CAP_SCOPE`) |
-| `--metered-surfaces antigravity,vertex_ai,gemini_enterprise` | 캡 계산 대상 서비스 (`METERED_SURFACES`) |
+| `--metered-surfaces antigravity,gemini_platform,gemini_enterprise` | 캡 계산 대상 서비스 (`METERED_SURFACES`) |
 | `--vertex-user-header-label LABEL` | Vertex AI 사용자 헤더 라벨 접미사 (`VERTEX_USER_HEADER_LABEL`, 기본 `user`) |
 | `--model-violation-block-scope project\|all` | 모델 규칙 위반 차단 범위 (`MODEL_VIOLATION_BLOCK_SCOPE`, 기본 `project`) |
 | `--skip-preflight` / `--skip-preflight-blockers` | 사전 점검 생략 / 차단 항목 무시 |

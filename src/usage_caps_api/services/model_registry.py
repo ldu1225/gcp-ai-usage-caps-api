@@ -23,6 +23,7 @@ import fnmatch
 import logging
 import re
 
+from .. import config
 from ..gcp import GcpError
 from ..httpkit import ApiError, now_iso, paginate_list
 from . import models_catalog as mc
@@ -160,7 +161,7 @@ def parse_publisher_model(publisher: str, raw: dict) -> dict | None:
         "publisher": publisher,
         "display_name": mc.display_from_key(mc.normalize_model_id(mid)) or mid,
         "family": _family(mid),
-        "available_surfaces": ["vertex_ai"],
+        "available_surfaces": ["gemini_platform"],
         "launch_stage": LAUNCH_STAGES.get(stage_raw, stage_raw.lower() or None),
         "version_id": raw.get("versionId"),
         "version_state": (str(raw.get("versionState") or "").replace("VERSION_STATE_", "").lower() or None),
@@ -517,7 +518,7 @@ def list_models(ctx) -> dict:
     catalog = load_catalog(ctx, refresh=refresh)
     pricing = pricing_svc.resolve_pricing(ctx, caps_svc.effective_policy(ctx))
     publisher = (ctx.params.get("publisher") or "").strip().lower()
-    surface = (ctx.params.get("surface") or "").strip().lower()
+    surface = config.normalize_service(ctx.params.get("surface") or "")
     stage = (ctx.params.get("stage") or "").strip().lower()
     source = (ctx.params.get("source") or "").strip().lower()
     if source and source not in ("model_garden", "observed"):
@@ -592,7 +593,7 @@ def get_model_access(ctx) -> dict:
     from . import model_access, user_model_rules
     catalog = load_catalog(ctx)
     pub, mid, _ = resolve(catalog, ctx.path_params.get("model_id") or "")
-    entry = catalog.get(mid) or {"id": mid, "publisher": pub, "surfaces": ["vertex_ai"], "supported_actions": ["predict"]}
+    entry = catalog.get(mid) or {"id": mid, "publisher": pub, "surfaces": ["gemini_platform"], "supported_actions": ["predict"]}
     projects = {p: model_access.access_evaluator(ctx, p, catalog)(entry) for p in ctx.all_projects[:50]}
     users = user_model_rules.users_affected_by_model(ctx, mid)
     return {"object": "model_access", "model": mid, "publisher": pub, "projects": projects, "user_rules": users}
@@ -610,9 +611,9 @@ def usage_by_model(ctx) -> dict:
     """GET /v1/usage/models?start=&end=&group_by=user|project|surface|traffic&project=&surface=&model="""
     from . import caps as caps_svc
     from . import usage as usage_svc
-    from .. import config, timeutil
+    from .. import timeutil
     rng = ctx.range or timeutil.parse_range(ctx.params, ctx.tz_name, ctx.ws.get("default_range_days", 14))
-    surface = (ctx.params.get("surface") or "").strip().lower()
+    surface = config.normalize_service(ctx.params.get("surface") or "")
     if surface and surface not in ("all", *config.VALID_SERVICES):
         raise ApiError("bad_request", "Parameter 'surface' must be one of: all, %s." % ", ".join(config.VALID_SERVICES))
     group_by = (ctx.params.get("group_by") or "").strip().lower()
@@ -664,7 +665,7 @@ def usage_by_model(ctx) -> dict:
             elif group_by == "user":
                 add_group(m, "(unattributed)", mrec)
             elif group_by == "surface":
-                add_group(m, mrec.get("surface") or "vertex_ai", mrec)
+                add_group(m, mrec.get("surface") or "gemini_platform", mrec)
             elif group_by == "traffic":
                 for t, tr in (mrec.get("by_traffic") or {"on_demand": mrec}).items():
                     add_group(m, t, tr)

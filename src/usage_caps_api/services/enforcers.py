@@ -3,11 +3,11 @@
 Manages ONE deny policy per attachment point (projects, folders, or organization) with a fixed
 prefix (`gcp-ai-caps-`). Inside that policy, up to 3 rules map cleanly to the selectable AI services:
   - `antigravity`       -> `businessaicode.googleapis.com/locations.generateContent`
-  - `vertex_ai`         -> `aiplatform.googleapis.com/endpoints.predict`
+  - `gemini_platform`         -> `aiplatform.googleapis.com/endpoints.predict`
   - `gemini_enterprise` -> `discoveryengine.googleapis.com/assistants.assist`
 
 This allows blocking user A on `["antigravity"]` while blocking user B on
-`["antigravity", "vertex_ai", "gemini_enterprise"]` inside one managed deny policy, while keeping:
+`["antigravity", "gemini_platform", "gemini_enterprise"]` inside one managed deny policy, while keeping:
 - Foreign policy protection (never modifies policies with unexpected rules, conditions, exceptions,
   non-person principals, or unknown permissions)
 - IAM v2 2,500 denied-principal capacity limit enforcement (Gate G6)
@@ -39,12 +39,12 @@ DENY_WARN_AT = 2000
 
 SERVICE_PERMISSIONS = {
     "antigravity": "businessaicode.googleapis.com/locations.generateContent",
-    "vertex_ai": "aiplatform.googleapis.com/endpoints.predict",
+    "gemini_platform": "aiplatform.googleapis.com/endpoints.predict",
     "gemini_enterprise": "discoveryengine.googleapis.com/assistants.assist",
 }
 PERMISSION_TO_SERVICE = {v: k for k, v in SERVICE_PERMISSIONS.items()}
 KNOWN_PERMISSIONS = frozenset(SERVICE_PERMISSIONS.values())
-SERVICE_ORDER = ("antigravity", "vertex_ai", "gemini_enterprise")
+SERVICE_ORDER = ("antigravity", "gemini_platform", "gemini_enterprise")
 
 DISPLAY_NAME = "GCP AI Usage Caps API (managed)"
 POLICY_PREFIX = "gcp-ai-caps-"

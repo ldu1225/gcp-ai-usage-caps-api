@@ -50,7 +50,7 @@ caps:
   vertex_logging_endpoint: "https://aiplatform.googleapis.com/v1beta1"
   cap_scope: "total"              # total (one cap across all projects) | per_project (cap applies in each project)
   project_defaults: {}            # {project_id: {cost_cap, token_cap, request_cap}} per-user cap inside one project
-  metered_surfaces: ["antigravity", "vertex_ai", "gemini_enterprise"]
+  metered_surfaces: ["antigravity", "gemini_platform", "gemini_enterprise"]
   audit_log_name: "gcp-ai-usage-caps-audit"
   max_log_entries: 20000
   enforcement_mode: "manual"      # manual | auto
@@ -59,7 +59,7 @@ caps:
   deny_attachment: "projects"     # projects | scope
   default_block_services:
     - "antigravity"
-    - "vertex_ai"
+    - "gemini_platform"
     - "gemini_enterprise"
   period: "monthly"               # daily | weekly | monthly | custom | all
   window: "calendar"              # calendar | rolling

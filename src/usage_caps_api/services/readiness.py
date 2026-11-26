@@ -262,7 +262,7 @@ def _capability(run, pid: str) -> dict:
     return {
         "project_id": pid,
         "role": run.role(pid),
-        "vertex_ai": surf("vertex_ai"),
+        "gemini_platform": surf("gemini_platform"),
         "gemini_enterprise": surf("gemini_enterprise"),
         "antigravity": surf("antigravity"),
         "org_policy_writable": org_writable,
@@ -510,7 +510,7 @@ def capabilities(ctx, project_id: str) -> dict:
     """Per-surface availability for one project, from the cached report or lightweight probes.
 
     Returns {object: 'capabilities', project_id, generated_at, source: 'cache'|'probe',
-             vertex_ai|gemini_enterprise|antigravity: {available: bool|None, reason, apps: [...], locations: [...]},
+             gemini_platform|gemini_enterprise|antigravity: {available: bool|None, reason, apps: [...], locations: [...]},
              org_policy_writable: bool|None, quotas_api: bool|None, deny_writable: bool|None,
              allowed_models_policy: {...}|None}"""
     pid = str(project_id or "").strip().lower()

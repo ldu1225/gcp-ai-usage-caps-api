@@ -45,7 +45,7 @@ flowchart LR
 | Antigravity | `businessaicode.googleapis.com/inference_response` | `promptTokenCount` (+`toolUsePromptTokenCount`) | `cachedContentTokenCount` | – | `max(total − I, candidates + thoughts)` | 표준(on-demand) |
 | Vertex AI — Gemini `generateContent` / `streamGenerateContent` | `aiplatform.googleapis.com/inference_request` → `generateContentDetails.usageMetadata` | `promptTokenCount + toolUsePromptTokenCount` | `cachedContentTokenCount` | – | `max(totalTokenCount − I, candidatesTokenCount + thoughtsTokenCount)` | `trafficType` |
 | Vertex AI — Claude `rawPredict` / `streamRawPredict` | 같은 로그 → `rawPredictDetails.usageMetadata` | `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` | `cache_read_input_tokens` | `cache_creation_input_tokens` | `output_tokens` | `trafficType` |
-| Vertex AI (추론 로그 미활성) | Data Access 감사 로그 | 없음 → **요청 수만** (`token_sources.vertex_ai = requests_only`) | – | – | – | – |
+| Vertex AI (추론 로그 미활성) | Data Access 감사 로그 | 없음 → **요청 수만** (`token_sources.gemini_platform = requests_only`) | – | – | – | – |
 | Gemini Enterprise | 사용자 활동 로그 | 없음 — **좌석(라이선스) 과금 제품**, 요청 수만 집계 (`cost_basis = license`) | – | – | – | – |
 
 * **사고(thinking) 토큰은 출력 단가로 과금**되므로 출력 토큰에 포함합니다(`thoughts_tokens`로 별도 표시).

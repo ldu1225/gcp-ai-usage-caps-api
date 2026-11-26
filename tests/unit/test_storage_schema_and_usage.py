@@ -129,7 +129,7 @@ class StorageSchemaAndUsageTests(unittest.TestCase):
         self.assertEqual(res["total"], 1)
         dana = res["data"][0]
         self.assertEqual(dana["email"], "dana@company.com")
-        self.assertEqual(dana["surfaces"], ["antigravity", "gemini_enterprise", "vertex_ai"])
+        self.assertEqual(dana["surfaces"], ["antigravity", "gemini_enterprise", "gemini_platform"])
         self.assertEqual(dana["requests"], 24)  # 5 + 12 + 7
         self.assertEqual(dana["total_tokens"], 500_000)
 

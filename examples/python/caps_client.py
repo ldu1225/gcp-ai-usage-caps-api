@@ -17,7 +17,7 @@ wildcards (`google/*`, `anthropic/*`), family patterns (`<family>-*`) or IDs tak
 
     c.pricing(model=model_id)                             # official Cloud Billing Catalog SKU prices in use
     c.user_projects("alice@company.com", include="iam")   # multi-project view (usage + per-project caps)
-    c.block_user("alice@company.com", services=["vertex_ai"], projects=["team-b-prod"])   # project-scoped
+    c.block_user("alice@company.com", services=["gemini_platform"], projects=["team-b-prod"])   # project-scoped
     c.enable_vertex_logging("team-a-prod", dry_run=True)  # Vertex AI token source (inference_request log)
 
 Errors raise CapsApiError(status, type, code, message) mirroring the OpenAI/Anthropic error envelope.

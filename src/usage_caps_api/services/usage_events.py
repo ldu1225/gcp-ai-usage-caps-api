@@ -93,7 +93,7 @@ def entry_usage(entry: dict, log_id: str, projects: list[str], *, vertex_log_id:
             return None
         key = parsed["key"] or "%s|%s|%s|%d" % (project, person, iso(parsed["ts"]), parsed["counts"]["total_tokens"])
         return _item(person, parsed["project"] or project, parsed["ts"], key, parsed["model"], parsed["publisher"],
-                     "vertex_ai", parsed["counts"])
+                     "gemini_platform", parsed["counts"])
     return None
 
 

@@ -61,7 +61,7 @@ def _services(raw, field: str) -> list[str] | None:
         raise ApiError("bad_request", "Field '%s' must be a list of: %s." % (field, ", ".join(config.VALID_SERVICES)))
     out = []
     for s in raw:
-        s = str(s or "").strip().lower()
+        s = config.normalize_service(s)
         if s not in config.VALID_SERVICES:
             raise ApiError("bad_request", "Invalid service '%s' in '%s'." % (s, field))
         if s not in out:
@@ -767,10 +767,10 @@ def users_affected_by_model(ctx, model: str) -> list[dict]:
     state = load_rules(ctx)
     out = []
     if state["default"]:
-        v = access_violation(state["default"], model, "antigravity") or access_violation(state["default"], model, "vertex_ai")
+        v = access_violation(state["default"], model, "antigravity") or access_violation(state["default"], model, "gemini_platform")
         out.append({"scope": "default", "decision": "denied" if v else "allowed"})
     for email, rule in sorted(state["rules"].items()):
         if rule.get("mode") in ("allow_list", "deny_list"):
-            v = access_violation(rule, model, "antigravity") or access_violation(rule, model, "vertex_ai")
+            v = access_violation(rule, model, "antigravity") or access_violation(rule, model, "gemini_platform")
             out.append({"scope": "user", "email": email, "decision": "denied" if v else "allowed"})
     return out[:200]
