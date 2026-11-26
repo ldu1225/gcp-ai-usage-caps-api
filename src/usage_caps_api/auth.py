@@ -241,8 +241,8 @@ class GoogleOidcVerifier:
         )
         if claims.get("iss") not in GOOGLE_ISSUERS:
             raise ValueError("unexpected issuer")
-        if claims.get("email_verified") is not True:
-            raise ValueError("email not verified")
+        if claims.get("email_verified") not in (True, "true", "True"):
+            raise ValueError("email not verified (ensure OIDC token includes email claim)")
         email = (claims.get("email") or "").strip().lower()
         if not email or "@" not in email:
             raise ValueError("missing email claim")
@@ -358,8 +358,9 @@ class Authenticator:
 
     def _verify_oidc(self, token: str, path: str) -> Caller:
         auth_cfg = self.cfg.get("auth") or {}
-        base = str(auth_cfg.get("public_base_url") or "").rstrip("/")
-        if not base:
+        raw_base = str(auth_cfg.get("public_base_url") or "")
+        bases = [b.strip().rstrip("/") for b in raw_base.split(",") if b.strip()]
+        if not bases:
             raise ApiError("unauthenticated", "OIDC authentication requires PUBLIC_BASE_URL to be configured.")
         allowed = {str(e).strip().lower() for e in (auth_cfg.get("oidc_allowed_service_accounts") or []) if e}
         own_sa = runtime_service_account(self.environ)
@@ -367,8 +368,11 @@ class Authenticator:
             allowed.add(own_sa)
         if not allowed:
             raise ApiError("unauthenticated", "No OIDC service accounts are allowed for this deployment.")
+        audiences = []
+        for b in bases:
+            audiences.extend((b + path, b, b + "/"))
         try:
-            email = self.verifier.verify(token, [base + path, base, base + "/"])
+            email = self.verifier.verify(token, audiences)
         except Exception as err:
             LOG.warning("OIDC token rejected reason=%s", type(err).__name__)
             raise ApiError("unauthenticated", "Invalid or expired Google OIDC token.")

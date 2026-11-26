@@ -38,8 +38,12 @@ NON_TEXT_WORDS = {
     "embedding", "embeddings", "grounding", "search", "contributor", "deferred", "offline", "lyria", "music", "song",
     "clip", "clips", "track", "tracks", "veo", "imagen", "chirp", "storage", "hour", "hours",
 }
-LONG_CONTEXT_RE = re.compile(r"(?i)(?:>|\u2265|over|above)\s*\d|long context|long input|long output")
+LONG_CONTEXT_RE = re.compile(
+    r"(?i)(?:>|\u2265|over|above)\s*\d|long context|long input|long output"
+    r"|from\s+(?:[1-9]\d{4,})\s+to\s+\d"
+)
 THRESHOLD_RE = re.compile(r"(?i)(?:>|\u2265|>=|over|above|<=|\u2264|up to)\s*(\d+(?:\.\d+)?)\s*([km])")
+RANGE_START_RE = re.compile(r"(?i)from\s+([1-9]\d{4,})\s+to\s+\d")
 WORD_RE = re.compile(r"[a-z0-9.]+")
 CREDIT_MODEL_PREFIXES = ("gemini",)
 _MODEL_PATH_RE = re.compile(r"^(?:publishers/[^/]+/models/|models/)")
@@ -53,10 +57,14 @@ def credit_eligible(model: str, prefixes=CREDIT_MODEL_PREFIXES) -> bool:
 
 def parse_threshold(description: str) -> int | None:
     m = THRESHOLD_RE.search(description or "")
-    if not m:
-        return None
-    mult = 1000 if m.group(2).lower() == "k" else 1_000_000
-    return int(float(m.group(1)) * mult)
+    if m:
+        mult = 1000 if m.group(2).lower() == "k" else 1_000_000
+        return int(float(m.group(1)) * mult)
+    rm = RANGE_START_RE.search(description or "")
+    if rm:
+        val = int(rm.group(1))
+        return val - 1 if val % 1000 == 1 else val
+    return None
 
 
 def classify_sku(description, service=None, unit=None, pricing_unit=None):
@@ -324,17 +332,20 @@ def split_cost(rec: dict, pricing: Pricing | None, prefixes=CREDIT_MODEL_PREFIXE
     eligible, other = {}, {}
     for model, agg in (rec.get("by_model") or {}).items():
         (eligible if credit_eligible(model, prefixes) else other)[model] = agg
-    costs, known, partial = [], True, False
+    costs, any_known, any_part, partial = [], False, False, False
     for part in (eligible, other):
         if not part:
             costs.append(0.0)
             continue
+        any_part = True
         cost, p_partial = estimate_cost({"by_model": part}, pricing)
         partial = partial or p_partial
         if cost is None:
-            known = False
             cost = 0.0
+        else:
+            any_known = True
         costs.append(cost)
+    known = any_known if any_part else True
     return costs[0], costs[1], known, partial
 
 

@@ -787,16 +787,47 @@ def _vertex_fields(src) -> dict:
     }
 
 
+def _refresh_vertex_schema(ctx, src) -> bool:
+    """Re-fetches BigQuery table schema live when Cloud Logging auto-evolves inference_request columns."""
+    registry = getattr(getattr(ctx, "app", None), "registry", None)
+    if registry is None or not hasattr(registry, "get_schema_and_location"):
+        return False
+    try:
+        fresh_schema, loc = registry.get_schema_and_location(
+            src.project, src.dataset, getattr(src, "sample_table", src.table),
+            quota_project=ctx.quota_project, fresh=True,
+        )
+        if fresh_schema is not None:
+            src.schema = fresh_schema
+            if loc:
+                src.location = loc
+            return True
+    except Exception:  # pylint: disable=broad-except
+        return False
+    return False
+
+
 def _bq_vertex_inference_one(ctx, src, start: dt.datetime, end: dt.datetime) -> list[dict]:
     f = _vertex_fields(src)
     if not f["model"]:
         raise GcpError("invalid", message="inference_request sink table lacks resource.labels.model_user_id")
-    s = src.schema
     label = header_label_key(ctx).replace("-", "_")
-    hcol = f["header_tpl"].format(label=label)
-    hpaths = payload_paths(s, hcol)
-    user_sql = expr("t", s, *[c + ".values[0]" for c in hpaths], *[c + ".values" for c in hpaths],
+
+    def _header_sql(s_obj, f_obj):
+        hcol = f_obj["header_tpl"].format(label=label)
+        hpaths = payload_paths(s_obj, hcol)
+        return expr("t", s_obj, *[c + ".values[0]" for c in hpaths], *[c + ".values" for c in hpaths],
                     *hpaths, cast="STRING")
+
+    user_sql = _header_sql(src.schema, f)
+    # Cloud Logging BigQuery sinks infer schema incrementally from the first observed row (e.g. a 404 error or
+    # Gemini-only call before Claude/header rows arrive). Refresh live when token or header columns are missing.
+    if (not f["g_prompt"] and not f["g_total"]) or (not f["c_in"] and not f["c_out"]) or not user_sql:
+        if _refresh_vertex_schema(ctx, src):
+            f = _vertex_fields(src)
+            if not f["model"]:
+                raise GcpError("invalid", message="inference_request sink table lacks resource.labels.model_user_id")
+            user_sql = _header_sql(src.schema, f)
     null = "CAST(NULL AS STRING)"
     log_proj = "REGEXP_EXTRACT(%s, r'^projects/([^/]+)/')" % f["log"] if f["log"] else null
     proj = f["project"] or log_proj
@@ -815,7 +846,7 @@ def _bq_vertex_inference_one(ctx, src, start: dt.datetime, end: dt.datetime) -> 
     where = " AND ".join(ok) if ok else "TRUE"
     start_ts = "IFNULL(%s, %s)" % (f["start"], f["ts"]) if f["start"] else f["ts"]
     sql = (
-        "WITH %s,\nv AS (SELECT %s AS ts, %s AS project, %s AS log_project, %s AS publisher, %s AS model, "
+        "WITH %s,\nv AS (SELECT %s AS ts, %s AS raw_ts, %s AS project, %s AS log_project, %s AS publisher, %s AS model, "
         "%s AS user_label, %s AS principal, IFNULL(%s, 'ON_DEMAND') AS traffic, %s AS prompt, %s AS cand, "
         "%s AS thoughts, %s AS cached, %s AS cwrite, %s AS total FROM s t WHERE %s AND %s IS NOT NULL)\n"
         "SELECT TIMESTAMP_TRUNC(ts, MINUTE) AS minute, project, log_project, publisher, model, user_label, principal, "
@@ -824,9 +855,9 @@ def _bq_vertex_inference_one(ctx, src, start: dt.datetime, end: dt.datetime) -> 
         "SUM(total) AS tokens, COUNTIF(prompt > @long_ctx) AS long_requests, "
         "SUM(IF(prompt > @long_ctx, prompt, 0)) AS long_input_tokens, "
         "SUM(IF(prompt > @long_ctx, GREATEST(total - prompt, cand + thoughts, 0), 0)) AS long_output_tokens, "
-        "SUM(IF(prompt > @long_ctx, cached, 0)) AS long_cached_tokens, MAX(ts) AS last_ts\n"
+        "SUM(IF(prompt > @long_ctx, cached, 0)) AS long_cached_tokens, MAX(ts) AS last_ts, MAX(raw_ts) AS max_log_ts\n"
         "FROM v GROUP BY minute, project, log_project, publisher, model, user_label, principal, traffic"
-        % (src.cte("s", start="w_start", end="w_end"), start_ts, proj, log_proj, f["publisher"] or null, f["model"],
+        % (src.cte("s", start="w_start", end="w_end"), start_ts, f["ts"], proj, log_proj, f["publisher"] or null, f["model"],
            user_sql or null, f["principal"] or null, f["traffic"] or "CAST(NULL AS STRING)", prompt, cand, thoughts,
            cached, cwrite, total, where, f["model"])
     )
@@ -844,9 +875,12 @@ def _bq_vertex_inference_one(ctx, src, start: dt.datetime, end: dt.datetime) -> 
                               long={k: to_int(r.get(k)) for k in LONG_COUNTERS})
         minute = r.get("minute")
         proj_id = _norm_project(r.get("project"), _norm_project(r.get("log_project"), src.project))
+        log_ts = r.get("max_log_ts") if isinstance(r.get("max_log_ts"), dt.datetime) else (
+            r.get("last_ts") if isinstance(r.get("last_ts"), dt.datetime) else minute)
         out.append({"project": proj_id, "publisher": pub, "model": model, "counts": counts,
                     "traffic": traffic, "user_label": r.get("user_label"), "principal": r.get("principal"),
                     "ts": r.get("last_ts") if isinstance(r.get("last_ts"), dt.datetime) else minute,
+                    "log_ts": log_ts,
                     "minute": _minute(minute) if isinstance(minute, dt.datetime) else _minute(r.get("last_ts"))})
     return out
 
@@ -939,21 +973,27 @@ def parse_audit_entry(entry: dict) -> dict | None:
 
 
 def _logging_vertex(ctx, start: dt.datetime, end: dt.datetime, *,
-                    need_audit: bool = True) -> tuple[list[dict], list[dict], bool]:
+                    need_audit: bool = True,
+                    ranges: dict | None = None) -> tuple[list[dict], list[dict], bool]:
     log_id = (ctx.config.get("caps") or {}).get("vertex_inference_log") or DEFAULT_VERTEX_LOG
     if not config.LOG_NAME_RE.match(log_id):
         raise GcpError("invalid", message="invalid vertex_inference_log")
     label = header_label_key(ctx)
     long_ctx = _long_threshold(ctx)
     projects = list(ctx.projects)
+    if ranges is not None:
+        projects = [p for p in projects if p in ranges]
+    else:
+        ranges = {p: (start, end) for p in projects}
     da_filter = ('protoPayload.serviceName="aiplatform.googleapis.com" AND '
                  'protoPayload.methodName=~"%s"' % MODEL_CALL_METHODS)
     tasks = {}
     for p in projects:
-        tasks[("inf", p)] = (lambda pr=p: _logging_project(ctx, pr, log_id, start, end))
+        lo, hi = ranges[p]
+        tasks[("inf", p)] = (lambda pr=p, a=lo, b=hi: _logging_project(ctx, pr, log_id, a, b))
         if need_audit:
-            tasks[("aud", p)] = (lambda pr=p: _logging_project(
-                ctx, pr, AUDIT_DATA_ACCESS_LOG, start, end, extra_filter=da_filter))
+            tasks[("aud", p)] = (lambda pr=p, a=lo, b=hi: _logging_project(
+                ctx, pr, AUDIT_DATA_ACCESS_LOG, a, b, extra_filter=da_filter))
     res = ctx.run(tasks)
     inf, aud, truncated, any_ok = [], [], False, False
     for p in projects:
@@ -1094,6 +1134,8 @@ def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None
     mode = (ctx.config.get("caps") or {}).get("usage_source") or "auto"
     inf_rows = audit_rows = None
     truncated = False
+    src = None
+    bq_ok = False
     if mode in ("auto", "bigquery"):
         src = ctx.audit_source(VERTEX_INFERENCE_SINK, optional=True)
         dsrc = ctx.audit_source(AUDIT_DATA_ACCESS, optional=True)
@@ -1106,6 +1148,7 @@ def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None
         if "inf" in res:
             if res["inf"][0]:
                 inf_rows = res["inf"][1]
+                bq_ok = True
                 ctx.add_source(src.label)
             else:
                 ctx.warn_error(src.label, res["inf"][1], "Gemini Platform inference request logs")
@@ -1115,15 +1158,52 @@ def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None
                 ctx.add_source(dsrc.label)
             elif not res["aud"][0]:
                 ctx.warn_error(dsrc.label, res["aud"][1], "Gemini Platform Data Access audit logs")
-    if inf_rows is None and mode in ("auto", "logging"):
+    if (inf_rows is None or (bq_ok and not inf_rows and mode == "auto")) and mode in ("auto", "logging"):
         try:
-            inf_rows, log_audit, truncated = _logging_vertex(ctx, start, end, need_audit=(audit_rows is None))
+            log_inf, log_audit, truncated = _logging_vertex(ctx, start, end, need_audit=(audit_rows is None))
+            if log_inf or inf_rows is None:
+                inf_rows = log_inf
             audit_rows = audit_rows if audit_rows is not None else log_audit
             ctx.add_source("api:logging.entries")
         except GcpError as err:
             if mode == "logging":
                 ctx.warn_error("api:logging.entries", err, "Gemini Platform inference request logs")
-            inf_rows = None
+            if not bq_ok:
+                inf_rows = None
+    elif bq_ok and inf_rows and mode == "auto":
+        # Merge Cloud Logging for (a) projects whose per-project BQ table doesn't exist yet (e.g. newly onboarded)
+        # and (b) fresh=True tail entries not yet flushed by the BigQuery streaming sink.
+        audit_proj = ((ctx.config.get("workspace") or {}).get("audit_project_id") or "").strip()
+        bq_covered = set(ctx.projects) if audit_proj else {s.project for s in _sources_of(src)}
+        last_by_proj: dict[str, dt.datetime] = {}
+        for r in inf_rows:
+            rp = r.get("project")
+            rt = r.get("log_ts") or r.get("ts")
+            if isinstance(rp, str) and isinstance(rt, dt.datetime):
+                if rp not in last_by_proj or rt > last_by_proj[rp]:
+                    last_by_proj[rp] = rt
+        tail_ranges: dict[str, tuple[dt.datetime, dt.datetime]] = {}
+        for p in ctx.projects:
+            if p not in bq_covered:
+                tail_ranges[p] = (start, end)
+            elif fresh:
+                last = last_by_proj.get(p)
+                lo = (last + dt.timedelta(microseconds=1)) if (last and last >= start) else start
+                if lo < end:
+                    tail_ranges[p] = (lo, end)
+        if tail_ranges:
+            try:
+                tail_inf, tail_aud, tail_trunc = _logging_vertex(
+                    ctx, start, end, need_audit=(audit_rows is None), ranges=tail_ranges,
+                )
+                if tail_inf:
+                    inf_rows.extend(tail_inf)
+                    ctx.add_source("api:logging.entries")
+                if audit_rows is None and tail_aud:
+                    audit_rows = tail_aud
+                truncated = truncated or tail_trunc
+            except GcpError:
+                pass
     if not inf_rows:
         # No inference request entries while audit logs show Gemini Platform calls -> logging is not enabled / routed.
         if audit_rows:
@@ -1392,7 +1472,8 @@ def list_user_usage(ctx) -> dict:
     from . import caps as caps_svc
     policy = caps_svc.effective_policy(ctx)
     pricing = pricing_svc.resolve_pricing(ctx, policy)
-    usage = collect_usage(ctx, rng.start_ts(), rng.end_ts(), email=email_f or None, surface=surface or None)
+    fresh = str(ctx.params.get("fresh") or "").lower() in ("1", "true")
+    usage = collect_usage(ctx, rng.start_ts(), rng.end_ts(), email=email_f or None, surface=surface or None, fresh=fresh)
     rows = [_format_user_row(mail, rec, pricing) for mail, rec in usage.users.items()]
     if model_f:
         rows = [r for r in rows if any(m["model"] == model_f for m in r["by_model"])]
@@ -1429,7 +1510,8 @@ def get_user_usage(ctx) -> dict:
     from . import caps as caps_svc
     policy = caps_svc.effective_policy(ctx)
     pricing = pricing_svc.resolve_pricing(ctx, policy)
-    usage = collect_usage(ctx, rng.start_ts(), rng.end_ts(), email=email, rng=rng)
+    fresh = str(ctx.params.get("fresh") or "").lower() in ("1", "true")
+    usage = collect_usage(ctx, rng.start_ts(), rng.end_ts(), email=email, rng=rng, fresh=fresh)
     rec = usage.users.get(email) or dict(_new_counters(), by_model={}, by_surface={}, by_project={}, last_active=None)
     row = _format_user_row(email, rec, pricing)
     timeseries = []

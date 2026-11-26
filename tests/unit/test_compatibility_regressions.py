@@ -266,6 +266,271 @@ class CompatibilityRegressionTests(unittest.TestCase):
         self.assertIn("SERVER_PID=$!", text)
         self.assertNotIn("trap 'kill $pid", text)
 
+    def test_claude_55_long_context_range_sku_and_gemini_4_tiers(self):
+        from usage_caps_api.services import pricing
+        std = pricing.classify_sku(
+            "Claude Opus 5 5 — Input Tokens — global — Context Window Size from 0 to 200000 Tokens",
+            "Vertex AI", "count", "count",
+        )
+        lng = pricing.classify_sku(
+            "Claude Opus 5 5 — Input Tokens — global — Context Window Size from 200001 to 1000000 Tokens",
+            "Vertex AI", "count", "count",
+        )
+        self.assertEqual(std[:4], ("claude-opus-5.5", "input", None, None))
+        self.assertEqual(lng, ("claude-opus-5.5", "input", None, "long_context", 200000))
+        g4c = pricing.classify_sku("Gemini 4 Carbon Global Text Output - Online Predictions", "Vertex AI", "count", "count")
+        g4a = pricing.classify_sku("Gemini 4 Argon Global Text Input - Online Predictions", "Vertex AI", "count", "count")
+        self.assertEqual(g4c[:2], ("gemini-4-carbon", "output"))
+        self.assertEqual(g4a[:2], ("gemini-4-argon", "input"))
+
+    def test_split_cost_preserves_partial_priced_user_for_chargeback(self):
+        from usage_caps_api.services import pricing
+        tbl = pricing.PriceTable(currency="USD", prices={"gemini-4-carbon": {"input": 4.0, "output": 20.0}})
+        pr = pricing.Pricing(currency="USD", source="auto", table=tbl)
+        rec = {
+            "by_model": {
+                "gemini-4-carbon": {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500},
+                "unpriced-partner-model": {"input_tokens": 200, "output_tokens": 100, "total_tokens": 300},
+            }
+        }
+        g_cost, o_cost, known, partial = pricing.split_cost(rec, pr)
+        self.assertTrue(known)
+        self.assertTrue(partial)
+        self.assertAlmostEqual(g_cost, 0.014, places=6)
+        self.assertEqual(o_cost, 0.0)
+
+    def test_enforcer_job_restores_unblocked_user_without_cap_and_in_manual_mode(self):
+        from usage_caps_api.services import caps
+        users = [
+            {"email": "a@example.com", "blocked_services": ["gemini_platform"], "blocked_projects": {},
+             "over_cap": None, "manual_block": None, "rule": None, "suspension": None},
+            {"email": "b@example.com", "blocked_services": ["gemini_platform"], "blocked_projects": {},
+             "over_cap": True, "manual_block": None, "rule": None, "suspension": None},
+        ]
+        _, plan = caps.evaluate_gates_and_plan(
+            users, deny_readable=True, deny_meta={"attachments": []}, telemetry_ok=True, telemetry_records=10,
+            telemetry_truncated=False, policy={"enforcement_mode": "manual", "enforcement_backend": "iam_deny"},
+        )
+        self.assertIn("a@example.com", plan["restore"])
+        self.assertIn("b@example.com", plan["restore"])
+
+    def test_enforcer_job_narrows_project_scoped_unblock(self):
+        from usage_caps_api.services import caps
+        app, _ = build_test_app(cfg=make_test_config(projects=["proj-b"]))
+        ctx = _ctx(app)
+        ap_a = enforcers.project_attachment("test-ai-project")
+        ap_b = enforcers.project_attachment("proj-b")
+        deny_state = enforcers.DenyState([
+            enforcers.AttachmentState(ap_a, exists=True, by_principal={"alice@company.com": frozenset(["gemini_platform"])}),
+            enforcers.AttachmentState(ap_b, exists=True, by_principal={"alice@company.com": frozenset(["gemini_platform"])}),
+        ])
+        state = {
+            "blocks": {"alice@company.com": {"email": "alice@company.com", "projects": ["test-ai-project"], "services": ["gemini_platform"]}},
+            "rules": {}, "suspensions": {}, "groups": {}, "group_blocks": {}, "group_rules": {},
+        }
+        desired = caps._desired_by_attachment(ctx, {"default_block_services": ["gemini_platform"]}, state, deny_state, add_blocks=["alice@company.com"])
+        self.assertTrue(desired[ap_a])
+        self.assertEqual(desired[ap_b], {})
+
+    def test_oidc_multi_url_public_base_url(self):
+        app, _ = build_test_app(cfg=make_test_config())
+        app.config["auth"]["public_base_url"] = "https://svc-123.asia-northeast3.run.app,https://svc-abc-du.a.run.app"
+        app.config["auth"]["oidc_allowed_service_accounts"] = ["sched@p.iam.gserviceaccount.com"]
+        seen_auds = []
+        class FakeV:
+            def verify(self, tok, auds):
+                seen_auds.extend(auds)
+                return "sched@p.iam.gserviceaccount.com"
+        app.authenticator.verifier = FakeV()
+        caller = app.authenticator._verify_oidc("a.b.c", "/v1/caps/enforce")
+        self.assertEqual(caller.id, "sched@p.iam.gserviceaccount.com")
+        self.assertIn("https://svc-123.asia-northeast3.run.app/v1/caps/enforce", seen_auds)
+        self.assertIn("https://svc-abc-du.a.run.app/v1/caps/enforce", seen_auds)
+
+    def test_block_in_sync_detects_extra_project_and_notify_only_breakglass_via_job(self):
+        from usage_caps_api.services import caps
+        # 1) _block_in_sync must return False when an extra project is still denied
+        self.assertFalse(caps._block_in_sync(
+            {"projects": ["proj-a"], "services": ["gemini_platform"]},
+            ["gemini_platform"], set(),
+            {"proj-a": {"gemini_platform"}, "proj-b": {"gemini_platform"}},
+        ))
+        self.assertTrue(caps._block_in_sync(
+            {"projects": ["proj-a"], "services": ["gemini_platform"]},
+            ["gemini_platform"], set(),
+            {"proj-a": {"gemini_platform"}},
+        ))
+        # 2) notify_only break-glass restore processed cleanly by enforce_cycle (Enforcer Job)
+        app, gcp = build_test_app(cfg=make_test_config())
+        ctx = _ctx(app)
+        def _set_pol(d):
+            d["policy"] = {"enforcement_backend": "notify_only", "enforcement_mode": "manual"}
+            return d
+        ctx.store.mutate(caps.POLICY_DOC, _set_pol)
+        client = enforcers.DenyPolicyClient(ctx)
+        enforcers.apply(ctx, enforcers.read_state(ctx, client=client),
+                        {"principal://goog/subject/alice@company.com": frozenset(["gemini_platform"])},
+                        dry_run=False, client=client)
+        def _set_bg(d):
+            d["pending_breakglass_restores"] = {"all": ["alice@company.com"], "projects": {}}
+            return d
+        ctx.store.mutate(caps.USER_CAPS_DOC, _set_bg)
+        res = caps.enforce_cycle(ctx, trigger="job", dry_run=False, deny_client=client)
+        self.assertEqual(res["result"], "breakglass_restored")
+        st_after = enforcers.read_state(ctx, client=client)
+        self.assertNotIn("alice@company.com", st_after.services_by_person)
+
+    def test_enforcer_readiness_skips_instead_of_false_fail_when_org_policy_unreadable(self):
+        from usage_caps_api.services import readiness_iam
+        class FakeRun:
+            enforcement_backend = "iam_deny"
+            deny_attachment = "projects"
+            enforcer_sa = "ai-usage-caps-enforcer@hub.iam.gserviceaccount.com"
+            enforcer_sa_configured = True
+            central = False
+            projects = ["hub"]
+            dataset_project = "hub"
+            def is_hub(self, pid): return pid == "hub"
+            def iam_policy(self, pid):
+                return ({"bindings": [
+                    {"role": "roles/logging.viewer", "members": ["serviceAccount:" + self.enforcer_sa]},
+                    {"role": "roles/logging.privateLogViewer", "members": ["serviceAccount:" + self.enforcer_sa]},
+                ]}, None)
+            def ancestry(self, pid):
+                return [{"type": "organization", "id": "123456"}]
+            def org_of(self, pid): return "123456"
+            def try_call(self, method, url, json_body=None):
+                return None, GcpError("denied", status=403, message="org getIamPolicy denied")
+            def set_fact(self, pid, key, val): pass
+        chk = readiness_iam.enforcer_permission_check(FakeRun(), "hub")
+        self.assertEqual(chk["status"], "skip")
+        self.assertTrue(chk["data"].get("org_policy_unreadable"))
+
+    def test_bq_vertex_inference_refreshes_evolving_schema_when_token_cols_missing(self):
+        app, gcp = build_test_app(cfg=make_test_config())
+        ctx = _ctx(app)
+        # Initial partial schema from an error-only first row (missing generateContentDetails/rawPredictDetails)
+        stale = schema.TableSchema.from_dicts([
+            {"name": "timestamp", "type": "TIMESTAMP"},
+            {"name": "logName", "type": "STRING"},
+            {"name": "resource", "type": "RECORD", "fields": [
+                {"name": "labels", "type": "RECORD", "fields": [
+                    {"name": "model_user_id", "type": "STRING"},
+                    {"name": "resource_container", "type": "STRING"},
+                ]}
+            ]},
+            {"name": "jsonpayload_logging_inferenceeventlogentry", "type": "RECORD", "fields": [
+                {"name": "error", "type": "RECORD", "fields": [{"name": "code", "type": "FLOAT"}]}
+            ]},
+        ])
+        evolved = schema.TableSchema.from_dicts([
+            {"name": "timestamp", "type": "TIMESTAMP"},
+            {"name": "logName", "type": "STRING"},
+            {"name": "resource", "type": "RECORD", "fields": [
+                {"name": "labels", "type": "RECORD", "fields": [
+                    {"name": "model_user_id", "type": "STRING"},
+                    {"name": "resource_container", "type": "STRING"},
+                ]}
+            ]},
+            {"name": "jsonpayload_logging_inferenceeventlogentry", "type": "RECORD", "fields": [
+                {"name": "generatecontentdetails", "type": "RECORD", "fields": [
+                    {"name": "usagemetadata", "type": "RECORD", "fields": [
+                        {"name": "prompttokencount", "type": "FLOAT"},
+                        {"name": "candidatestokencount", "type": "FLOAT"},
+                        {"name": "totaltokencount", "type": "FLOAT"},
+                    ]}
+                ]},
+                {"name": "rawpredictdetails", "type": "RECORD", "fields": [
+                    {"name": "usagemetadata", "type": "RECORD", "fields": [
+                        {"name": "input_tokens", "type": "FLOAT"},
+                        {"name": "output_tokens", "type": "FLOAT"},
+                    ]}
+                ]},
+            ]},
+        ])
+        src = schema.TableSource("test-ai-project", "ge_analytics", "aiplatform_googleapis_com_inference_request", stale)
+        refreshed = {"called": False}
+        def fake_get(proj, ds, tbl, *, quota_project, fresh=False):
+            if fresh:
+                refreshed["called"] = True
+                return evolved, "US"
+            return stale, "US"
+        app.registry.get_schema_and_location = fake_get
+        captured_sql = []
+        gcp.query_handlers.append((lambda sql, p, m: (captured_sql.append(sql), True)[1], lambda sql, p, m: []))
+        now = dt.datetime.now(dt.timezone.utc)
+        usage._bq_vertex_inference_one(ctx, src, now - dt.timedelta(hours=1), now)
+        self.assertTrue(refreshed["called"])
+        self.assertIn("prompttokencount", captured_sql[0])
+        self.assertIn("input_tokens", captured_sql[0])
+
+    def test_oidc_internal_service_accounts_env_var_grants_internal_scope(self):
+        cfg = config.load_config(environ={
+            "PROJECT_ID": "hub-proj",
+            "PUBLIC_BASE_URL": "https://api-123.asia-northeast3.run.app",
+            "OIDC_ALLOWED_SERVICE_ACCOUNTS": "scheduler@hub-proj.iam.gserviceaccount.com",
+            "OIDC_INTERNAL_SERVICE_ACCOUNTS": "scheduler@hub-proj.iam.gserviceaccount.com,pubsub@hub-proj.iam.gserviceaccount.com",
+        })
+        self.assertEqual(
+            cfg["auth"]["oidc_internal_service_accounts"],
+            ["scheduler@hub-proj.iam.gserviceaccount.com", "pubsub@hub-proj.iam.gserviceaccount.com"],
+        )
+        app, _ = build_test_app(cfg=cfg)
+        app.authenticator.environ = {"RUNTIME_SERVICE_ACCOUNT": "api-runtime@hub-proj.iam.gserviceaccount.com"}
+        class FakeV:
+            def verify(self, tok, auds):
+                return "scheduler@hub-proj.iam.gserviceaccount.com"
+        app.authenticator.verifier = FakeV()
+        caller = app.authenticator._verify_oidc("a.b.c", "/v1/internal/usage-event")
+        self.assertIsNotNone(caller)
+        self.assertTrue(caller.has_scope(auth.INTERNAL_SCOPE))
+        self.assertTrue(caller.has_scope("caps:write"))
+
+    def test_cap_mutations_invalidate_realtime_tracker_snapshot(self):
+        from usage_caps_api.services import caps, usage_events
+        app, _ = build_test_app(cfg=make_test_config())
+        ctx = _ctx(app)
+        ctx.body = {"type": "limit", "request_cap": 5}
+        ctx.path_params = {"email": "alice@company.com"}
+        usage_events.TRACKER.snap = {"at": dt.datetime.now(dt.timezone.utc), "payload": {}, "internal": {}}
+        caps.put_user_cap(ctx)
+        self.assertIsNone(usage_events.TRACKER.snap)
+        usage_events.TRACKER.snap = {"at": dt.datetime.now(dt.timezone.utc), "payload": {}, "internal": {}}
+        caps.delete_user_cap(ctx)
+        self.assertIsNone(usage_events.TRACKER.snap)
+
+    def test_quota_default_row_missing_required_dimensions_fails_fast(self):
+        from usage_caps_api.httpkit import ApiError
+        from usage_caps_api.services import quotas
+        app, _ = build_test_app(cfg=make_test_config())
+        ctx = _ctx(app)
+        rows = quotas._flatten(ctx, "test-ai-project", [{
+            "quotaId": "AnthropicMaasConcurrentBatchPredictionJobs",
+            "metric": "aiplatform.googleapis.com/anthropic_maas_concurrent_batch_prediction_jobs",
+            "dimensions": ["region", "base_model"],
+            "quotaIncreaseEligibility": {"isEligible": True},
+            "dimensionsInfos": [
+                {"dimensions": {}, "details": {"value": "4"}},
+                {"dimensions": {"region": "us-central1", "base_model": "claude-opus-5"}, "details": {"value": "4"}},
+            ],
+        }], [], None, True)
+        default_row = next(r for r in rows if r["is_default"])
+        concrete_row = next(r for r in rows if not r["is_default"])
+        self.assertEqual(default_row["required_dimensions"], ["region", "base_model"])
+        self.assertFalse(default_row["dimensions_complete"])
+        self.assertTrue(concrete_row["dimensions_complete"])
+        with self.assertRaises(ApiError) as cm:
+            quotas._submit(ctx, default_row, {
+                "requested_value": 5, "justification": "Valid long justification",
+                "contact_email": "ops@company.com", "dryRun": True,
+            })
+        self.assertEqual(cm.exception.code, "unprocessable")
+        dry_ok = quotas._submit(ctx, concrete_row, {
+            "requested_value": 5, "justification": "Valid long justification",
+            "contact_email": "ops@company.com", "dryRun": True,
+        })
+        self.assertEqual(dry_ok["status"], "dry_run")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -196,12 +196,15 @@ def _member_roles(policies: list[dict], member: str) -> set[str]:
     return roles
 
 
-def _ancestor_policies(run, pid: str) -> list[dict]:
+def _ancestor_policies(run, pid: str) -> tuple[list[dict], bool]:
     out = []
+    org_unreadable = False
     for anc in run.ancestry(pid) or []:
         if anc["type"] == "organization":
             pol, err = run.try_call("POST", "%s/organizations/%s:getIamPolicy" % (CRM_V1, anc["id"]),
                                     json_body={"options": {"requestedPolicyVersion": 3}})
+            if err is not None:
+                org_unreadable = True
         elif anc["type"] == "folder":
             pol, err = run.try_call("POST", "%s/folders/%s:getIamPolicy" % (CRM_V3, anc["id"]),
                                     json_body={"options": {"requestedPolicyVersion": 3}})
@@ -209,20 +212,26 @@ def _ancestor_policies(run, pid: str) -> list[dict]:
             continue
         if err is None and pol:
             out.append(pol)
-    return out
+    return out, org_unreadable
 
 
-def _bindings_granted(run, pid: str, member: str):
-    """(granted perms, roles, err) for `member` from project + ancestor allow policies."""
+def _bindings_granted_meta(run, pid: str, member: str):
+    """(granted perms, roles, err, org_unreadable) for `member` from project + ancestor allow policies."""
     pol, err = run.iam_policy(pid)
     if err is not None:
-        return None, None, err
-    policies = [pol or {}] + _ancestor_policies(run, pid)
+        return None, None, err, False
+    anc_policies, org_unreadable = _ancestor_policies(run, pid)
+    policies = [pol or {}] + anc_policies
     roles = _member_roles(policies, member)
     granted = set()
     for role in roles:
         granted |= _role_permissions(role)
-    return granted, roles, None
+    return granted, roles, None, org_unreadable
+
+
+def _bindings_granted(run, pid: str, member: str):
+    granted, roles, err, _ = _bindings_granted_meta(run, pid, member)
+    return granted, roles, err
 
 
 def _applicable(run, pid: str, table) -> list[tuple]:
@@ -324,7 +333,7 @@ def enforcer_permission_check(run, pid: str) -> dict | None:
     cid = "iam.enforcer.permissions"
     member = sa_member(run.enforcer_sa)
     needed = _applicable(run, pid, ENFORCER_PERMISSIONS)
-    granted, roles, err = _bindings_granted(run, pid, member)
+    granted, roles, err, org_unreadable = _bindings_granted_meta(run, pid, member)
     if err is not None:
         return skipped(cid, "iam", *title, err, what="IAM policy of %s and its ancestors" % pid)
     run.set_fact(pid, "enforcer_granted", granted)
@@ -338,6 +347,18 @@ def enforcer_permission_check(run, pid: str) -> dict | None:
         return item
     item = _verdict(run, pid, cid, title, run.enforcer_sa, member, needed, granted, None, "allow-policy bindings",
                     roles_found=roles)
+    if item["status"] != "pass" and org_unreadable:
+        missing_roles = set((item.get("data") or {}).get("missing_roles") or ())
+        if missing_roles and missing_roles.issubset(ORG_ONLY_ROLES):
+            org_id = run.org_of(pid) or "ORGANIZATION_ID"
+            return check(
+                cid, "iam", "skip", *title,
+                "Project-level permissions of %s on %s are present; organization %s IAM allow policy is not readable "
+                "by the runtime identity, so organization-level %s could not be verified from bindings."
+                % (run.enforcer_sa, pid, org_id, ", ".join(sorted(missing_roles))),
+                commands=item.get("commands") or [],
+                data=dict(item.get("data") or {}, org_policy_unreadable=True),
+            )
     if item["status"] == "fail":
         # Missing Deny Admin disables per-user enforcement but not the rest of the product.
         item["blocking"] = False

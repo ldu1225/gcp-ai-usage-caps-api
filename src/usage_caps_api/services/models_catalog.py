@@ -35,6 +35,7 @@ TIERS = {
     "pro", "flash", "lite", "ultra", "nano", "omni", "sonnet", "opus", "haiku", "instant",
     "large", "medium", "small", "fast", "oss", "live", "embedding", "native", "image", "tts",
     "hd", "clip", "coder", "maverick", "scout",
+    "carbon", "argon", "hydrogen", "neon", "fable",
 }
 STOP_WORDS = {
     "text", "input", "output", "caching", "cached", "cache", "token", "tokens", "count",

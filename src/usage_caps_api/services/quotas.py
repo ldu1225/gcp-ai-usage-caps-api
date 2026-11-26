@@ -146,6 +146,7 @@ def _flatten(ctx, project: str, infos: list[dict], prefs: list[dict], usage: dic
                 "base_model" not in (info.get("dimensions") or []):
             continue
         kind = _metric_kind(info)
+        req_dims = [str(d) for d in (info.get("dimensions") or []) if d not in ("user", "resource")]
         for di in info.get("dimensionsInfos") or [{"dimensions": {}, "details": {}}]:
             dims = dict(di.get("dimensions") or {})
             value = _int((di.get("details") or {}).get("value"))
@@ -175,6 +176,8 @@ def _flatten(ctx, project: str, infos: list[dict], prefs: list[dict], usage: dic
                 "model": model,
                 "location": location,
                 "dimensions": dims,
+                "required_dimensions": req_dims,
+                "dimensions_complete": all(bool(dims.get(d)) for d in req_dims),
                 "is_default": not dims,
                 "limit": value,
                 "usage_peak": peak,
@@ -365,25 +368,33 @@ def _resolve_target(ctx, project: str, body: dict) -> dict:
         return _find_limit(ctx, project, lid)
     qid = str(body.get("quota_id") or "").strip()
     if not qid:
-        raise ApiError("bad_request", "Provide 'limit_id' or 'quota_id' (+ optional 'model' / 'location').")
-    model = (str(body.get("model") or "").strip().lower() or None)
-    location = (str(body.get("location") or "").strip().lower() or None)
+        raise ApiError("bad_request", "Provide 'limit_id' or 'quota_id' (+ optional 'model' / 'location' / 'dimensions').")
+    raw_dims = body.get("dimensions")
+    explicit_dims = {str(k): str(v) for k, v in raw_dims.items() if k and v not in (None, "")} if isinstance(raw_dims, dict) else {}
+    model = (str(body.get("model") or explicit_dims.get("base_model") or "").strip().lower() or None)
+    location = (str(body.get("location") or explicit_dims.get("region") or "").strip().lower() or None)
     rows, _ = project_limits(ctx, project, with_usage=True, ai_only=False)
     cands = [r for r in rows if r["quota_id"] == qid]
     if not cands:
         raise ApiError("not_found", "Quota '%s' not found for service %s in %s." % (qid, service_name(ctx), project))
+    if explicit_dims:
+        by_dims = [r for r in cands if (r.get("dimensions") or {}) == explicit_dims]
+        if by_dims:
+            return by_dims[0]
     exact = [r for r in cands if r.get("model") == model and (location is None or r.get("location") == location)]
     if exact:
         return exact[0]
     # No explicit dimension entry yet: derive dimensions from the quota's default row.
     base = next((r for r in cands if r["is_default"]), cands[0])
-    dims = {}
-    if location and location != "global":
+    dims = dict(explicit_dims)
+    if location and location != "global" and "region" not in dims:
         dims["region"] = location
-    if model:
+    if model and "base_model" not in dims:
         dims["base_model"] = model
-    return dict(base, id=limit_id(project, qid, dims), dimensions=dims, model=model, location=location or "global",
-                is_default=not dims, preference=None)
+    req_dims = list(base.get("required_dimensions") or [])
+    return dict(base, id=limit_id(project, qid, dims), dimensions=dims,
+                dimensions_complete=all(bool(dims.get(d)) for d in req_dims),
+                model=model, location=location or "global", is_default=not dims, preference=None)
 
 
 def _submit(ctx, row: dict, body: dict) -> dict:
@@ -398,6 +409,15 @@ def _submit(ctx, row: dict, body: dict) -> dict:
         raise ApiError("bad_request", "Field 'requested_value' must be a non-negative integer.")
     if row.get("is_fixed"):
         raise ApiError("unprocessable", "Quota '%s' is a fixed system limit and cannot be changed." % row["quota_id"])
+    req_dims = [d for d in (row.get("required_dimensions") or []) if d not in ("user", "resource")]
+    row_dims = row.get("dimensions") or {}
+    missing_dims = [d for d in req_dims if not row_dims.get(d)]
+    if missing_dims:
+        raise ApiError(
+            "unprocessable",
+            "Quota '%s' requires dimension values for %s (default fallback rows cannot be edited directly; "
+            "pick a dimensioned limit_id or pass dimensions/model/location)." % (row["quota_id"], ", ".join(missing_dims)),
+        )
     current = row.get("limit")
     kind = "decrease" if (current is not None and requested <= current) else "increase"
     if kind == "increase" and row.get("increase_eligible") is False:

@@ -293,10 +293,19 @@ def update_policy(ctx) -> dict:
         return pol
 
     ctx.store.mutate(POLICY_DOC, save)
-    if getattr(ctx.app, "cache", None) is not None:
-        ctx.app.cache.clear("caps_status")
+    _invalidate_caps_caches(ctx)
     audit.write_audit(ctx, "caps.policy.updated", target="global", details={"fields": sorted(updates.keys())})
     return public_policy_view(ctx, effective_policy(ctx))
+
+
+def _invalidate_caps_caches(ctx):
+    if getattr(ctx.app, "cache", None) is not None:
+        ctx.app.cache.clear("caps_status")
+    try:
+        from . import usage_events
+        usage_events.TRACKER.drop_snapshot()
+    except Exception:  # pylint: disable=broad-except
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -421,8 +430,13 @@ def evaluate_gates_and_plan(users: list[dict], *, deny_readable: bool, telemetry
                     suspend_projects[email] = missing
             else:
                 review_list.append(email)
+                if currently_denied and susp is None:
+                    restore_list.append(email)
+        elif mode == "manual" and over is True and currently_denied and susp is None:
+            review_list.append(email)
+            restore_list.append(email)
         elif currently_denied and over is not True:
-            if u.get("expired_block") or _suspension_ended(susp, now) or (over is False and g3_ok):
+            if u.get("expired_block") or _suspension_ended(susp, now) or (susp is None and over is None) or (over is False and g3_ok):
                 restore_list.append(email)
             elif not g3_ok:
                 withheld_restores = True
@@ -591,13 +605,22 @@ def _remaining(c_cap, t_cap, r_cap, rec, cost) -> dict:
     }
 
 
-def _block_in_sync(src: dict, def_svcs, blocked_global: set, blocked_projects: dict) -> bool:
+def _block_in_sync(src: dict, def_svcs, blocked_global: set, blocked_projects: dict,
+                   susp: dict | None = None) -> bool:
     desired = set(src.get("services") or def_svcs)
     projects = src.get("projects")
     if projects is None:
         return blocked_global == desired
+    if blocked_global:
+        return False
+    desired_projects = set(projects)
+    susp_projects = (set(susp.get("projects") or ())
+                     if isinstance(susp, dict) and isinstance(susp.get("projects"), list) else set())
+    extra = {p for p, svcs in (blocked_projects or {}).items() if svcs} - desired_projects - susp_projects
+    if extra:
+        return False
     for p in projects:
-        have = set(blocked_projects.get(p) or ()) | blocked_global
+        have = set(blocked_projects.get(p) or ())
         if have != desired:
             return False
     return True
@@ -808,7 +831,8 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
             "expired_block": bool(raw_block and _rule_expired(raw_block, now) and not mblock),
             "blocked_services": blocked_svcs,
             "blocked_projects": blocked_projects,
-            "block_in_sync": (_block_in_sync(block_src, def_svcs, blocked_global, blocked_projects_raw)
+            "block_in_sync": (_block_in_sync(block_src, def_svcs, blocked_global, blocked_projects_raw,
+                                             susp=(susp if susp_active else None))
                               if (block_src and backend == "iam_deny") else True),
             "over_cap": over,
             "over_cap_reasons": (list(reasons) if over_t else sorted({r for pr_ in project_rows if pr_["over_cap"]
@@ -891,8 +915,9 @@ def _public_user_cap(row: dict) -> dict:
 
 
 def list_user_caps(ctx) -> dict:
-    """GET /v1/caps/users?status=&email=&project=&multi_project=&limit=&cursor="""
-    payload, _ = compute_caps_status(ctx)
+    """GET /v1/caps/users?status=&email=&project=&multi_project=&fresh=&limit=&cursor="""
+    fresh = str(ctx.params.get("fresh") or "").lower() in ("1", "true")
+    payload, _ = compute_caps_status(ctx, fresh=fresh)
     rows = [_public_user_cap(r) for r in payload["users"]]
     status_f = (ctx.params.get("status") or "").strip().lower()
     if status_f:
@@ -919,8 +944,8 @@ def list_user_caps(ctx) -> dict:
     return page
 
 
-def get_user_cap_snapshot(ctx, email: str) -> dict:
-    payload, _ = compute_caps_status(ctx)
+def get_user_cap_snapshot(ctx, email: str, *, fresh: bool = False) -> dict:
+    payload, _ = compute_caps_status(ctx, fresh=fresh)
     for row in payload["users"]:
         if row["email"] == email:
             return dict(_public_user_cap(row), period=payload["period"])
@@ -966,7 +991,8 @@ def get_user_cap(ctx) -> dict:
     email = identity.person_key(ctx.path_params.get("email") or "")
     if not email:
         raise ApiError("bad_request", "Path parameter 'email' must be a valid email or workforce principal.")
-    return dict(get_user_cap_snapshot(ctx, email), object="user_cap")
+    fresh = str(ctx.params.get("fresh") or "").lower() in ("1", "true")
+    return dict(get_user_cap_snapshot(ctx, email, fresh=fresh), object="user_cap")
 
 
 def put_user_cap(ctx) -> dict:
@@ -1019,6 +1045,7 @@ def put_user_cap(ctx) -> dict:
         return rule
 
     ctx.store.mutate(USER_CAPS_DOC, save)
+    _invalidate_caps_caches(ctx)
     audit.write_audit(ctx, "caps.user.updated", target=email, details={"type": rtype, "rule": rule})
     return {"object": "user_cap_rule", "email": email, "rule": rule}
 
@@ -1039,6 +1066,7 @@ def delete_user_cap(ctx) -> dict:
     existed = ctx.store.mutate(USER_CAPS_DOC, remove)
     if not existed:
         raise ApiError("not_found", "No individual spend cap rule found for '%s'." % email)
+    _invalidate_caps_caches(ctx)
     audit.write_audit(ctx, "caps.user.deleted", target=email)
     return {"email": email, "deleted": True}
 
@@ -1109,6 +1137,11 @@ def _desired_by_attachment(ctx, policy: dict, state: dict, deny_state: enforcers
             src = blocks.get(em) or rules.get(em) or {}
             if applies(ap, src.get("projects")):
                 cur[em] = set(src.get("services") or def_svcs)
+            else:
+                susp = suspensions.get(em)
+                active_susp = isinstance(susp, dict) and not _suspension_ended(susp, now) and applies(ap, susp.get("projects"))
+                if not active_susp:
+                    cur.pop(em, None)
         for em, rule in rules.items():
             if rule.get("type") == "block" and applies(ap, rule.get("projects")):
                 cur[em] = set(rule.get("services") or def_svcs)
@@ -1187,6 +1220,7 @@ def block_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) ->
         doc = ctx.store.mutate(USER_CAPS_DOC, save)
         enforcement = _reconcile_direct_change(ctx, policy, doc, deny_client=deny_client)
 
+    _invalidate_caps_caches(ctx)
     audit.write_audit(ctx, "user.blocked", target=email,
                       details={"services": services, "projects": projects, "reason": reason, "until": until,
                                "enforcement": enforcement})
@@ -1300,6 +1334,7 @@ def unblock_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) 
                     (src is expanded["blocks"].get(email) or src.get("type") == "block"):
                 group_left.append(src["source"][6:])
 
+    _invalidate_caps_caches(ctx)
     status = "blocked" if (remaining_holder["any"] or group_left) else "active"
     audit.write_audit(ctx, "user.unblocked", target=email,
                       details={"unblocked_services": target_services or list(config.VALID_SERVICES),
@@ -1351,6 +1386,29 @@ def _reconcile_direct_change(ctx, policy: dict, state_doc: dict, *,
         present = any(t in deny_state.services_at(st.attachment) for st in deny_state.attachments for t in targets)
         if not deny_state.readable or not present:
             return {"backend": "notify_only", "applied": False, "detail": "No IAM deny entry to remove."}
+        if deny_client is None and (ctx.config.get("caps") or {}).get("enforcement_job"):
+            def _queue_bg(doc):
+                bg = dict(doc.get("pending_breakglass_restores") or {})
+                bg_all = list(bg.get("all") or [])
+                bg_proj = {k: list(v) for k, v in (bg.get("projects") or {}).items()}
+                if force_unblock and force_unblock not in bg_all:
+                    bg_all.append(force_unblock)
+                for person, ps in (restore_projects or {}).items():
+                    cur = list(bg_proj.get(person) or [])
+                    for p in ps:
+                        if p not in cur:
+                            cur.append(p)
+                    bg_proj[person] = cur
+                doc["pending_breakglass_restores"] = {"all": bg_all, "projects": bg_proj}
+                return doc
+            ctx.store.mutate(USER_CAPS_DOC, _queue_bg)
+            try:
+                job_res = _trigger_enforcer_job(ctx)
+                if job_res:
+                    return {"backend": "notify_only", "applied": True, "mode": "enforcer_job", **job_res,
+                            "note": "Enforcer job triggered to remove existing IAM deny entry (break-glass unblock in notify_only mode)."}
+            except GcpError as err:
+                return {"backend": "notify_only", "applied": False, "error": err.kind}
         per_ap = {}
         for st in deny_state.attachments:
             pid = enforcers.attachment_project(st.attachment)
@@ -1461,8 +1519,49 @@ def enforce_cycle(ctx, *, trigger: str = "api", dry_run: bool = False,
                                 project=prow["project"],
                             )
 
-        # 2. If dry_run, aborted by safety gates, or notify_only: change nothing.
+        # 2. If dry_run, aborted by safety gates, or notify_only: change nothing (except pending break-glass restores).
         changes = []
+        if backend == "notify_only" and not dry_run and not plan["aborted"]:
+            raw_bg_doc, _ = ctx.store.load(USER_CAPS_DOC)
+            bg = raw_bg_doc.get("pending_breakglass_restores") or {}
+            bg_all = set(bg.get("all") or ())
+            bg_proj = {k: set(v or ()) for k, v in (bg.get("projects") or {}).items()}
+            if bg_all or bg_proj:
+                if use_job_if_configured and deny_client is None and (ctx.config.get("caps") or {}).get("enforcement_job"):
+                    job_res = _trigger_enforcer_job(ctx)
+                    if job_res:
+                        return {
+                            "object": "enforcement_run", "trigger": trigger, "mode": "apply",
+                            "backend": backend, "enforcement_mode": policy.get("enforcement_mode"),
+                            "executed": True, "result": "job_started", "job": job_res,
+                            "gates": gates, "plan": plan, "changes": [],
+                        }
+                bg_deny = enforcers.read_state(ctx, client=deny_client)
+                bg_extra = [enforcers.project_attachment(p) for ps in bg_proj.values()
+                            for p in ps if enforcers.project_attachment(p)]
+                bg_deny = enforcers.extend_state(ctx, bg_deny, bg_extra, client=deny_client)
+                if bg_deny.readable:
+                    per_ap = {}
+                    for st in bg_deny.attachments:
+                        pid = enforcers.attachment_project(st.attachment)
+                        m = {}
+                        for person, svcs in bg_deny.services_at(st.attachment).items():
+                            if person in bg_all:
+                                continue
+                            if person in bg_proj and pid in bg_proj[person]:
+                                continue
+                            uri = identity.deny_principal(person)
+                            if uri and svcs:
+                                m[uri] = frozenset(svcs)
+                        per_ap[st.attachment] = m
+                    apply_res = enforcers.apply(ctx, bg_deny, {}, dry_run=False, client=deny_client, per_attachment=per_ap)
+                    ctx.store.mutate(USER_CAPS_DOC, lambda d: (d.pop("pending_breakglass_restores", None), d)[1])
+                    return {
+                        "object": "enforcement_run", "trigger": trigger, "mode": "apply",
+                        "backend": backend, "enforcement_mode": policy.get("enforcement_mode"),
+                        "executed": bool(apply_res.get("applied")), "result": "breakglass_restored",
+                        "gates": gates, "plan": plan, "changes": apply_res.get("items") or [],
+                    }
         if dry_run or plan["aborted"] or backend == "notify_only":
             result = "dry_run" if dry_run else ("aborted" if plan["aborted"] else "notify_only")
             return {

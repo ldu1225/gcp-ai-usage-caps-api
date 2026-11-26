@@ -14,8 +14,8 @@ SHARD_RE = re.compile(r"^(.+)_(\d{8})$")
 SEGMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d{1,3})\])?$")
 FILTER_PROJECT_RE = re.compile(r"^[a-z0-9.:\-]+$")
 TYPE_ALIASES = {"INTEGER": "INT64", "FLOAT": "FLOAT64", "BOOLEAN": "BOOL", "RECORD": "STRUCT"}
-TABLES_TTL = 600
-SCHEMA_TTL = 1800
+TABLES_TTL = 120
+SCHEMA_TTL = 300
 
 
 def norm_type(field_type: str | None) -> str:
@@ -190,10 +190,12 @@ def project_filter_sql(schema: TableSchema | None, projects: list[str] | tuple[s
 
 class TableSource:
     def __init__(self, project: str, dataset: str, table: str, schema: TableSchema,
-                 *, sharded: bool = False, created=None, filter_projects=None, location: str | None = None):
+                 *, sharded: bool = False, created=None, filter_projects=None, location: str | None = None,
+                 sample_table: str | None = None):
         self.project = project
         self.dataset = dataset
         self.table = table
+        self.sample_table = sample_table or table
         self.schema = schema
         self.sharded = sharded
         self.created = created
@@ -322,7 +324,7 @@ class SchemaRegistry:
         return val
 
     def get_schema_and_location(self, project: str, dataset: str, table: str, *,
-                                quota_project: str) -> tuple[TableSchema, str | None]:
+                                quota_project: str, fresh: bool = False) -> tuple[TableSchema, str | None]:
         key = ("schema_loc", project, dataset, table)
         def load():
             client = self.gcp.bq_client(quota_project)
@@ -333,11 +335,15 @@ class SchemaRegistry:
             loc = getattr(tbl, "location", None)
             return TableSchema(tbl.schema, partition_field=pfield, ingestion_partitioned=ingestion), (
                 str(loc) if isinstance(loc, str) and loc else None)
+        if fresh:
+            val = load()
+            self._cache.set(key, val, SCHEMA_TTL)
+            return val
         val, _ = self._cache.get_or_compute(key, SCHEMA_TTL, load)
         return val
 
-    def get_schema(self, project: str, dataset: str, table: str, *, quota_project: str) -> TableSchema:
-        schema, _ = self.get_schema_and_location(project, dataset, table, quota_project=quota_project)
+    def get_schema(self, project: str, dataset: str, table: str, *, quota_project: str, fresh: bool = False) -> TableSchema:
+        schema, _ = self.get_schema_and_location(project, dataset, table, quota_project=quota_project, fresh=fresh)
         return schema
 
     def resolve(self, project: str, dataset: str, prefix: str, *, quota_project: str,
@@ -348,4 +354,5 @@ class SchemaRegistry:
             return None
         schema, loc = self.get_schema_and_location(project, dataset, hit["sample"], quota_project=quota_project)
         return TableSource(project, dataset, prefix, schema, sharded=hit["sharded"],
-                           created=hit.get("created"), filter_projects=filter_projects, location=loc)
+                           created=hit.get("created"), filter_projects=filter_projects, location=loc,
+                           sample_table=hit["sample"])

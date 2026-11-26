@@ -105,8 +105,11 @@ def billing_users_report(ctx) -> dict:
     prefixes = tuple((ctx.config.get("caps") or {}).get("credit_model_prefixes") or pricing_svc.CREDIT_MODEL_PREFIXES)
 
     facts: list[dict] = []
+    partial_users: set[str] = set()
     for email, rec in sorted(usage.users.items()):
-        gemini_cost, other_cost, known, _partial = pricing_svc.split_cost(rec, pricing, prefixes)
+        gemini_cost, other_cost, known, is_partial = pricing_svc.split_cost(rec, pricing, prefixes)
+        if is_partial:
+            partial_users.add(email)
         total_cost = gemini_cost + other_cost
         cost_cents = to_cents(total_cost) if (known and pricing.configured) else None
         if cost_cents is not None:
@@ -210,6 +213,7 @@ def billing_users_report(ctx) -> dict:
             "cached_tokens": a["cached_tokens"],
             "total_tokens": a["total_tokens"],
             "cost": None if unk else money(a["cost_cents"]),
+            "cost_partial": email in partial_users,
             "credit_applied": None if unk else money(a["credit_cents"]),
             "chargeable": None if unk else money(a["chargeable_cents"]),
             "projects": sorted(a["by_project"], key=lambda x: (-(x["chargeable"] or 0), x["project"])),

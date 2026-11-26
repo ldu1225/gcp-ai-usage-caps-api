@@ -617,7 +617,9 @@ def _after_membership_change(ctx, gid: str, before: dict, after: dict) -> dict |
             doc["suspensions"] = _drop_group_suspensions(doc.get("suspensions") or {}, removed, gid)
             return doc
         doc = ctx.store.mutate(caps_svc.USER_CAPS_DOC, save)
-        return _reconcile(ctx, doc, {p: {gid} for p in removed})
+        res = _reconcile(ctx, doc, {p: {gid} for p in removed})
+    caps_svc._invalidate_caps_caches(ctx)  # pylint: disable=protected-access
+    return res
 
 
 def block_group(ctx, *, deny_client=None) -> dict:
@@ -643,6 +645,7 @@ def block_group(ctx, *, deny_client=None) -> dict:
             return doc
         doc = ctx.store.mutate(caps_svc.USER_CAPS_DOC, save)
         enforcement = _reconcile(ctx, doc, {}, deny_client=deny_client)
+    caps_svc._invalidate_caps_caches(ctx)  # pylint: disable=protected-access
     members = effective_members(g)
     expanded = expand_state(ctx, caps_svc._load_user_caps_state(ctx))  # pylint: disable=protected-access
     applied_to = sorted(p for p in members if (expanded["blocks"].get(p) or {}).get("source") == "group:" + gid)
@@ -680,6 +683,7 @@ def unblock_group(ctx, *, deny_client=None) -> dict:
             return doc
         doc = ctx.store.mutate(caps_svc.USER_CAPS_DOC, save)
         enforcement = _reconcile(ctx, doc, {p: {gid} for p in effective_members(g)}, deny_client=deny_client)
+    caps_svc._invalidate_caps_caches(ctx)  # pylint: disable=protected-access
     if not (holder["had_block"] or holder["had_rule_block"]):
         LOG.info("group %s unblock: no active group block", gid)
     expanded = expand_state(ctx, caps_svc._load_user_caps_state(ctx))  # pylint: disable=protected-access
@@ -775,7 +779,8 @@ def _group_cap_view(gid: str, g: dict, payload: dict, raw_doc: dict) -> dict:
 def list_group_caps(ctx) -> dict:
     """GET /v1/caps/groups"""
     from . import caps as caps_svc
-    payload, _ = caps_svc.compute_caps_status(ctx)
+    fresh = str(ctx.params.get("fresh") or "").lower() in ("1", "true")
+    payload, _ = caps_svc.compute_caps_status(ctx, fresh=fresh)
     raw_doc, _ = ctx.store.load(caps_svc.USER_CAPS_DOC)
     rows = [_group_cap_view(gid, g, payload, raw_doc) for gid, g in
             sorted(load_groups(ctx).items(), key=lambda kv: (int(kv[1].get("priority", DEFAULT_PRIORITY)), kv[0]))]
@@ -789,7 +794,8 @@ def get_group_cap(ctx) -> dict:
     from . import caps as caps_svc
     gid = _gid(ctx)
     g = _require_group(ctx, gid)
-    payload, _ = caps_svc.compute_caps_status(ctx)
+    fresh = str(ctx.params.get("fresh") or "").lower() in ("1", "true")
+    payload, _ = caps_svc.compute_caps_status(ctx, fresh=fresh)
     raw_doc, _ = ctx.store.load(caps_svc.USER_CAPS_DOC)
     return _group_cap_view(gid, g, payload, raw_doc)
 
@@ -813,8 +819,7 @@ def put_group_cap(ctx) -> dict:
         enforcement = None
         if rule["type"] in ("block", "allow") or (prev.get("rule") or {}).get("type") in ("block", "allow"):
             enforcement = _reconcile(ctx, doc, {p: {gid} for p in effective_members(g)})
-    if getattr(ctx.app, "cache", None) is not None:
-        ctx.app.cache.clear("caps_status")
+    caps_svc._invalidate_caps_caches(ctx)  # pylint: disable=protected-access
     audit.write_audit(ctx, "caps.group.updated", target="group:" + gid, details={"type": rule["type"], "rule": rule})
     return {"object": "group_cap_rule", "group": gid, "rule": rule, "enforcement": enforcement}
 
@@ -837,6 +842,7 @@ def delete_group_cap(ctx) -> dict:
         if holder["rule"] is None:
             raise ApiError("not_found", "No spend cap rule found for group '%s'." % gid)
         enforcement = _reconcile(ctx, doc, {p: {gid} for p in effective_members(g)})
+    caps_svc._invalidate_caps_caches(ctx)  # pylint: disable=protected-access
     audit.write_audit(ctx, "caps.group.deleted", target="group:" + gid)
     return {"object": "group_cap_rule", "group": gid, "deleted": True, "enforcement": enforcement}
 

@@ -377,6 +377,9 @@ def _apply_env(cfg: dict, env: dict) -> dict:
     if get("OIDC_ALLOWED_SERVICE_ACCOUNTS"):
         auth["oidc_allowed_service_accounts"] = [e.lower() for e in _split_csv(get("OIDC_ALLOWED_SERVICE_ACCOUNTS"))
                                                  if valid_email(e)]
+    if get("OIDC_INTERNAL_SERVICE_ACCOUNTS"):
+        auth["oidc_internal_service_accounts"] = [e.lower() for e in _split_csv(get("OIDC_INTERNAL_SERVICE_ACCOUNTS"))
+                                                  if valid_email(e)]
     if env.get("ALLOW_LOCAL_INSECURE") is not None and env.get("ALLOW_LOCAL_INSECURE") != "":
         auth["allow_local_insecure"] = _parse_bool(env["ALLOW_LOCAL_INSECURE"])
 

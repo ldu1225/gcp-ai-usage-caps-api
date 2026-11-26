@@ -56,9 +56,9 @@ ENFORCER_MEMBER="serviceAccount:${ENFORCER_SA}"
 
 # Least-privilege role sets.
 API_HUB_ROLES="roles/browser roles/bigquery.dataViewer roles/bigquery.jobUser roles/logging.viewer roles/logging.privateLogViewer roles/logging.logWriter roles/serviceusage.serviceUsageConsumer roles/monitoring.viewer roles/cloudquotas.admin roles/discoveryengine.editor"
-ENFORCER_HUB_ROLES="roles/bigquery.dataViewer roles/bigquery.jobUser roles/logging.viewer roles/logging.privateLogViewer roles/logging.logWriter roles/serviceusage.serviceUsageConsumer"
+ENFORCER_HUB_ROLES="roles/browser roles/bigquery.dataViewer roles/bigquery.jobUser roles/logging.viewer roles/logging.privateLogViewer roles/logging.logWriter roles/serviceusage.serviceUsageConsumer"
 API_MANAGED_ROLES="roles/browser roles/logging.viewer roles/logging.privateLogViewer roles/monitoring.viewer roles/cloudquotas.admin roles/discoveryengine.editor roles/serviceusage.serviceUsageConsumer"
-ENFORCER_MANAGED_ROLES="roles/logging.viewer roles/logging.privateLogViewer"
+ENFORCER_MANAGED_ROLES="roles/browser roles/logging.viewer roles/logging.privateLogViewer"
 if [[ "$DATASET_MODE" == "per_project" ]]; then
   API_MANAGED_ROLES="${API_MANAGED_ROLES} roles/bigquery.dataViewer"
   ENFORCER_MANAGED_ROLES="${ENFORCER_MANAGED_ROLES} roles/bigquery.dataViewer"
@@ -120,6 +120,11 @@ else
     info "  gcloud organizations add-iam-policy-binding ${ORG_ID:-ORGANIZATION_ID} --member=${pair%%|*} --role=${pair#*|} --condition=None"
   done
 fi
+if [[ "$SPEND_CAPS" == "true" && -n "$BILLING_ACCOUNT" ]]; then
+  run_quiet gcloud billing accounts add-iam-policy-binding "$BILLING_ACCOUNT" \
+    --member="$API_MEMBER" --role="roles/billing.costsManager" --quiet 2>/dev/null || \
+    warn "Could not grant roles/billing.costsManager on billing account ${BILLING_ACCOUNT}; grant it manually for /v1/caps/projects"
+fi
 
 log "5/9 GCS state bucket & bootstrap Admin API key"
 if ! probe gcloud storage buckets describe "gs://${STATE_BUCKET}" --project="$HUB"; then
@@ -180,8 +185,8 @@ MANAGED_CSV="$(IFS=,; echo "${MANAGED_ARR[*]+"${MANAGED_ARR[*]}"}")"
 # Optional v1.2 runtime settings (costs = log token counts x Cloud Billing Catalog SKU prices; no billing export).
 for var in CAP_SCOPE VERTEX_USER_HEADER_LABEL METERED_SURFACES MODEL_VIOLATION_BLOCK_SCOPE MODEL_PUBLISHERS \
            LONG_CONTEXT_THRESHOLD_TOKENS PROVISIONED_THROUGHPUT_COST VERTEX_LOGGING_ENDPOINT \
-           SERVICE_ACCOUNT_SUBJECTS; do
-  if [[ -n "${!var}" ]]; then ENV_PAIRS+=("${var}=${!var// /}"); fi
+           SERVICE_ACCOUNT_SUBJECTS OIDC_ALLOWED_SERVICE_ACCOUNTS OIDC_INTERNAL_SERVICE_ACCOUNTS; do
+  if [[ -n "${!var:-}" ]]; then ENV_PAIRS+=("${var}=${!var// /}"); fi
 done
 ENV_VARS="^|^$(IFS='|'; echo "${ENV_PAIRS[*]}")"
 
@@ -211,6 +216,14 @@ run gcloud run deploy "$SERVICE_NAME" \
   --set-env-vars="$ENV_VARS" \
   --set-secrets="BOOTSTRAP_ADMIN_KEY=${BOOT_SECRET}:latest" \
   --cpu=1 --memory=512Mi --max-instances=5
+if [[ "${DRY_RUN:-0}" != "1" ]]; then
+  ACTUAL_URL="$(gcloud run services describe "$SERVICE_NAME" --project="$HUB" --region="$REGION" --format='value(status.url)' 2>/dev/null || true)"
+  if [[ -n "$ACTUAL_URL" && "${ACTUAL_URL%/}" != "${RUN_URL%/}" ]]; then
+    info "Cloud Run reports secondary URL ${ACTUAL_URL}; allowing both in PUBLIC_BASE_URL for OIDC audience checks"
+    run gcloud run services update "$SERVICE_NAME" --project="$HUB" --region="$REGION" \
+      --update-env-vars="^|^PUBLIC_BASE_URL=${RUN_URL},${ACTUAL_URL}" >/dev/null
+  fi
+fi
 JOB_VERB="create"
 probe gcloud run jobs describe "$ENFORCER_JOB" --region="$REGION" --project="$HUB" && JOB_VERB="update"
 JOB_FLAGS=()
