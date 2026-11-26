@@ -531,6 +531,42 @@ class CompatibilityRegressionTests(unittest.TestCase):
         })
         self.assertEqual(dry_ok["status"], "dry_run")
 
+    def test_mixed_surface_by_traffic_preserves_unbucketed_tokens(self):
+        """Mixing Antigravity (no trafficType) + Gemini Platform (by_traffic) on the same model must never drop cost."""
+        from usage_caps_api.services import pricing as pricing_svc
+        table = pricing_svc.PriceTable(currency="USD", prices={
+            "gemini-4-carbon": {
+                "input": 4.0, "output": 20.0, "cached": 0.4, "source": "official_sku",
+                "tiers": {"flex": {"input": 2.0, "output": 10.0, "cached": 0.2}},
+            },
+        })
+        pr = pricing_svc.Pricing(currency="USD", input_per_million=0, output_per_million=0,
+                                 source="auto", table=table)
+        # 1) Same model used on Antigravity (200k in, 100k cached, 5k out, no traffic)
+        #    + Gemini Platform on_demand (100 in, 50 out, by_traffic={"on_demand": ...})
+        agg = {
+            "requests": 13,
+            "input_tokens": 200100, "output_tokens": 5050, "cached_tokens": 100000,
+            "cache_write_tokens": 0, "total_tokens": 205150,
+            "by_traffic": {"on_demand": {"input_tokens": 100, "output_tokens": 50,
+                                         "cached_tokens": 0, "cache_write_tokens": 0}},
+        }
+        cost, priced, _ = pricing_svc.model_cost("gemini-4-carbon", agg, pr)
+        self.assertTrue(priced)
+        # Expected: (100100 * 4 + 100000 * 0.4 + 5050 * 20) / 1e6 = (400400 + 40000 + 101000) / 1e6 = 0.5414
+        self.assertAlmostEqual(cost, 0.5414, places=6)
+
+        # 2) Mixed Antigravity (1M in, no traffic) + Gemini Platform flex (1M in, by_traffic={"flex": ...})
+        agg_flex = {
+            "input_tokens": 2_000_000, "output_tokens": 0, "cached_tokens": 0,
+            "cache_write_tokens": 0, "total_tokens": 2_000_000,
+            "by_traffic": {"flex": {"input_tokens": 1_000_000, "output_tokens": 0,
+                                    "cached_tokens": 0, "cache_write_tokens": 0}},
+        }
+        cost_flex, _, _ = pricing_svc.model_cost("gemini-4-carbon", agg_flex, pr)
+        # 1M * $2.0 (flex) + 1M * $4.0 (on_demand remainder) = $6.0
+        self.assertAlmostEqual(cost_flex, 6.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

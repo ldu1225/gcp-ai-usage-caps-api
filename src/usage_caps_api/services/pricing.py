@@ -244,9 +244,20 @@ def model_cost(model: str | None, agg: dict, pricing: Pricing) -> tuple[float, b
     if "output_tokens" in agg:
         agg = dict(agg)
         agg["output_tokens"] = max(to_int(agg.get("output_tokens")), tokens - to_int(agg.get("input_tokens")), 0)
+    bucket_keys = ("input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens")
     traffic = agg.get("by_traffic") or {}
-    buckets = {t: dict(v) for t, v in traffic.items()} if traffic else {"on_demand": {
-        k: agg.get(k) for k in ("input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens")}}
+    if traffic:
+        buckets = {t: {k: max(0, to_int(v.get(k))) for k in bucket_keys} for t, v in traffic.items()}
+        # Rows from surfaces without trafficType (e.g. Antigravity mixed with Gemini Platform on the same model)
+        # contribute to top-level `agg` totals but not to `by_traffic`. Price the unbucketed remainder at on_demand
+        # so multi-surface usage never wipes out earlier surface cost.
+        rem = {k: max(0, to_int(agg.get(k)) - sum(b[k] for b in buckets.values())) for k in bucket_keys}
+        if any(rem.values()):
+            od = buckets.setdefault("on_demand", {k: 0 for k in bucket_keys})
+            for k, v in rem.items():
+                od[k] += v
+    else:
+        buckets = {"on_demand": {k: max(0, to_int(agg.get(k))) for k in bucket_keys}}
     total = 0.0
     long_c = {k: to_int(agg.get("long_" + k)) for k in ("input_tokens", "output_tokens", "cached_tokens")}
     if any(long_c.values()):
