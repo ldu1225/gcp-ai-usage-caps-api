@@ -4,7 +4,7 @@ Steps (each isolated; one failure never stops the others):
   1. Per-user model rules safety net (detect disallowed model use / exceeded per-model limits -> block + notify).
   2. Quota request status refresh (pending -> approved / partially_approved / denied) + webhooks.
   3. Rate-limit headroom thresholds (hourly) -> `rate_limit.threshold_reached` webhooks.
-  4. Model access intent reconcile (hourly): re-expands patterns such as `gemini-2.5-*` when new versions appear.
+  4. Model access intent reconcile (hourly): re-expands patterns such as `<family>-*` when new models appear in the live catalog.
 """
 
 from __future__ import annotations

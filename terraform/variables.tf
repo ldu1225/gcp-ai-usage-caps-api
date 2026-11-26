@@ -120,21 +120,6 @@ variable "quota_project_id" {
   default = ""
 }
 
-variable "billing_project_id" {
-  type    = string
-  default = ""
-}
-
-variable "billing_dataset_id" {
-  type    = string
-  default = ""
-}
-
-variable "billing_table_id" {
-  type    = string
-  default = ""
-}
-
 variable "billing_account_id" {
   type        = string
   default     = ""
@@ -301,4 +286,61 @@ variable "enforcement_schedule" {
 variable "pricing_sync_schedule" {
   type    = string
   default = "0 3 * * *"
+}
+
+# v1.2 -------------------------------------------------------------------------------------------------------------
+# Costs = log token counts x official Cloud Billing Catalog SKU prices (no Cloud Billing export variables anymore).
+
+variable "enable_vertex_inference_logging" {
+  type        = bool
+  default     = true
+  description = "Enable Vertex AI inference request metadata logging (aiplatform.googleapis.com/inference_request, the per-request Vertex AI token source) on the hub and every managed project. No native Terraform resource exists (hashicorp/terraform-provider-google#30642), so a terraform_data local-exec calls the v1beta1 setPublisherModelConfig REST method with curl (needs bash + curl where terraform runs, and aiplatform.endpoints.setPublisherModelConfig for the Terraform identity). Cloud Logging ingestion/storage pricing applies to the entries."
+}
+
+variable "vertex_logging_endpoint" {
+  type        = string
+  default     = "https://aiplatform.googleapis.com/v1beta1"
+  description = "v1beta1 Vertex AI endpoint used to enable inference request metadata logging (e.g. a Private Service Connect endpoint under VPC Service Controls)."
+  validation {
+    condition     = can(regex("^https://[A-Za-z0-9.-]+(:[0-9]+)?/v1beta1$", var.vertex_logging_endpoint))
+    error_message = "vertex_logging_endpoint must look like https://HOST/v1beta1."
+  }
+}
+
+variable "create_vertex_logging_reader_role" {
+  type        = bool
+  default     = true
+  description = "Create the one-permission custom role gcpAiCapsVertexLoggingReader (aiplatform.endpoints.fetchPublisherModelConfig) in the hub and every managed project and grant it to the runtime service account (readiness + GET /v1/projects/{p}/vertex-logging). Import existing roles created by scripts/deploy.sh instead of recreating them."
+}
+
+variable "cap_scope" {
+  type        = string
+  default     = ""
+  description = "Optional CAP_SCOPE: total | per_project (empty = application default)."
+  validation {
+    condition     = contains(["", "total", "per_project"], var.cap_scope)
+    error_message = "cap_scope must be empty, total or per_project."
+  }
+}
+
+variable "vertex_user_header_label" {
+  type        = string
+  default     = ""
+  description = "Optional VERTEX_USER_HEADER_LABEL: custom request header label carrying the end user in Vertex AI inference request logs."
+}
+
+variable "metered_surfaces" {
+  type        = list(string)
+  default     = []
+  description = "Optional METERED_SURFACES (e.g. [\"antigravity\", \"vertex_ai\", \"gemini_enterprise\"]); empty = application default."
+}
+
+variable "model_violation_block_scope" {
+  type        = string
+  default     = ""
+  description = "Optional MODEL_VIOLATION_BLOCK_SCOPE: project | all (empty = application default)."
+  validation {
+    condition     = contains(["", "project", "all"], var.model_violation_block_scope)
+    error_message = "model_violation_block_scope must be empty, project or all."
+  }
 }

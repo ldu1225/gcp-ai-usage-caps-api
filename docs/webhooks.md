@@ -6,9 +6,11 @@
 > `X-Signature-256: sha256=HMAC_SHA256(secret, "{timestamp}.{body}")`. This page lists every event in
 > `SUPPORTED_EVENTS` (`services/webhooks.py`), when it fires, and an example `data` payload taken from the emitting code
 > (`caps.py`, `usage_events.py`, `spend_caps.py`, `model_access.py`, `surface_models.py`, `user_model_rules.py`,
-> `quotas.py`, `governance_cycle.py`, `app.py`). All 13 events are emitted. Threshold, rate-limit, project-cap,
-> model-lifecycle and readiness events are de-duplicated server-side; receivers should still de-duplicate on the
-> envelope `id`.
+> `quotas.py`, `governance_cycle.py`, `model_registry.py`, `app.py`). All 15 events are emitted. Threshold, rate-limit,
+> project-cap, model-lifecycle and readiness events are de-duplicated server-side; receivers should still de-duplicate
+> on the envelope `id`. Since 1.2.0, `cap.*` carry `scope`/`project` (per-project caps), `user.blocked` carries
+> `projects` (list or `"all"`), and `model.first_seen` / `model.catalog_changed` report new models from logs and Model
+> Garden. Model IDs in the examples are placeholders — there is no built-in model list.
 
 ---
 
@@ -99,11 +101,13 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 
 | 이벤트 | 서버 측 중복 제거 | 키 |
 |---|---|---|
-| `cap.threshold_reached`, `cap.exceeded` | 예 — `notify_threshold_once` | `(사용자 이메일 소문자, 기간 시작, 임계값 %)` — 같은 기간·같은 임계값은 한 번만. 실시간 경로와 5분 주기 경로가 같은 원장을 공유 |
+| `cap.threshold_reached`, `cap.exceeded` | 예 — `notify_threshold_once` | `(사용자 이메일 소문자, 기간 시작, 임계값 %[, 프로젝트])` — 같은 기간·같은 임계값은 한 번만(프로젝트별 캡은 프로젝트마다 별도). 실시간 경로와 5분 주기 경로가 같은 원장을 공유 |
 | `rate_limit.threshold_reached` | 예 — `notify_once` | `rate_limit.threshold_reached\|<limit_id>\|<UTC 날짜>` — 한도별 하루 1회 |
 | `project_cap.enforced` | 예 — `notify_once` | `project_cap.enforced\|<project_id>\|<UTC 날짜>` — 캡이 `ENFORCED`인 동안 프로젝트별 하루 1회 |
 | `model.lifecycle_notice` | 예 — `notify_once` | `model.lifecycle_notice\|<model_id>\|<deprecation_date 또는 shutdown_date>\|<날짜 값>` — 모델·필드·날짜별 1회 (날짜가 바뀌면 다시 발송) |
 | `readiness.degraded` | 예 — `notify_once` | `readiness.degraded\|<overall>\|<UTC 날짜>` — 상태(`blocked`/`ready_with_warnings`)별 하루 1회 (프로젝트 구분 없음) |
+| `model.first_seen` | 예 — 카탈로그 원장 | 모델 ID별 **최초 1회**(상태 문서 `model_catalog.observed`에 없을 때만). 한 번에 최대 50건 |
+| `model.catalog_changed` | 부분 — 변경이 있을 때만 | Model Garden 동기화 결과에 `added`/`delisted`가 있을 때 1회(최초 동기화는 발송 안 함) |
 | 그 외 모든 이벤트 | 아니오 | 상태 변경이 일어날 때마다 1회 디스패치 |
 
 - 원장은 상태 버킷 `webhooks.json`의 `notified` 맵이며, 5,000개를 넘으면 오래된 1,000개를 정리합니다. 정리된 키는
@@ -131,9 +135,11 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 | `quota_request.created` | 쿼터 변경 요청 제출 (드라이런 제외) | `quotas._submit` | 발송 |
 | `quota_request.updated` | 요청 상태 변경(새로고침 시) 또는 취소 | `quotas.refresh_request`, `quotas.cancel_request` | 발송 |
 | `readiness.degraded` | `GET /v1/admin/readiness`(캐시 미사용 실행) 또는 `POST /v1/admin/readiness/run` 결과의 `overall`이 `blocked`/`ready_with_warnings` — 상태별 하루 1회 | `app._notify_readiness` | 발송 |
+| `model.first_seen` | 어떤 서비스 로그에서든 **처음 사용된** 모델 (내장 목록 없이 로그 관측으로 추적) | `model_registry.record_observed` (사용량 수집 시) | 발송 (1.2.0) |
+| `model.catalog_changed` | Model Garden 동기화에서 신규 모델(`added`) 또는 사라진 모델(`delisted`) 발견 | `model_registry.discover` (카탈로그 TTL 만료·`POST /v1/models/sync`) | 발송 (1.2.0) |
 
 > [!NOTE]
-> `events`를 생략하고 구독하면 위 13개 이벤트를 모두 받습니다. `readiness.degraded`는 API로 readiness를 실행할 때만
+> `events`를 생략하고 구독하면 위 15개 이벤트를 모두 받습니다. `readiness.degraded`는 API로 readiness를 실행할 때만
 > 평가되며(캐시 응답은 제외), 사전 점검 CLI(`scripts/preflight.sh`)나 스케줄러는 이 이벤트를 발생시키지 않습니다.
 
 ## 6. 이벤트별 페이로드
@@ -148,6 +154,8 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
   "period_start": "2026-11-01T00:00:00Z",
   "threshold_pct": 80,
   "utilization_pct": 83.4,
+  "scope": "total",
+  "project": null,
   "usage": {
     "requests": 412, "input_tokens": 1830000, "output_tokens": 220000, "cached_tokens": 50000,
     "total_tokens": 2050000, "estimated_cost": 41.7, "cost_partial": false, "currency": "USD",
@@ -157,39 +165,52 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 }
 ```
 
+프로젝트별 캡(`cap_scope: per_project`, 사용자 `project_caps`, 정책 `project_defaults`)의 임계값이면:
+
+```json
+{
+  "email": "alice@example.com", "period_start": "2026-11-01T00:00:00Z", "threshold_pct": 100, "utilization_pct": 100.8,
+  "scope": "project", "project": "team-b-prod",
+  "usage": {"requests": 120, "total_tokens": 610000, "estimated_cost": 50.4, "currency": "USD"},
+  "limit": {"cost_cap": 50.0, "token_cap": null, "request_cap": null, "currency": "USD", "source": "user_project_cap"}
+}
+```
+
+- `scope`: `total`(합산 캡) 또는 `project`(프로젝트별 캡 — `project`에 프로젝트 ID). 같은 사용자라도 프로젝트마다 따로 발송됩니다.
 - `period_start`는 캡 기간 시작(기간이 없으면 `"all"`). `utilization_pct`는 소수 둘째 자리 반올림.
 - 실시간 경로(`usage_events`)에서 발송되면 `usage`는 `{"requests", "total_tokens", "estimated_cost"}`만 포함합니다.
-- `limit`의 비어 있는 캡은 `null`.
+- `limit`의 비어 있는 캡은 `null`. 프로젝트별 캡은 `limit.source`(`user_project_cap` / `project_default` / `per_project_scope`) 포함.
 
 ### 6.2 `user.blocked`
 
-발생 경로에 따라 필드가 다릅니다(`trigger`로 구분).
+발생 경로에 따라 필드가 다릅니다(`trigger`로 구분). 모든 경로에 **`projects`**(차단이 적용된 프로젝트 목록, 전체면 `"all"`)가 포함됩니다.
 
 ```json
-{"email": "alice@example.com", "services": ["vertex_ai"], "reason": "policy breach drill",
+{"email": "alice@example.com", "services": ["vertex_ai"], "projects": ["team-b-prod"], "reason": "policy breach drill",
  "until": "2026-11-27T00:00:00Z", "trigger": "manual", "actor": "key:1a2b3c4d5e6f"}
 ```
 
 ```json
-{"email": "bob@example.com", "services": ["antigravity", "vertex_ai", "gemini_enterprise"],
+{"email": "bob@example.com", "services": ["antigravity", "vertex_ai", "gemini_enterprise"], "projects": "all",
  "trigger": "auto_cap", "until": "2026-12-01T00:00:00Z", "reasons": ["cost"]}
 ```
 
 ```json
-{"email": "carol@example.com", "services": ["antigravity"], "until": "2026-11-27T00:00:00Z",
+{"email": "carol@example.com", "services": ["antigravity"], "projects": ["team-a-prod"], "until": "2026-11-27T00:00:00Z",
  "trigger": "model_policy", "reasons": ["model_not_allowed"]}
 ```
 
 | `trigger` | 발생 | 추가 필드 |
 |---|---|---|
-| `manual` | `POST /v1/users/{email}/block` | `reason`, `until`(RFC 3339 또는 `null`), `actor` |
-| `auto_cap` | 자동 모드 캡 초과 정지(집행 주기에서 IAM 적용 성공 시) | `until`(다음 기간 리셋), `reasons`(`over_cap_reasons`) |
-| `model_policy` | 모델 규칙 위반 차단 | `until`, `reasons`(위반 유형 목록: `model_not_allowed`, `model_denied`, `limit_exceeded`) |
+| `manual` | `POST /v1/users/{email}/block` (`projects` 지정 시 해당 프로젝트만) | `reason`, `until`(RFC 3339 또는 `null`), `actor` |
+| `auto_cap` | 자동 모드 캡 초과 정지(집행 주기에서 IAM 적용 성공 시). 일부 프로젝트만 초과하면 그 프로젝트만 | `until`(다음 기간 리셋), `reasons`(`over_cap_reasons`) |
+| `model_policy` | 모델 규칙 위반 차단 (기본 `violation_block_scope=project` → 위반 프로젝트만) | `until`, `reasons`(위반 유형 목록: `model_not_allowed`, `model_denied`, `limit_exceeded`) |
 
 ### 6.3 `user.unblocked`
 
 ```json
-{"email": "alice@example.com", "unblocked_services": ["vertex_ai"], "remaining_services": [],
+{"email": "alice@example.com", "unblocked_services": ["vertex_ai"], "unblocked_projects": ["team-b-prod"],
+ "remaining_services": ["vertex_ai"], "remaining_projects": ["team-a-prod"],
  "reason": "drill complete", "trigger": "manual", "actor": "key:1a2b3c4d5e6f"}
 ```
 
@@ -198,7 +219,8 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 ```
 
 - `manual`: `services`를 지정하지 않으면 `unblocked_services`는 모든 서비스(`antigravity`, `vertex_ai`,
-  `gemini_enterprise`). `remaining_services`가 비어 있지 않으면 일부 서비스는 계속 차단 중입니다.
+  `gemini_enterprise`). `projects`를 지정하지 않으면 `unblocked_projects`는 `"all"`. `remaining_services` /
+  `remaining_projects`가 비어 있지 않으면 일부 서비스·프로젝트는 계속 차단 중입니다.
 - `auto_reset`: 기간 리셋으로 자동 복구(집행 주기에서 IAM 적용 성공 시).
 
 ### 6.4 `project_cap.lifted`
@@ -211,28 +233,31 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 
 ### 6.5 `model.access_changed`
 
+> 아래 `<model-a>`, `<model-b>` 등은 자리표시자입니다. 실제 값은 실시간 카탈로그(`GET /v1/models`)의 모델 ID입니다.
+
 Vertex AI 조직 정책(`constraints/vertexai.allowedModels`) 적용:
 
 ```json
 {"surface": "vertex_ai", "scope": "projects/team-a", "mode": "allow_list",
- "models": ["gemini-2.5-*"], "expanded_models": ["publishers/google/models/gemini-2.5-pro", "publishers/google/models/gemini-2.5-flash"],
+ "models": ["google/*"], "expanded_models": ["publishers/google/models/<model-a>", "publishers/google/models/<model-b>"],
  "operation_id": "op_0123456789abcdef", "actor": "key:1a2b3c4d5e6f"}
 ```
 
 - `mode`: `allow_list`, `deny_list`, `unrestricted`, `deny_all`, `inherit` 중 하나.
+- `expanded_models`: 패턴을 그 시점의 실시간 카탈로그로 확장한 결과(매시간 재확장 시 새 모델이 추가될 수 있음).
 - `operation_id`로 `GET /v1/operations/{operation_id}`에서 반영 확인(조직 정책 반영은 보통 수 분, 최대 ~15분).
 
 Gemini Enterprise 앱 모델 변경(단건 `PATCH /v1/gemini-enterprise/apps/{app_id}/models`):
 
 ```json
-{"surface": "gemini_enterprise", "target": "team-a/global/my-engine", "changes": {"gemini-2.5-pro": "on", "gemini-2.0-flash": "off"},
+{"surface": "gemini_enterprise", "target": "team-a/global/my-engine", "changes": {"<model-a>": "on", "<model-c>": "off"},
  "actor": "key:1a2b3c4d5e6f"}
 ```
 
 일괄(`POST /v1/gemini-enterprise/apps/bulk-models`):
 
 ```json
-{"surface": "gemini_enterprise", "target": "bulk", "changes": {"gemini-2.5-pro": "on"}, "apps": 7, "actor": "key:1a2b3c4d5e6f"}
+{"surface": "gemini_enterprise", "target": "bulk", "changes": {"<model-a>": "on"}, "apps": 7, "actor": "key:1a2b3c4d5e6f"}
 ```
 
 `changes` 값은 `on` / `off` / `default`. 실제 변경이 있을 때만(드라이런·무변경 제외) 발송됩니다.
@@ -247,6 +272,7 @@ Gemini Enterprise 앱 모델 변경(단건 `PATCH /v1/gemini-enterprise/apps/{ap
   "type": "limit_exceeded",
   "model": null,
   "surface": "antigravity",
+  "projects": ["team-a-prod"],
   "metric": "daily_tokens",
   "limit": 500000,
   "observed": 612345,
@@ -257,6 +283,7 @@ Gemini Enterprise 앱 모델 변경(단건 `PATCH /v1/gemini-enterprise/apps/{ap
   "detected_at": "2026-11-26T11:40:58Z",
   "window_id": "2026-11-26",
   "block_services": ["antigravity"],
+  "block_projects": ["team-a-prod"],
   "block_until": "2026-11-27T00:00:00Z",
   "enforcement_applied": true
 }
@@ -265,12 +292,14 @@ Gemini Enterprise 앱 모델 변경(단건 `PATCH /v1/gemini-enterprise/apps/{ap
 | 필드 | 값 |
 |---|---|
 | `type` | `model_not_allowed`, `model_denied`, `limit_exceeded` |
+| `model` / `publisher` | 로그에 기록된 모델 ID와 publisher(Model Garden·로그 리소스 기준, 이름으로 추측하지 않음) |
+| `projects` | 위반 요청이 실행된 관리 프로젝트 |
 | `metric` | `limit_exceeded`일 때 `rpm`, `tpm`, `daily_requests`, `daily_tokens`, `monthly_requests`, `monthly_tokens`, `monthly_cost` |
 | `rule_source` | `user`, `user+default`, `default` |
 | `action` | `block_service`, `notify`, `deferred`(변경 예산 G4 도달) — `already_blocked`인 위반은 발송하지 않음 |
 | `action_note` | `notify`로 바뀐 사유(`enforcement_backend=notify_only`, `protected principal / allow override`) 등 |
 | `trigger` | `scheduler`(거버넌스 주기), `api`(`POST /v1/model-rules/evaluate`), `usage_event`(실시간) |
-| `block_services`, `block_until` | `action=block_service`일 때만 |
+| `block_services`, `block_projects`, `block_until` | `action=block_service`일 때만. `block_projects`는 `models.violation_block_scope=project`(기본)면 위반 프로젝트, `all`이면 `"all"` |
 | `enforcement_applied` | `block_service`일 때 IAM 적용 성공 여부, 그 외 `false` |
 
 ### 6.7 `rate_limit.threshold_reached`
@@ -289,9 +318,9 @@ Gemini Enterprise 앱 모델 변경(단건 `PATCH /v1/gemini-enterprise/apps/{ap
   "display_name": "Generate content requests per minute per project per base model",
   "unit": "1/min/{project}/{base_model}",
   "refresh_interval": "minute",
-  "model": "gemini-2.5-pro",
+  "model": "<model-id>",
   "location": "global",
-  "dimensions": {"base_model": "gemini-2.5-pro"},
+  "dimensions": {"base_model": "<model-id>"},
   "is_default": false,
   "limit": 600,
   "usage_peak": 540,
@@ -320,8 +349,8 @@ Gemini Enterprise 앱 모델 변경(단건 `PATCH /v1/gemini-enterprise/apps/{ap
   "service": "aiplatform.googleapis.com",
   "quota_id": "GenerateContentRequestsPerMinutePerProjectPerBaseModel",
   "limit_id": "rl_…",
-  "dimensions": {"base_model": "gemini-2.5-pro"},
-  "model": "gemini-2.5-pro",
+  "dimensions": {"base_model": "<model-id>"},
+  "model": "<model-id>",
   "location": "global",
   "metric_kind": "per_minute",
   "kind": "increase",
@@ -376,8 +405,8 @@ Gemini Enterprise 앱 모델 변경(단건 `PATCH /v1/gemini-enterprise/apps/{ap
 ### 6.11 `model.lifecycle_notice`
 
 ```json
-{"model": "gemini-2.0-flash-001", "publisher": "google", "event": "shutdown_date", "date": "2027-02-01",
- "days_remaining": 67, "replacement": "gemini-2.5-flash"}
+{"model": "<model-id>", "publisher": "google", "event": "shutdown_date", "date": "2027-02-01",
+ "days_remaining": 67, "replacement": "<replacement-model-id>"}
 ```
 
 | 필드 | 값 |
@@ -388,6 +417,39 @@ Gemini Enterprise 앱 모델 변경(단건 `PATCH /v1/gemini-enterprise/apps/{ap
 | `replacement` | 대체 모델(없으면 `null`) |
 
 같은 모델이라도 `deprecation_date`와 `shutdown_date`는 각각 한 번씩 발송되고, 날짜가 바뀌면 다시 발송됩니다.
+
+### 6.12 `model.first_seen` (1.2.0)
+
+로그(어떤 서비스든)에서 **처음 사용된** 모델. 내장 모델 목록 없이 신규 모델을 사용 당일 추적합니다.
+
+```json
+{"model": "<model-id>", "publisher": "anthropic", "surfaces": ["vertex_ai"], "projects": ["team-a-prod"],
+ "users": 3, "first_seen": "2026-11-26T09:12:44Z", "in_model_garden": true}
+```
+
+| 필드 | 값 |
+|---|---|
+| `model` | 로그에 기록된 모델 ID(소문자 정규화, `publishers/.../models/` 접두사·`:action` 접미사 제거) |
+| `publisher` | 로그 리소스(`publishers/{p}/models/{m}`) 또는 Model Garden 기준. 알 수 없으면 `null`(이름으로 추측하지 않음) |
+| `surfaces` | `antigravity` · `vertex_ai` · `gemini_enterprise` 중 관측된 서비스 |
+| `projects` | 관측된 관리 프로젝트(최대 20개) |
+| `users` | 관측 구간의 사용자 수 |
+| `first_seen` | 로그상 최초 사용 시각 |
+| `in_model_garden` | Model Garden 카탈로그에 있는지(`false`면 `GET /v1/models?source=observed`에 표시) |
+
+권장 처리: 사용자 규칙(`/v1/model-rules/default`)·프로젝트 정책에 이 모델이 의도대로 포함/제외되는지 검토, `GET /v1/pricing?model=<model-id>`로 단가 존재 확인.
+
+### 6.13 `model.catalog_changed` (1.2.0)
+
+Model Garden 동기화(카탈로그 TTL 만료 또는 `POST /v1/models/sync`)에서 변화가 있을 때:
+
+```json
+{"added": ["<model-id-1>", "<model-id-2>"], "delisted": ["<model-id-3>"], "fetched_at": "2026-11-26T03:00:12Z"}
+```
+
+- `added`: 새로 나타났거나 다시 게시된 모델(최대 200개), `delisted`: 조회에 성공한 publisher에서 사라진 모델(최대 200개).
+- 제외된 모델은 카탈로그에서 삭제되지 않고 `lifecycle.delisted_at`과 함께 유지되며, 정책 패턴 확장에서는 빠집니다.
+- 최초 동기화(이전 카탈로그 없음)에서는 발송하지 않습니다.
 
 ## 7. 수신 측 구현 권장사항
 

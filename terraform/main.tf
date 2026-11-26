@@ -13,6 +13,8 @@
 # - Log Router sinks (BigQuery -> central dataset, Pub/Sub -> hub topic), writer identities granted on the hub only
 # - least-privilege roles for the runtime and enforcer service accounts (or folder/org-level grants)
 # - optional Vertex AI Data Access audit logs (google_project_iam_audit_config)
+# - Vertex AI inference request metadata logging (var.enable_vertex_inference_logging, local-exec REST call) and the
+#   one-permission custom role gcpAiCapsVertexLoggingReader for the runtime service account
 #
 # Existing resources are adopted instead of duplicated: var.reuse_dataset = "PROJECT:DATASET" reads the dataset with a
 # data source and only adds sinks/grants. Run `scripts/preflight.sh` first to detect adoptable datasets and sinks.
@@ -40,7 +42,6 @@ locals {
   api_sa_member      = "serviceAccount:${google_service_account.api_sa.email}"
   enforcer_sa_member = "serviceAccount:${google_service_account.enforcer_sa.email}"
   quota_project      = var.quota_project_id != "" ? var.quota_project_id : var.project_id
-  billing_project    = var.billing_project_id != "" ? var.billing_project_id : var.project_id
   settings_bucket    = var.settings_bucket_name != "" ? var.settings_bucket_name : "${var.project_id}-${var.service_name}-state"
   dataset_location   = var.dataset_location != "" ? var.dataset_location : var.region
   run_url            = "https://${var.service_name}-${data.google_project.this.number}.${var.region}.run.app"
@@ -155,10 +156,20 @@ locals {
 
   ai_log_filter = join(" OR ", [
     "log_id(\"businessaicode.googleapis.com/inference_response\")",
+    "log_id(\"aiplatform.googleapis.com/inference_request\")",
     "(log_id(\"cloudaudit.googleapis.com/data_access\") AND protoPayload.serviceName=\"aiplatform.googleapis.com\")",
     "log_id(\"discoveryengine.googleapis.com/gemini_enterprise_user_activity\")",
     "log_id(\"discoveryengine.googleapis.com/gen_ai_user_message\")",
   ])
+
+  # Real-time usage events: Antigravity inference responses + Vertex AI inference request metadata.
+  realtime_filter = join(" OR ", [
+    "log_id(\"businessaicode.googleapis.com/inference_response\")",
+    "log_id(\"aiplatform.googleapis.com/inference_request\")",
+  ])
+
+  vertex_logging_reader_role_id = "gcpAiCapsVertexLoggingReader"
+  vertex_reader_projects        = var.create_vertex_logging_reader_role ? toset(concat([var.project_id], var.grant_managed_roles ? local.managed_projects : [])) : toset([])
 
   common_env = {
     HOST                          = "0.0.0.0"
@@ -170,9 +181,6 @@ locals {
     AUDIT_PROJECT_ID              = local.audit_project
     SCOPE_TYPE                    = var.scope_type
     SCOPE_IDS                     = join(",", var.scope_ids)
-    BILLING_PROJECT_ID            = var.billing_project_id
-    BILLING_DATASET_ID            = var.billing_dataset_id
-    BILLING_TABLE_ID              = var.billing_table_id
     BILLING_ACCOUNT_ID            = var.billing_account_id
     WORKSPACE_TIMEZONE            = var.workspace_timezone
     SETTINGS_BUCKET               = google_storage_bucket.state.name
@@ -197,6 +205,11 @@ locals {
     CAP_CURRENCY                  = var.cap_currency
     QUOTA_CONTACT_EMAIL           = var.quota_contact_email
     MODEL_VIOLATION_ACTION        = var.model_violation_action
+    CAP_SCOPE                     = var.cap_scope
+    VERTEX_USER_HEADER_LABEL      = var.vertex_user_header_label
+    METERED_SURFACES              = join(",", var.metered_surfaces)
+    MODEL_VIOLATION_BLOCK_SCOPE   = var.model_violation_block_scope
+    VERTEX_LOGGING_ENDPOINT       = var.vertex_logging_endpoint
   }
 }
 
@@ -384,6 +397,73 @@ resource "google_project_iam_audit_config" "vertex_data_access" {
   }
 }
 
+# Vertex AI inference request metadata logging (aiplatform.googleapis.com/inference_request): the only log-based
+# source of per-request Vertex AI token counts. There is NO native Terraform resource for the project-level
+# PublisherModelConfig (hashicorp/terraform-provider-google#30642), so each project is enabled with the v1beta1
+# setPublisherModelConfig REST method through a local-exec (bash + curl on the machine running terraform; the access
+# token of the provider credentials is passed via the environment and never written to state). An identical write
+# returns 409 ALREADY_EXISTS (= already enabled). The setting has no DELETE: destroying this resource leaves logging on.
+data "google_client_config" "current" {}
+
+resource "terraform_data" "vertex_inference_logging" {
+  for_each = var.enable_vertex_inference_logging ? toset(local.sink_projects) : toset([])
+  input    = each.value
+
+  triggers_replace = {
+    project  = each.value
+    endpoint = var.vertex_logging_endpoint
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    environment = {
+      ACCESS_TOKEN = data.google_client_config.current.access_token
+      SET_URL      = "${var.vertex_logging_endpoint}/projects/${self.input}:setPublisherModelConfig"
+      PROJECT      = self.input
+    }
+    command = <<-EOT
+      set -uo pipefail
+      out="$(mktemp)"
+      code="$(curl -sS -o "$out" -w '%%{http_code}' --max-time 60 -X POST \
+        -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: application/json" "$SET_URL" \
+        -d '{"publisherModelConfig":{"inferenceEventLoggingConfig":{"state":"ENABLED"}}}' || echo 000)"
+      case "$code" in
+        2??) echo "$PROJECT: Vertex AI inference request metadata logging ENABLED" ;;
+        409) echo "$PROJECT: Vertex AI inference request metadata logging already ENABLED (409)" ;;
+        *)
+          if grep -Eq 'SERVICE_DISABLED|has not been used|it is disabled' "$out"; then
+            echo "warning: $PROJECT: aiplatform.googleapis.com is disabled (Vertex AI unused); logging not enabled" >&2
+          else
+            echo "error: $PROJECT: setPublisherModelConfig failed (HTTP $code): $(head -c 400 "$out")" >&2
+            rm -f "$out"
+            exit 1
+          fi ;;
+      esac
+      rm -f "$out"
+    EOT
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+# One-permission custom role so the runtime can read the logging state (readiness + GET /v1/projects/{p}/vertex-logging).
+resource "google_project_iam_custom_role" "vertex_logging_reader" {
+  for_each    = local.vertex_reader_projects
+  project     = each.value
+  role_id     = local.vertex_logging_reader_role_id
+  title       = "GCP AI Caps Vertex logging reader"
+  description = "Read Vertex AI inference request logging state (GCP AI Usage Caps API)"
+  permissions = ["aiplatform.endpoints.fetchPublisherModelConfig"]
+  stage       = "GA"
+}
+
+resource "google_project_iam_member" "api_vertex_logging_reader" {
+  for_each = google_project_iam_custom_role.vertex_logging_reader
+  project  = each.value.project
+  role     = each.value.id
+  member   = local.api_sa_member
+}
+
 # 5. Headless Cloud Run v2 API Service
 resource "google_cloud_run_v2_service" "api" {
   name                 = var.service_name
@@ -566,7 +646,7 @@ resource "google_logging_project_sink" "usage_events" {
   name                   = local.usage_topic_name
   project                = each.value
   destination            = "pubsub.googleapis.com/projects/${var.project_id}/topics/${google_pubsub_topic.usage_events[0].name}"
-  filter                 = "log_id(\"businessaicode.googleapis.com/inference_response\")"
+  filter                 = local.realtime_filter
   unique_writer_identity = true
 }
 

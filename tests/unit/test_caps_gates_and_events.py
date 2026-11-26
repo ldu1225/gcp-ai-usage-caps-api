@@ -117,7 +117,7 @@ class CapsGatesAndEventsTests(unittest.TestCase):
 
         now = dt.datetime.now(dt.timezone.utc)
         # First event: $8.50 (85% of $10 cap) -> fires 80% threshold webhook, does NOT block yet
-        e1 = make_inference_entry("carol@company.com", model="gemini-2.5-pro",
+        e1 = make_inference_entry("carol@company.com", model="gemini-test-pro",
                                   prompt=400_000, cand=800_000, ts=now, insert_id="ev-1")
         # $0.50 input + $8.00 output = $8.50
         push1 = {"message": {"data": base64.b64encode(json.dumps(e1).encode("utf-8")).decode("ascii")}}
@@ -132,7 +132,7 @@ class CapsGatesAndEventsTests(unittest.TestCase):
         self.assertEqual(ev_hdrs["X-Signature-256"], expected_sig)
 
         # Second event: +$2.50 -> $11.00 (>= 100% cap) -> triggers immediate IAM Deny v2 enforcement!
-        e2 = make_inference_entry("carol@company.com", model="gemini-2.5-pro",
+        e2 = make_inference_entry("carol@company.com", model="gemini-test-pro",
                                   prompt=400_000, cand=200_000, ts=now + dt.timedelta(seconds=5), insert_id="ev-2")
         fake_gcp.log_entries.extend([e1, e2])
         push2 = {"message": {"data": base64.b64encode(json.dumps(e2).encode("utf-8")).decode("ascii")}}

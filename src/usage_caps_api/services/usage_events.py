@@ -1,9 +1,15 @@
 """Real-time Pub/Sub push usage event handler (POST /v1/internal/usage-event).
 
-A Cloud Logging sink routes Antigravity inference entries (`businessaicode.googleapis.com/inference_response`)
-to Pub/Sub, which pushes each entry to this endpoint with a Google OIDC token.
-When a user crosses a webhook threshold or reaches their spend cap in `auto` mode, an outbound webhook
-and/or immediate enforcement cycle (or Cloud Run Enforcer Job) is triggered within seconds.
+A Cloud Logging sink (one per managed project, or one aggregated folder/organization sink) routes inference log
+entries to Pub/Sub, which pushes each entry to this endpoint with a Google OIDC token:
+
+- Antigravity `businessaicode.googleapis.com/inference_response` (person in `labels.user_id`)
+- Vertex AI `aiplatform.googleapis.com/inference_request` (person from the custom header label; entries without a
+  header label are handled by the scheduled cycle, which correlates them with Data Access audit logs)
+
+Per event: per-user model rules (allow/deny list, RPM/TPM) are checked first (default action: block + notify), then
+the user's total cap and the cap of the project the request ran in. Threshold webhooks fire in real time; in `auto`
+mode an over-cap triggers an immediate enforcement cycle (or the Cloud Run Enforcer Job).
 """
 
 from __future__ import annotations
@@ -17,12 +23,12 @@ import logging
 import threading
 import urllib.parse
 
-from .. import identity, timeutil
+from .. import timeutil
 from ..auth import INTERNAL_SCOPE
 from ..gcp import GcpError
 from ..httpkit import ApiError
 from . import caps as caps_svc, pricing as pricing_svc, usage as usage_svc, user_model_rules, webhooks
-from .base import iso, to_int
+from .base import iso
 
 LOG = logging.getLogger("usage_caps_api.usage_events")
 
@@ -47,59 +53,61 @@ def decode_push(body: dict) -> dict | None:
     return entry if isinstance(entry, dict) else None
 
 
-def entry_usage(entry: dict, log_id: str, projects: list[str]) -> dict | None:
+def _item(person, project, ts, key, model, publisher, surface, counts) -> dict:
+    return {
+        "person": person, "project": project, "ts": ts, "key": key, "model": model, "publisher": publisher,
+        "surface": surface, "counts": counts,
+        "total_tokens": counts["total_tokens"], "input_tokens": counts["input_tokens"],
+        "output_tokens": counts["output_tokens"], "cached_tokens": counts["cached_tokens"],
+    }
+
+
+def entry_usage(entry: dict, log_id: str, projects: list[str], *, vertex_log_id: str | None = None,
+                header_label: str = "user", directory: dict | None = None, long_ctx: int = 200000) -> dict | None:
+    """Normalizes one pushed log entry (Antigravity or Vertex AI) into a usage item, or None when not applicable."""
     name = entry.get("logName")
     if not isinstance(name, str) or "/logs/" not in name:
         return None
     project = usage_svc.entry_project(name)
     if not project or project not in projects:
         return None
-    if urllib.parse.unquote(name.split("/logs/", 1)[1]) != urllib.parse.unquote(str(log_id or "")):
-        return None
-    labels = entry.get("labels") if isinstance(entry.get("labels"), dict) else {}
-    person = identity.person_key(labels.get("user_id"))
-    if person is None:
-        return None
-    ts = timeutil.parse_rfc3339(entry.get("timestamp")) or timeutil.parse_rfc3339(entry.get("receiveTimestamp"))
-    if ts is None:
-        return None
-    payload = entry.get("jsonPayload") if isinstance(entry.get("jsonPayload"), dict) else {}
-    meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-    total = max(0, to_int(meta.get("totalTokenCount")))
-    prompt = max(0, to_int(meta.get("promptTokenCount")))
-    cand = max(0, to_int(meta.get("candidatesTokenCount")))
-    cached = max(0, to_int(meta.get("cachedContentTokenCount")))
-    model = str(labels.get("model_id") or labels.get("model") or "unknown").strip()[:200]
-    key = (str(entry.get("insertId") or "").strip() or str(labels.get("request_id") or "").strip()
-           or "%s|%s|%s|%d" % (project, person, iso(ts), total))
-    return {
-        "person": person,
-        "project": project,
-        "ts": ts,
-        "key": key,
-        "model": model,
-        "total_tokens": total,
-        "input_tokens": prompt,
-        "output_tokens": max(total - prompt, cand, 0),
-        "cached_tokens": min(cached, prompt),
-    }
+    lid = usage_svc.log_id_of(name)
+    if lid == urllib.parse.unquote(str(log_id or "")):
+        parsed = usage_svc.parse_agy_entry(entry, long_ctx)
+        if parsed is None or parsed["person"] is None:
+            return None
+        ts = parsed["ts"] or timeutil.parse_rfc3339(entry.get("receiveTimestamp"))
+        if ts is None:
+            return None
+        key = (str(entry.get("insertId") or "").strip()
+               or str(((entry.get("labels") or {}).get("request_id")) or "").strip()
+               or "%s|%s|%s|%d" % (project, parsed["person"], iso(ts), parsed["counts"]["total_tokens"]))
+        return _item(parsed["person"], project, ts, key, parsed["model"], parsed["publisher"], "antigravity",
+                     parsed["counts"])
+    if vertex_log_id and lid == urllib.parse.unquote(vertex_log_id):
+        parsed = usage_svc.parse_vertex_entry(entry, header_label=header_label, long_ctx=long_ctx)
+        if parsed is None:
+            return None
+        person = usage_svc.resolve_user_label(parsed.get("user_label"), directory or {})
+        if person is None or parsed["ts"] is None:
+            return None
+        key = parsed["key"] or "%s|%s|%s|%d" % (project, person, iso(parsed["ts"]), parsed["counts"]["total_tokens"])
+        return _item(person, parsed["project"] or project, parsed["ts"], key, parsed["model"], parsed["publisher"],
+                     "vertex_ai", parsed["counts"])
+    return None
 
 
 def _aggregate_items(items: list[dict]) -> dict:
-    rec = {"requests": 0, "total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "by_model": {}}
+    rec = usage_svc._new_counters()  # pylint: disable=protected-access
+    rec["by_model"] = {}
     for it in items:
-        rec["requests"] += 1
-        rec["total_tokens"] += it["total_tokens"]
-        rec["input_tokens"] += it["input_tokens"]
-        rec["output_tokens"] += it["output_tokens"]
-        rec["cached_tokens"] += it["cached_tokens"]
-        m = rec["by_model"].setdefault(it["model"], {"requests": 0, "total_tokens": 0, "input_tokens": 0,
-                                                     "output_tokens": 0, "cached_tokens": 0})
-        m["requests"] += 1
-        m["total_tokens"] += it["total_tokens"]
-        m["input_tokens"] += it["input_tokens"]
-        m["output_tokens"] += it["output_tokens"]
-        m["cached_tokens"] += it["cached_tokens"]
+        counts = it.get("counts") or usage_svc.token_counts(
+            prompt=it.get("input_tokens", 0), cand=it.get("output_tokens", 0), cached=it.get("cached_tokens", 0),
+            total=it.get("total_tokens", 0))
+        usage_svc._add(rec, counts)  # pylint: disable=protected-access
+        m = rec["by_model"].setdefault(it["model"], dict(usage_svc._new_counters(),  # pylint: disable=protected-access
+                                                         surface=it.get("surface"), publisher=it.get("publisher")))
+        usage_svc._add(m, counts)  # pylint: disable=protected-access
     return rec
 
 
@@ -120,10 +128,12 @@ class RealtimeTracker:
             while self.seen and (len(self.seen) > SEEN_MAX or next(iter(self.seen.values()))["ts"] < floor):
                 self.seen.popitem(last=False)
 
-    def unseen(self, person: str, after: dt.datetime | None, since: dt.datetime | None, item: dict) -> list[dict]:
+    def unseen(self, person: str, after: dt.datetime | None, since: dt.datetime | None, item: dict,
+               surface: str | None = None) -> list[dict]:
         with self.lock:
-            items = [it for it in self.seen.values() if it["person"] == person]
-        if not any(it["key"] == item["key"] for it in items):
+            items = [it for it in self.seen.values() if it["person"] == person
+                     and (surface is None or it.get("surface") == surface)]
+        if not any(it["key"] == item["key"] for it in items) and (surface is None or item.get("surface") == surface):
             items.append(item)
         return [it for it in items if (after is None or it["ts"] > after) and (since is None or it["ts"] >= since)]
 
@@ -151,6 +161,13 @@ def _ack(action: str, **extra) -> dict:
     return dict({"acknowledged": True, "action": action}, **extra)
 
 
+def _last_counted(usage_res, person: str, surface: str):
+    rec = usage_res.users.get(person) or {}
+    if not (rec.get("by_surface") or {}).get(surface):
+        return None
+    return rec.get("last_active")
+
+
 def handle_usage_event(ctx) -> dict:
     """POST /v1/internal/usage-event: processes one Pub/Sub push inference log message."""
     if not (ctx.caller.has_scope(INTERNAL_SCOPE) or ctx.caller.has_scope("admin")):
@@ -159,8 +176,14 @@ def handle_usage_event(ctx) -> dict:
     entry = decode_push(ctx.body)
     if entry is None:
         return _ack("ignored", reason="invalid_payload")
-    log_id = (ctx.config.get("caps") or {}).get("inference_log") or "businessaicode.googleapis.com%2Finference_response"
-    item = entry_usage(entry, log_id, ctx.all_projects)
+    caps_cfg = ctx.config.get("caps") or {}
+    log_id = caps_cfg.get("inference_log") or usage_svc.DEFAULT_AGY_LOG
+    vertex_log = caps_cfg.get("vertex_inference_log") or usage_svc.DEFAULT_VERTEX_LOG
+    directory = usage_svc.user_directory(ctx) if usage_svc.log_id_of(entry.get("logName")) != \
+        urllib.parse.unquote(log_id) else {}
+    item = entry_usage(entry, log_id, ctx.all_projects, vertex_log_id=vertex_log,
+                       header_label=usage_svc.header_label_key(ctx), directory=directory,
+                       long_ctx=int((ctx.config.get("pricing") or {}).get("long_context_threshold_tokens") or 200000))
     if item is None:
         return _ack("ignored", reason="not_matching_inference_entry")
 
@@ -191,46 +214,82 @@ def handle_usage_event(ctx) -> dict:
 
     person = item["person"]
     row = next((u for u in payload["users"] if u["email"] == person), None)
-    if row and row["status"] in ("blocked", "suspended"):
+    if row and row["status"] in ("blocked", "suspended") and row.get("status_scope", "all") == "all":
         return _ack("already_" + row["status"])
+    prow = next((p for p in (row or {}).get("projects") or [] if p["project"] == item["project"]), None)
+    if prow and prow["status"] in ("blocked", "suspended"):
+        return _ack("already_" + prow["status"], project=item["project"])
     if row and (row.get("rule") or {}).get("type") == "allow":
         return _ack("allowed")
 
-    last_counted = (usage_res.users.get(person) or {}).get("last_active")
-    unseen_items = TRACKER.unseen(person, last_counted, win["start"], item)
+    last_counted = _last_counted(usage_res, person, item["surface"])
+    unseen_items = TRACKER.unseen(person, last_counted, win["start"], item, surface=item["surface"])
     added = _aggregate_items(unseen_items)
     added_cost, _ = pricing_svc.estimate_cost(added, pricing)
 
-    base_tokens = (row["usage"]["total_tokens"] if row else 0) + added["total_tokens"]
-    base_req = (row["usage"]["requests"] if row else 0) + added["requests"]
-    base_cost_raw = row["usage"]["estimated_cost"] if row else (0.0 if pricing.configured else None)
-    base_cost = None if base_cost_raw is None else round(float(base_cost_raw) + float(added_cost or 0.0), 6)
+    over_any = False
+    thresholds = sorted(int(t) for t in (policy.get("webhook_thresholds") or [80, 100]))
 
+    # 1) User total cap (cap_scope=total)
     lim = row["limit"] if row else {
         "cost_cap": float(policy.get("cost_cap") or 0.0) or None,
         "token_cap": int(policy.get("token_cap") or 0) or None,
         "request_cap": int(policy.get("request_cap") or 0) or None,
         "currency": pricing.currency,
     }
-    over, ratio_val, _reasons = caps_svc.cap_check(
-        base_tokens, base_req,
-        int(lim.get("token_cap") or 0), int(lim.get("request_cap") or 0),
-        base_cost, float(lim.get("cost_cap") or 0.0),
-    )
+    if (row or {}).get("cap_scope", policy.get("cap_scope") or "total") == "total":
+        base_tokens = (row["usage"]["total_tokens"] if row else 0) + added["total_tokens"]
+        base_req = (row["usage"]["requests"] if row else 0) + added["requests"]
+        base_cost_raw = row["usage"]["estimated_cost"] if row else (0.0 if pricing.configured else None)
+        base_cost = None if base_cost_raw is None else round(float(base_cost_raw) + float(added_cost or 0.0), 6)
+        over, ratio_val, _reasons = caps_svc.cap_check(
+            base_tokens, base_req, int(lim.get("token_cap") or 0), int(lim.get("request_cap") or 0),
+            base_cost, float(lim.get("cost_cap") or 0.0))
+        if ratio_val is not None:
+            for thr in thresholds:
+                if ratio_val * 100.0 >= thr:
+                    webhooks.notify_threshold_once(
+                        ctx, email=person, period_start=win["start_iso"] or "all", threshold_pct=thr,
+                        utilization_pct=ratio_val * 100.0,
+                        usage={"requests": base_req, "total_tokens": base_tokens, "estimated_cost": base_cost},
+                        limit=lim)
+        over_any = over_any or bool(over)
 
-    # Fire deduplicated threshold webhooks in real time
-    if ratio_val is not None:
-        util_pct = ratio_val * 100.0
-        for thr in sorted(int(t) for t in (policy.get("webhook_thresholds") or [80, 100])):
-            if util_pct >= thr:
-                webhooks.notify_threshold_once(
-                    ctx, email=person, period_start=win["start_iso"] or "all",
-                    threshold_pct=thr, utilization_pct=util_pct,
-                    usage={"requests": base_req, "total_tokens": base_tokens, "estimated_cost": base_cost},
-                    limit=lim,
-                )
+    # 2) Cap of the project this request ran in (user assigned to several projects / per-project caps)
+    p_lim = (prow or {}).get("limit")
+    if p_lim is None:
+        src = ((row or {}).get("rule") or {}).get("project_caps", {}).get(item["project"]) if (row or {}).get("rule") else None
+        src = src or (policy.get("project_defaults") or {}).get(item["project"])
+        if src:
+            p_lim = {"cost_cap": src.get("cost_cap"), "token_cap": src.get("token_cap"),
+                     "request_cap": src.get("request_cap"), "currency": pricing.currency}
+        elif (policy.get("cap_scope") or "total") == "per_project":
+            p_lim = {"cost_cap": float(policy.get("cost_cap") or 0.0) or None,
+                     "token_cap": int(policy.get("token_cap") or 0) or None,
+                     "request_cap": int(policy.get("request_cap") or 0) or None, "currency": pricing.currency}
+    if p_lim:
+        p_items = [it for it in unseen_items if it.get("project") == item["project"]]
+        p_added = _aggregate_items(p_items)
+        p_added_cost, _ = pricing_svc.estimate_cost(p_added, pricing)
+        pu = (prow or {}).get("usage") or {"total_tokens": 0, "requests": 0, "estimated_cost": 0.0}
+        p_tokens = int(pu.get("total_tokens") or 0) + p_added["total_tokens"]
+        p_req = int(pu.get("requests") or 0) + p_added["requests"]
+        p_cost_raw = pu.get("estimated_cost") if pu.get("estimated_cost") is not None else (0.0 if pricing.configured else None)
+        p_cost = None if p_cost_raw is None else round(float(p_cost_raw) + float(p_added_cost or 0.0), 6)
+        p_over, p_ratio, _ = caps_svc.cap_check(p_tokens, p_req, int(p_lim.get("token_cap") or 0),
+                                                int(p_lim.get("request_cap") or 0), p_cost,
+                                                float(p_lim.get("cost_cap") or 0.0))
+        if p_ratio is not None:
+            for thr in thresholds:
+                if p_ratio * 100.0 >= thr:
+                    webhooks.notify_threshold_once(
+                        ctx, email=person, period_start=win["start_iso"] or "all", threshold_pct=thr,
+                        utilization_pct=p_ratio * 100.0,
+                        usage={"requests": p_req, "total_tokens": p_tokens, "estimated_cost": p_cost},
+                        limit=p_lim, project=item["project"])
+        over_any = over_any or bool(p_over)
 
-    if not over:
+    if not over_any:
         return _ack("under_cap")
     if (policy.get("enforcement_mode") or "manual") != "auto":
         return _ack("over_cap_manual_mode")

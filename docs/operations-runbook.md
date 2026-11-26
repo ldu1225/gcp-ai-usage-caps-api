@@ -1,13 +1,15 @@
 # 운영 런북 (Day-2 Operations)
 
 > **English summary** — Day-2 procedures for the hub deployment: health checks (`GET /v1/health`, readiness report,
-> Enforcer Job executions), verifying enforcement (IAM Deny v2 typically propagates in ~1–2 minutes), emergency
-> unblock / break-glass (order matters: unblock while `enforcement_backend=iam_deny`, or delete the managed deny policy
-> after switching to `notify_only`), protected principals and `allow` overrides, a symptom → cause → fix troubleshooting
-> table (missing usage data, VPC-SC denials, permission denied on Org Policy / Cloud Quotas / deny policies, IAM v2
-> read quota, Pub/Sub push failures, Scheduler, stuck quota requests, model policy drift, Gemini Enterprise
-> `not_applicable`, webhook signature verification with a Python sample), API key rotation (`/v1/admin/api-keys` and
-> `python -m usage_caps_api.cli keys`), GCS state bucket backup/restore, and the upgrade/rollback procedure.
+> Enforcer Job executions, daily price sync), verifying enforcement (IAM Deny v2 typically propagates in ~1–2 minutes),
+> emergency unblock / break-glass (order matters: unblock while `enforcement_backend=iam_deny`, or delete the managed
+> deny policy after switching to `notify_only`), protected principals and `allow` overrides, a symptom → cause → fix
+> troubleshooting table (missing usage data, Vertex AI `requests_only`, high `unattributed`, unpriced models, VPC-SC
+> denials, permission denied on Org Policy / Cloud Quotas / deny policies, IAM v2 read quota, Pub/Sub push failures,
+> Scheduler, stuck quota requests, model policy drift, Gemini Enterprise `not_applicable`), webhook signature
+> verification with a Python sample, API key rotation, GCS state bucket backup/restore, upgrade/rollback, and §10 on
+> cost & attribution operations (official SKU price sync — no Cloud Billing export —, enabling Vertex AI inference
+> request logging, reading `telemetry.attribution`, handling unattributed usage, new-model tracking).
 
 ---
 
@@ -22,6 +24,7 @@
 7. [API 키 교체](#7-api-키-교체)
 8. [GCS 상태 버킷 백업·복구](#8-gcs-상태-버킷-백업복구)
 9. [업그레이드·롤백](#9-업그레이드롤백)
+10. [비용·단가·사용자 귀속 운영](#10-비용단가사용자-귀속-운영)
 
 공통 변수(예시):
 
@@ -42,6 +45,8 @@ ADMIN_KEY=gcpai_xxxxxxxxxxxx_yyyyyyyy...   # admin 스코프 키
 | 환경 준비도 | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/admin/readiness" \| jq '.overall,.summary'` | `ready` 또는 예상된 `ready_with_warnings` |
 | Enforcer Job 실행 이력 | `gcloud run jobs executions list --job $SVC-enforcer --region $REGION --project $HUB --limit 5` | 5분 간격 성공 실행 |
 | 스케줄러 | `gcloud scheduler jobs describe $SVC-enforce-schedule --location $REGION --project $HUB --format='value(state,lastAttemptTime,status)'` | `ENABLED`, 최근 시도 성공 |
+| **단가 동기화** | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/pricing" \| jq '.pricing_source'` / `gcloud scheduler jobs describe $SVC-pricing-sync --location $REGION --project $HUB` | `catalog_synced_at`이 24시간 이내, `official_sku_models > 0`, `billing_export: "not_used"` |
+| **Vertex AI 토큰 출처** | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/usage/users?limit=1" \| jq '.telemetry'` | `token_sources.vertex_ai = "logs"`, `attribution.unattributed`가 전체 대비 작음 |
 | 실시간 구독 적체 | Cloud Monitoring `pubsub.googleapis.com/subscription/num_undelivered_messages` (구독 `$SVC-usage-events-push`) | 0 근처 |
 | 감사 로그 | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/audit-logs"` | 예상하지 못한 `api_key.created`, `user.blocked` 등 없음 |
 
@@ -177,6 +182,10 @@ done
 | 증상 | 가능한 원인 | 확인 | 조치 |
 |---|---|---|---|
 | 사용량이 0 / 특정 서피스 데이터 없음 | 싱크 없음·비활성·writer 권한 없음, `_Default` 제외 필터, Vertex AI Data Access 로그 꺼짐, Antigravity Metadata logging 꺼짐, 서비스가 데이터세트를 잘못 가리킴 | readiness `logging.sink.bigquery`, `logging.sink.writer_access`, `logging.sink.disabled`, `logging.default_sink`, `logging.audit_config.aiplatform`, `surface.antigravity.metadata_logging`, `bq.freshness.*`; Cloud Run 환경변수 `AUDIT_PROJECT_ID`/`AUDIT_DATASET_ID` | `prepare.sh` 재실행(싱크·권한), `--enable-data-access-logs`, 콘솔에서 Metadata logging 켜기, 환경변수 수정. 새 싱크는 **생성 이후** 로그만 라우팅합니다 |
+| Vertex AI 요청 수는 있는데 토큰·비용이 0 (`token_sources.vertex_ai = "requests_only"`, 경고 `inference_logs_missing`) | 추론 요청 메타데이터 로그 꺼짐, 또는 싱크 필터에 `aiplatform.googleapis.com/inference_request` 없음(1.1 이하에서 채택한 싱크) | readiness `logging.vertex_inference_logging`, `logging.sink.bigquery`의 `data.missing`, `GET /v1/projects/{id}/vertex-logging` | `POST /v1/projects/{id}/vertex-logging/enable` 또는 `prepare.sh` 재실행. 레거시 싱크는 readiness가 제시하는 `gcloud logging sinks update ... --log-filter=...`로 필터 보강. 켠 **이후** 요청부터 토큰이 집계됩니다 |
+| `telemetry.attribution.unattributed`가 큼 / `summary.unattributed_*` 증가 | 포털이 Vertex AI 호출에 헤더 라벨을 안 붙임, 헤더 값이 알 수 없는 uid, Data Access 감사 로그 꺼짐, 배치·서비스 계정 워크로드 | `telemetry.unattributed_projects`, `GET /v1/usage/models?group_by=project`의 `unattributed_*`, 차지백 `unattributed[].reasons` (`service_account` / `no_user_identity`) | §10.3 참고: 헤더 추가(이메일 권장), `--enable-data-access-logs`, 서비스 계정 워크로드는 프로젝트 비용으로 처리 |
+| `estimated_cost`가 `null` / `cost_partial: true` / `cost_basis: "unpriced"` | 단가 동기화 안 됨, 해당 모델 SKU가 아직 Catalog에 없음, 모델 ID와 SKU 이름 불일치 | `GET /v1/pricing` (`catalog_synced_at`, `model_key` 목록), `GET /v1/pricing?model=<model-id>` | `POST /v1/internal/pricing/sync`(관리자 키) 실행, Scheduler `$SVC-pricing-sync` 확인. 불일치는 `pricing.model_aliases`, 계약 단가는 `pricing.model_overrides`. **추측 단가로 채우지 않습니다** |
+| `GET /v1/models`가 비어 있거나 Model Garden 모델이 없음 | Model Garden 조회 실패(권한·VPC-SC·네트워크), 아직 로그 관측 없음 — **내장 목록 없음**(정상 설계) | 응답 `catalog.errors`, `catalog.model_garden_models`, readiness `surface.vertex_ai.models` | 원인 해결 후 `POST /v1/models/sync`. 로그에서 모델이 사용되면 `source: observed`로 자동 등록 |
 | `vpcsc.denials` / API 호출이 `SECURITY_POLICY_VIOLATED`, "VPC Service Controls" 오류 | 허브와 관리 프로젝트가 다른 경계, 경계 밖 호출자(포털·설치 PC) | readiness `vpcsc.perimeter`, `vpcsc.cross_project`, `vpcsc.denials`의 `data.denials` | `vpcsc.cross_project`가 생성한 ingress/egress YAML을 기존 규칙과 병합 적용, 포털에는 액세스 수준/ingress 규칙 ([preflight-checklist.md §7](preflight-checklist.md#7-vpc-서비스-제어vpc-sc-경계-간-ingressegress-가이드)) |
 | 모델 접근 정책 변경 시 `403`/`forbidden`, `org_policy_writable=false` | 런타임 SA에 조직 수준 `roles/orgpolicy.policyAdmin` 없음, `orgpolicy.googleapis.com` 비활성, `ALLOW_ORG_POLICY_WRITES=false`, 조직 없는 프로젝트 | `iam.runtime.permissions`의 `data.missing`, `api.orgpolicy.enabled`, `capabilities.org_policy_writable` | 조직 관리자가 `roles/orgpolicy.policyAdmin` 부여 (조직 전용 역할) |
 | 쿼터 조회/요청 `403` ("lacks cloudquotas.quotas.update") | `roles/cloudquotas.admin` 없음, API 비활성 | `quotas.api` | `gcloud projects add-iam-policy-binding P --member=serviceAccount:ai-usage-caps-api@HUB.iam.gserviceaccount.com --role=roles/cloudquotas.admin`, API 활성화 |
@@ -302,9 +311,10 @@ gcloud run services update $SVC --region $REGION --project $HUB \
 | `project_caps.json` | 프로젝트 지출 캡 |
 | `api_keys.json` | API 키 salt + 해시 |
 | `webhooks.json` | 웹훅 구독(시크릿 포함), 알림 dedupe 원장 |
-| `pricing.json` | 가격·환율 |
+| `pricing.json` | 공식 Cloud Billing Catalog SKU 단가표(차원·티어·SKU 이름)·환율, `synced_at` |
 | `audit_local.json` | 최근 감사 이벤트 2,000건 |
-| `model_policies.json`, `model_catalog.json`, `user_model_rules.json` | 모델 거버넌스 의도·카탈로그·사용자 모델 규칙 |
+| `model_policies.json`, `model_catalog.json`, `user_model_rules.json` | 모델 거버넌스 의도·카탈로그(Model Garden `models` + 로그 관측 `observed`)·사용자 모델 규칙 |
+| `user_directory.json` | 헤더 라벨 `uid` → 사용자 매핑 |
 | `quota_requests.json`, `operations.json`, `governance_cycle.json`, `readiness.json` | 쿼터 요청, 비동기 작업, 거버넌스 주기 상태, readiness 캐시 |
 
 ```bash
@@ -362,5 +372,77 @@ gcloud run jobs update $SVC-enforcer --region $REGION --project $HUB --image=<PR
 
 상태 문서 형식이 바뀐 경우를 대비해 §8 백업에서 필요한 문서만 복구합니다.
 
+### 9.4 1.1 → 1.2 업그레이드 체크리스트
+
+1. 환경변수 `BILLING_PROJECT_ID`/`BILLING_DATASET_ID`/`BILLING_TABLE_ID` 삭제(무시됨). Terraform `billing_project_id`/`billing_dataset_id`/`billing_table_id` 변수 삭제.
+2. `prepare.sh` 재실행 → Vertex AI 추론 요청 로그 활성화 + 싱크 필터에 `inference_request` 추가(채택 싱크는 readiness 안내 명령으로 수정).
+3. `deploy.sh` 재실행 → `$SVC-pricing-sync` 스케줄러, `gcpAiCapsVertexLoggingReader` 역할.
+4. `POST /v1/internal/pricing/sync` 1회 실행 후 `GET /v1/pricing` 확인.
+5. 포털: Vertex AI 호출에 사용자 헤더 라벨 추가, 하드코딩된 모델 ID 제거, `Model.source`(`model_garden`|`observed`) 처리 확인.
+
+## 10. 비용·단가·사용자 귀속 운영
+
+> [!IMPORTANT]
+> 비용은 **로그 토큰 수 × 공식 Cloud Billing Catalog SKU 단가**입니다. Cloud Billing Export는 사용하지 않으며 설정할 것도 없습니다. 산정 방식 전체는 [cost-methodology.md](cost-methodology.md).
+
+### 10.1 단가 동기화 (매일)
+
+| 항목 | 내용 |
+|---|---|
+| 스케줄 | Cloud Scheduler `$SVC-pricing-sync` → `POST /v1/internal/pricing/sync` (OIDC, 기본 매일 03:00 워크스페이스 TZ, `PRICING_SYNC_SCHEDULE`/`pricing_sync_schedule`) |
+| 결과 | GCS `pricing.json`: 모델 키별 `input/output/cached/cache_write`, `tiers`(long_context·flex·priority·batch), `skus`(SKU 리소스 이름), 환율 `fx` |
+| 확인 | `GET /v1/pricing` → `pricing_source.catalog_synced_at`, `official_sku_models`; 특정 모델 `?model=<model-id>` |
+| 수동 실행 | `curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/internal/pricing/sync"` → `services_scanned`, `models_synced`, `models_with_tiers`, `families_learned`, `currencies_synced` |
+| 실패 시 | 이전 동기화 값을 계속 사용(6시간 캐시). VPC egress 환경에서 비 USD 통화의 공개 환율 조회가 실패하면 Cloud NAT 확인(`network.nat`) |
+
+```bash
+gcloud scheduler jobs run $SVC-pricing-sync --location $REGION --project $HUB       # 즉시 실행
+curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/pricing" | jq '.pricing_source, (.data | length)'
+```
+
+계약 단가가 있으면 `config.local.yaml`의 `pricing.model_overrides`(1M 토큰당, 캡 통화)로 넣고 재배포합니다. 응답의 `cost_basis`가 `override`로 바뀝니다.
+
+### 10.2 Vertex AI 추론 요청 로그 켜기·확인
+
+```bash
+# 상태 (모든 관리 프로젝트)
+for P in team-a team-b; do
+  curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/projects/$P/vertex-logging" | jq -c '{project, enabled, state, error}'
+done
+# 일괄 활성화: 먼저 dryRun(기본 true) → 실제 적용
+curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"projects":["*"]}' "$API/v1/vertex-logging/enable" | jq '.data[] | {project, action}'
+curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"projects":["*"],"dryRun":false}' "$API/v1/vertex-logging/enable"
+```
+
+* API로 활성화하려면 런타임 SA에 각 프로젝트의 `aiplatform.endpoints.setPublisherModelConfig`가 필요합니다(기본 부여 안 됨, 기본은 조회용 `gcpAiCapsVertexLoggingReader`만). 권한이 없으면 `action: failed, error: denied` → `prepare.sh` 재실행 또는 readiness가 제시하는 curl을 관리자 권한으로 실행하세요.
+* 한 번에 최대 `quotas.max_projects_per_call`(기본 50)개, 초과분은 `skipped_over_limit`.
+* 활성화 후 몇 분 뒤부터 로그가 생성되며, 과거 요청은 소급되지 않습니다.
+
+### 10.3 `telemetry.attribution` 읽기 · 귀속 불가 사용량 처리
+
+| 키 | 의미 | 기대 |
+|---|---|---|
+| `log_identity` | 로그 자체에 사람이 기록된 요청 (Antigravity, 감사 로그, GE) | 대부분 |
+| `header_label` | 포털 헤더 `x-goog-agent-platform-observability-label-user`로 정확 귀속된 Vertex AI 요청 | Vertex AI의 대부분 |
+| `audit_correlated` | 헤더가 없어 같은 분(±1)의 Data Access 감사 호출자에게 비례 배분 | 적을수록 좋음 |
+| `unattributed` | 귀속 불가 → 프로젝트 `unattributed`로 보존 | 0에 가깝게 |
+
+처리 절차:
+
+1. **어디서 생기나**: `telemetry.unattributed_projects`, `GET /v1/usage/models?group_by=project`의 `unattributed_requests/tokens`, `GET /v1/billing/users?month=YYYY-MM`의 `unattributed[]`(`reasons`: `service_account` — 서비스 계정 호출, `no_user_identity` — 주체 정보 없음).
+2. **포털 호출이면**: Vertex AI 호출 코드에 헤더를 추가합니다(README §4 예시). 값은 이메일을 권장합니다(uid는 이 API가 이미 아는 사용자만 해석). 헤더 이름 접미사를 바꿨다면 `VERTEX_USER_HEADER_LABEL`과 일치시켜야 합니다.
+3. **감사 로그 상관을 쓰려면**: `logging.audit_config.aiplatform`이 `pass`인지 확인(`prepare.sh --enable-data-access-logs`). 같은 프로젝트·모델·분에 사람 호출자가 있어야 배분됩니다.
+4. **배치·파이프라인(서비스 계정)**: 사람에게 귀속할 수 없는 정상 사용입니다. 차지백에서는 프로젝트 비용으로 처리하고, 사용자 캡에는 포함되지 않음을 이해관계자에게 알립니다.
+5. **보고**: 프로젝트 합계 = 사용자 합계 + `unattributed`. 고객 보고서에는 두 값을 분리해 표기하세요.
+
+### 10.4 신규 모델 추적
+
+* `model.first_seen` 웹훅을 포털에 등록해 새 모델 사용을 당일 검토합니다(사용자 규칙·프로젝트 정책 반영 여부).
+* `GET /v1/models?source=observed` — Model Garden에 없지만 사용된 모델(프리뷰·파트너·튜닝 모델 등). publisher가 비어 있으면 정책 지정 시 `publisher/model-id`를 사용하세요.
+* `GET /v1/usage/models` 행의 `cost_basis: unpriced`이면 SKU가 아직 게시되지 않은 모델입니다 — 다음 단가 동기화에서 자동 반영되며, 급하면 `pricing.model_overrides`.
+* `model.catalog_changed`의 `delisted`는 Model Garden에서 사라진 모델입니다(카탈로그에는 `lifecycle.delisted_at`과 함께 유지, 패턴 확장에서는 제외).
+
 관련 문서: [preflight-checklist.md](preflight-checklist.md) · [multi-project-deployment.md](multi-project-deployment.md) ·
-[security.md](security.md) · [webhooks.md](webhooks.md) · [enforcement-logic.md](enforcement-logic.md)
+[security.md](security.md) · [webhooks.md](webhooks.md) · [enforcement-logic.md](enforcement-logic.md) · [cost-methodology.md](cost-methodology.md)

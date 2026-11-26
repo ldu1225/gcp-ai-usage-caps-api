@@ -86,6 +86,21 @@ init_defaults() {
   KEEP_LOG_SINKS=0
   DRY_RUN=0
   PREFLIGHT_LANG="${CAPS_API_LANG:-ko}"
+  # v1.2: Vertex AI inference request metadata logging (token source of Vertex AI usage), enabled by prepare.sh on
+  # every project unless ENABLE_VERTEX_INFERENCE_LOGGING=false / --no-vertex-inference-logging.
+  ENABLE_VERTEX_INFERENCE_LOGGING="${ENABLE_VERTEX_INFERENCE_LOGGING:-true}"
+  VERTEX_LOGGING_ENDPOINT="${VERTEX_LOGGING_ENDPOINT:-https://aiplatform.googleapis.com/v1beta1}"
+  # Optional runtime settings passed to Cloud Run only when set (environment or flags).
+  ENFORCEMENT_BACKEND="${ENFORCEMENT_BACKEND:-iam_deny}"
+  CAP_SCOPE="${CAP_SCOPE:-}"
+  VERTEX_USER_HEADER_LABEL="${VERTEX_USER_HEADER_LABEL:-}"
+  METERED_SURFACES="${METERED_SURFACES:-}"
+  MODEL_VIOLATION_BLOCK_SCOPE="${MODEL_VIOLATION_BLOCK_SCOPE:-}"
+  MODEL_PUBLISHERS="${MODEL_PUBLISHERS:-}"
+  LONG_CONTEXT_THRESHOLD_TOKENS="${LONG_CONTEXT_THRESHOLD_TOKENS:-}"
+  PROVISIONED_THROUGHPUT_COST="${PROVISIONED_THROUGHPUT_COST:-}"
+  PRICING_SYNC_SCHEDULE="${PRICING_SYNC_SCHEDULE:-17 3 * * *}"
+  PRICING_SYNC_TIME_ZONE="${PRICING_SYNC_TIME_ZONE:-Etc/UTC}"
 }
 
 COMMON_FLAGS_HELP='Common options (accepted by prepare.sh, deploy.sh, install.sh, teardown.sh):
@@ -113,6 +128,11 @@ COMMON_FLAGS_HELP='Common options (accepted by prepare.sh, deploy.sh, install.sh
   --worker-pool projects/P/locations/R/workerPools/W   --image IMAGE (prebuilt, skip build)
   --quota-contact-email EMAIL   Contact for quota increase requests
   --model-violation-action ACT  Default block_service
+  --no-vertex-inference-logging Do not enable Vertex AI inference request metadata logging (default: enabled on
+                                every project; env ENABLE_VERTEX_INFERENCE_LOGGING=false)
+  --enforcement-backend iam_deny|notify_only   (env ENFORCEMENT_BACKEND, default iam_deny)
+  --cap-scope total|per_project --metered-surfaces A,B --vertex-user-header-label L
+  --model-violation-block-scope project|all    Optional runtime settings (also read from the same-named env vars)
   --skip-preflight              Do not run the readiness preflight
   --skip-preflight-blockers     Continue even when preflight reports blockers
   --dry-run                     Print commands without changing anything
@@ -152,6 +172,13 @@ parse_common_args() {
       --image) need_value "$@"; PREBUILT_IMAGE="$2"; shift 2 ;;
       --quota-contact-email) need_value "$@"; QUOTA_CONTACT_EMAIL="$2"; shift 2 ;;
       --model-violation-action) need_value "$@"; MODEL_VIOLATION_ACTION="$2"; shift 2 ;;
+      --enable-vertex-inference-logging) ENABLE_VERTEX_INFERENCE_LOGGING="true"; shift ;;
+      --no-vertex-inference-logging) ENABLE_VERTEX_INFERENCE_LOGGING="false"; shift ;;
+      --enforcement-backend) need_value "$@"; ENFORCEMENT_BACKEND="$2"; shift 2 ;;
+      --cap-scope) need_value "$@"; CAP_SCOPE="$2"; shift 2 ;;
+      --metered-surfaces) need_value "$@"; METERED_SURFACES="$2"; shift 2 ;;
+      --vertex-user-header-label) need_value "$@"; VERTEX_USER_HEADER_LABEL="$2"; shift 2 ;;
+      --model-violation-block-scope) need_value "$@"; MODEL_VIOLATION_BLOCK_SCOPE="$2"; shift 2 ;;
       --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
       --skip-preflight-blockers) SKIP_PREFLIGHT_BLOCKERS=1; shift ;;
       --keep-log-sinks) KEEP_LOG_SINKS=1; shift ;;
@@ -181,6 +208,18 @@ finalize_args() {
   case "$DENY_ATTACHMENT" in projects|scope) ;; *) die "--deny-attachment must be projects or scope" ;; esac
   case "$MODE" in manual|auto) ;; *) die "--mode must be manual or auto" ;; esac
   case "$VPC_EGRESS" in ""|all-traffic|private-ranges-only) ;; *) die "--vpc-egress must be all-traffic or private-ranges-only" ;; esac
+  case "$ENFORCEMENT_BACKEND" in iam_deny|notify_only) ;; *) die "--enforcement-backend / ENFORCEMENT_BACKEND must be iam_deny or notify_only" ;; esac
+  case "$ENABLE_VERTEX_INFERENCE_LOGGING" in true|false|1|0) ;; *) die "ENABLE_VERTEX_INFERENCE_LOGGING must be true or false" ;; esac
+  [[ "$ENABLE_VERTEX_INFERENCE_LOGGING" == "1" ]] && ENABLE_VERTEX_INFERENCE_LOGGING="true"
+  [[ "$ENABLE_VERTEX_INFERENCE_LOGGING" == "0" ]] && ENABLE_VERTEX_INFERENCE_LOGGING="false"
+  case "$CAP_SCOPE" in ""|total|per_project) ;; *) die "--cap-scope / CAP_SCOPE must be total or per_project" ;; esac
+  case "$MODEL_VIOLATION_BLOCK_SCOPE" in ""|project|all) ;; *) die "--model-violation-block-scope must be project or all" ;; esac
+  case "$PROVISIONED_THROUGHPUT_COST" in ""|on_demand|zero) ;; *) die "PROVISIONED_THROUGHPUT_COST must be on_demand or zero" ;; esac
+  [[ -z "$METERED_SURFACES" || "$METERED_SURFACES" =~ ^[a-z_,[:space:]]+$ ]] || die "invalid --metered-surfaces"
+  [[ -z "$MODEL_PUBLISHERS" || "$MODEL_PUBLISHERS" =~ ^[a-z0-9,[:space:]-]+$ ]] || die "invalid MODEL_PUBLISHERS"
+  [[ -z "$VERTEX_USER_HEADER_LABEL" || "$VERTEX_USER_HEADER_LABEL" =~ ^[A-Za-z0-9_-]{1,40}$ ]] || die "invalid --vertex-user-header-label"
+  [[ -z "$LONG_CONTEXT_THRESHOLD_TOKENS" || "$LONG_CONTEXT_THRESHOLD_TOKENS" =~ ^[0-9]{1,9}$ ]] || die "LONG_CONTEXT_THRESHOLD_TOKENS must be an integer"
+  [[ "$VERTEX_LOGGING_ENDPOINT" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/v1beta1$ ]] || die "VERTEX_LOGGING_ENDPOINT must be https://HOST/v1beta1"
   if [[ -n "$VPC_NETWORK" && -z "$VPC_SUBNET" ]] || [[ -z "$VPC_NETWORK" && -n "$VPC_SUBNET" ]]; then
     die "--vpc-network and --vpc-subnet go together"
   fi
@@ -379,8 +418,8 @@ detect_org_id() {
 # ---------------------------------------------------------------------------
 # BigQuery & Log Router
 # ---------------------------------------------------------------------------
-AI_LOG_FILTER='log_id("businessaicode.googleapis.com/inference_response") OR (log_id("cloudaudit.googleapis.com/data_access") AND protoPayload.serviceName="aiplatform.googleapis.com") OR log_id("discoveryengine.googleapis.com/gemini_enterprise_user_activity") OR log_id("discoveryengine.googleapis.com/gen_ai_user_message")'
-REALTIME_FILTER='log_id("businessaicode.googleapis.com/inference_response")'
+AI_LOG_FILTER='log_id("businessaicode.googleapis.com/inference_response") OR log_id("aiplatform.googleapis.com/inference_request") OR (log_id("cloudaudit.googleapis.com/data_access") AND protoPayload.serviceName="aiplatform.googleapis.com") OR log_id("discoveryengine.googleapis.com/gemini_enterprise_user_activity") OR log_id("discoveryengine.googleapis.com/gen_ai_user_message")'
+REALTIME_FILTER='log_id("businessaicode.googleapis.com/inference_response") OR log_id("aiplatform.googleapis.com/inference_request")'
 
 ensure_dataset() {  # ensure_dataset PROJECT DATASET LOCATION
   local project="$1" dataset="$2" location="$3"
@@ -474,7 +513,8 @@ ensure_aggregated_bq_sink() {
   fi
 }
 
-# ensure_pubsub_sink SOURCE_PROJECT: routes Antigravity inference logs to the ONE hub topic.
+# ensure_pubsub_sink SOURCE_PROJECT: routes Antigravity inference_response and Vertex AI inference_request logs to the
+# ONE hub topic (an existing sink is updated to the current filter).
 ensure_pubsub_sink() {
   local src="$1" dest writer
   dest="pubsub.googleapis.com/projects/${HUB}/topics/${TOPIC}"
@@ -543,4 +583,96 @@ PYAUDIT
     sleep $((attempt * 2))
   done
   warn "could not update Data Access audit logs on ${project} (concurrent IAM change or permission)"
+}
+
+# ---------------------------------------------------------------------------
+# Vertex AI inference request metadata logging (aiplatform.googleapis.com/inference_request)
+# ---------------------------------------------------------------------------
+# There is no gcloud command and no Terraform resource (hashicorp/terraform-provider-google#30642) for this setting:
+# it is the v1beta1 project-level PublisherModelConfig, written with setPublisherModelConfig and read with
+# fetchPublisherModelConfig. Identical writes return 409 ALREADY_EXISTS (= already enabled).
+VERTEX_LOGGING_BODY='{"publisherModelConfig":{"inferenceEventLoggingConfig":{"state":"ENABLED"}}}'
+VERTEX_READER_ROLE_ID="gcpAiCapsVertexLoggingReader"
+VERTEX_READER_PERMISSION="aiplatform.endpoints.fetchPublisherModelConfig"
+
+vertex_logging_cost_note() {
+  info "Cost note: every Vertex AI request then writes ONE small metadata entry (model, token counts, latency; no"
+  info "prompts/responses) to Cloud Logging in the project that served it. Cloud Logging ingestion/storage pricing"
+  info "applies (_Default bucket, 30-day retention) plus the copy routed to BigQuery by ${AI_SINK:-the AI log sink}."
+  info "Disable with --no-vertex-inference-logging (Vertex AI token usage is then not measured)."
+}
+
+# _csv_has LIST ITEM -> 0 when ITEM is in the comma-separated LIST
+_csv_has() { [[ ",${1}," == *",${2},"* ]]; }
+
+# enable_vertex_inference_logging PROJECT: fetch -> skip when ENABLED -> setPublisherModelConfig (409 tolerated).
+# Never aborts the installer: permission, VPC-SC or disabled-API errors only warn (with the copy-paste command).
+enable_vertex_inference_logging() {
+  local project="$1" fetch_url set_url token out code
+  fetch_url="${VERTEX_LOGGING_ENDPOINT}/projects/${project}:fetchPublisherModelConfig"
+  set_url="${VERTEX_LOGGING_ENDPOINT}/projects/${project}:setPublisherModelConfig"
+  local manual="curl -sS -X POST -H \"Authorization: Bearer \$(gcloud auth print-access-token)\" -H \"Content-Type: application/json\" \"${set_url}\" -d '${VERTEX_LOGGING_BODY}'"
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    echo "[dry-run] curl -sS -X GET -H \"Authorization: Bearer \$(gcloud auth print-access-token)\" \"${fetch_url}\"  # skip when inferenceEventLoggingConfig.state=ENABLED"
+    echo "[dry-run] ${manual}  # setPublisherModelConfig (409 = already enabled)"
+    return 0
+  fi
+  command -v curl >/dev/null || { warn "curl not found; enable Vertex AI inference logging on ${project} manually: ${manual}"; return 0; }
+  token="$(gcloud auth print-access-token 2>/dev/null || true)"
+  [[ -n "$token" ]] || { warn "no access token (gcloud auth print-access-token); enable on ${project} manually: ${manual}"; return 0; }
+  out="$(mktemp)"
+  code="$(curl -sS -o "$out" -w '%{http_code}' --max-time 30 -H "Authorization: Bearer ${token}" "$fetch_url" 2>/dev/null || echo 000)"
+  if [[ "$code" == "200" ]] && grep -Eq '"state"[[:space:]]*:[[:space:]]*"ENABLED"' "$out"; then
+    rm -f "$out"
+    info "${project}: Vertex AI inference request metadata logging already ENABLED"
+    return 0
+  fi
+  code="$(curl -sS -o "$out" -w '%{http_code}' --max-time 60 -X POST -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" "$set_url" -d "$VERTEX_LOGGING_BODY" 2>/dev/null || echo 000)"
+  case "$code" in
+    2??) info "${project}: Vertex AI inference request metadata logging ENABLED (effective within a few minutes)" ;;
+    409) info "${project}: Vertex AI inference request metadata logging already ENABLED (409)" ;;
+    *)
+      if grep -Eq 'SERVICE_DISABLED|has not been used|it is disabled' "$out" 2>/dev/null; then
+        warn "${project}: aiplatform.googleapis.com is disabled (Vertex AI unused there); inference logging not enabled"
+      elif grep -Eq 'VPC Service Controls|SECURITY_POLICY_VIOLATED' "$out" 2>/dev/null; then
+        warn "${project}: blocked by VPC Service Controls (aiplatform.googleapis.com); add an ingress rule for this caller, then: ${manual}"
+      elif [[ "$code" == "403" ]]; then
+        warn "${project}: permission denied (needs aiplatform.endpoints.setPublisherModelConfig, e.g. roles/aiplatform.admin); run: ${manual}"
+      else
+        warn "${project}: could not enable Vertex AI inference logging (HTTP ${code}); run: ${manual}"
+      fi ;;
+  esac
+  rm -f "$out"
+  return 0
+}
+
+# ensure_vertex_reader_role PROJECT MEMBER: one-permission custom role (fetchPublisherModelConfig) bound to MEMBER so
+# the runtime can report the logging state. No read-only predefined role is documented to contain this permission.
+ensure_vertex_reader_role() {
+  local project="$1" member="$2"
+  if ! probe gcloud iam roles describe "$VERTEX_READER_ROLE_ID" --project="$project"; then
+    run_quiet gcloud iam roles create "$VERTEX_READER_ROLE_ID" --project="$project" \
+      --title="GCP AI Caps Vertex logging reader" \
+      --description="Read Vertex AI inference request logging state (GCP AI Usage Caps API)" \
+      --permissions="$VERTEX_READER_PERMISSION" --stage=GA --quiet \
+      || run_quiet gcloud iam roles undelete "$VERTEX_READER_ROLE_ID" --project="$project" --quiet \
+      || { warn "could not create custom role ${VERTEX_READER_ROLE_ID} on ${project} (needs iam.roles.create); the vertex logging status shows as unreadable"; return 0; }
+  fi
+  grant_project_role "$project" "$member" "projects/${project}/roles/${VERTEX_READER_ROLE_ID}"
+}
+
+# ensure_vertex_reader_org_role ORG: organization-level variant for folder/organization scope grants; sets
+# VERTEX_READER_ORG_ROLE (empty when the role cannot be created).
+ensure_vertex_reader_org_role() {
+  local org="$1"
+  VERTEX_READER_ORG_ROLE=""
+  if ! probe gcloud iam roles describe "$VERTEX_READER_ROLE_ID" --organization="$org"; then
+    run_quiet gcloud iam roles create "$VERTEX_READER_ROLE_ID" --organization="$org" \
+      --title="GCP AI Caps Vertex logging reader" \
+      --description="Read Vertex AI inference request logging state (GCP AI Usage Caps API)" \
+      --permissions="$VERTEX_READER_PERMISSION" --stage=GA --quiet \
+      || { warn "could not create organization custom role ${VERTEX_READER_ROLE_ID} on ${org} (needs roles/iam.organizationRoleAdmin)"; return 0; }
+  fi
+  VERTEX_READER_ORG_ROLE="organizations/${org}/roles/${VERTEX_READER_ROLE_ID}"
 }

@@ -12,29 +12,31 @@ from usage_caps_api.services import base as svc_base, chargeback, models_catalog
 
 class PricingAndChargebackTests(unittest.TestCase):
     def test_sku_parsing_and_model_normalization(self):
-        hit = pricing.token_sku("Gemini 2.5 Pro Input Token Count", "Vertex AI", "count", "1000000 tokens")
-        self.assertEqual(hit, ("gemini-2.5-pro", "input", None))
+        # Model names are learned from the live catalog / logs (no built-in list); fictional ids are used here.
+        mc.learn_models(["gemini-test-pro"])
+        hit = pricing.token_sku("Gemini Test Pro Input Token Count", "Vertex AI", "count", "1000000 tokens")
+        self.assertEqual(hit, ("gemini-test-pro", "input", None))
 
-        hit_cached = pricing.cached_token_sku("Gemini 2.5 Pro Cached Input Token Count", "Vertex AI", "count")
-        self.assertEqual(hit_cached, ("gemini-2.5-pro", "cached", None))
+        hit_cached = pricing.cached_token_sku("Gemini Test Pro Cached Input Token Count", "Vertex AI", "count")
+        self.assertEqual(hit_cached, ("gemini-test-pro", "cached", None))
 
         # Batch and non-token media models excluded from standard online token pricing
-        self.assertIsNone(pricing.token_sku("Gemini 2.5 Pro Batch Input Token Count", "Vertex AI", "count"))
+        self.assertIsNone(pricing.token_sku("Gemini Test Pro Batch Input Token Count", "Vertex AI", "count"))
         self.assertIsNone(pricing.token_sku("Veo 3 Video Generation", "Vertex AI", "s"))
-        self.assertEqual(mc.normalize_model_id("publishers/google/models/gemini-3.0-pro-preview"), "gemini-3-pro")
+        self.assertEqual(mc.normalize_model_id("publishers/google/models/gemini-next-pro-preview"), "gemini-next-pro")
 
     def test_estimate_cost_with_prompt_cache_and_thinking_tokens(self):
         p = pricing.Pricing(
             currency="USD",
             source="manual",
-            models=(("gemini-2.5-pro", 2.0, 10.0),),
-            cached_models=(("gemini-2.5-pro", 0.5),),
+            models=(("gemini-test-pro", 2.0, 10.0),),
+            cached_models=(("gemini-test-pro", 0.5),),
         )
         # 1M prompt (400k cached, 600k uncached), 1.5M total -> 500k output/thinking tokens
         # Expected: 0.6 * 2.0 + 0.4 * 0.5 + 0.5 * 10.0 = 1.2 + 0.2 + 5.0 = $6.40
         rec = {
             "by_model": {
-                "gemini-2.5-pro": {
+                "gemini-test-pro": {
                     "input_tokens": 1_000_000,
                     "cached_tokens": 400_000,
                     "output_tokens": 200_000,
@@ -52,16 +54,17 @@ class PricingAndChargebackTests(unittest.TestCase):
         self.assertEqual(parts, [34, 33, 33])
 
     def test_monthly_billing_report_user_project_rollup_invariant(self):
-        app, fake_gcp = build_test_app()
+        from tests.unit.support import make_test_config
+        app, fake_gcp = build_test_app(cfg=make_test_config(workspace={"projects": ["proj-a", "proj-b"]}))
         now = dt.datetime.now(dt.timezone.utc)
         month_str = now.strftime("%Y-%m")
         # Alice uses Gemini + Claude across two projects; Bob uses Gemini in one project
         fake_gcp.log_entries = [
-            make_inference_entry("alice@company.com", project="proj-a", model="gemini-2.5-pro",
+            make_inference_entry("alice@company.com", project="proj-a", model="gemini-test-pro",
                                  prompt=2_000_000, cand=500_000, ts=now),
-            make_inference_entry("alice@company.com", project="proj-b", model="claude-sonnet-4.5",
+            make_inference_entry("alice@company.com", project="proj-b", model="claude-test-sonnet",
                                  prompt=1_000_000, cand=400_000, ts=now),
-            make_inference_entry("bob@company.com", project="proj-a", model="gemini-2.5-pro",
+            make_inference_entry("bob@company.com", project="proj-a", model="gemini-test-pro",
                                  prompt=1_000_000, cand=100_000, ts=now),
         ]
         caller = auth.Caller("test", "test", "api_key", frozenset(["usage:read"]), "test")

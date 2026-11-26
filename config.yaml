@@ -22,10 +22,7 @@ workspace:
   discovery_engine_locations:
     - "global"
   billing:
-    project_id: ""
-    dataset: ""
-    table: ""
-    account_id: ""
+    account_id: ""                # only for project hard spend caps (Budget API); Billing Export is never used
 
 storage:
   backend: "auto"                 # auto | gcs | file | memory
@@ -48,6 +45,12 @@ auth:
 caps:
   usage_source: "auto"            # auto | bigquery | logging
   inference_log: "businessaicode.googleapis.com%2Finference_response"
+  vertex_inference_log: "aiplatform.googleapis.com%2Finference_request"   # Vertex AI token source (enable per project)
+  vertex_user_header_label: "user"  # portal sends x-goog-agent-platform-observability-label-user: <email|uid>
+  vertex_logging_endpoint: "https://aiplatform.googleapis.com/v1beta1"
+  cap_scope: "total"              # total (one cap across all projects) | per_project (cap applies in each project)
+  project_defaults: {}            # {project_id: {cost_cap, token_cap, request_cap}} per-user cap inside one project
+  metered_surfaces: ["antigravity", "vertex_ai", "gemini_enterprise"]
   audit_log_name: "gcp-ai-usage-caps-audit"
   max_log_entries: 20000
   enforcement_mode: "manual"      # manual | auto
@@ -103,6 +106,8 @@ pricing:
     - "duet ai"
   fx_sources:
     - "https://open.er-api.com/v6/latest/USD"
+  long_context_threshold_tokens: 200000   # prompts above this use the long-context SKU tier (align with the threshold shown in GET /v1/pricing)
+  provisioned_throughput_cost: "on_demand" # on_demand (price PT tokens at on-demand SKU) | zero (prepaid commitment)
 
 # Central (hub) deployment facts — filled by scripts/deploy.sh via environment variables.
 hub:
@@ -121,10 +126,13 @@ models:
   violation_action: "block_service"   # block_service (default: block first, always notify) | notify
   violation_block_minutes: 0          # 0 = model violations stay blocked until POST /v1/users/{email}/unblock
   violation_notify: true
+  violation_block_scope: "project"    # project (block only where the violation happened) | all (every managed project)
   policy_scopes: ["projects"]         # projects | folders | organizations (writes need org-level roles/orgpolicy.policyAdmin)
   allow_org_policy_writes: true
   default_actions: ["predict"]        # predict | deploy | tune
   always_allow: ["publishers/anthropic/models/count-tokens"]
+  # Model Garden publishers (vendors) to scan - NOT a model list. Models are discovered live and every model /
+  # publisher seen in usage logs is added automatically (GET /v1/models?source=observed).
   publishers: ["google", "anthropic", "meta", "mistralai", "ai21", "deepseek-ai", "qwen", "openai"]
   catalog_ttl_seconds: 3600
   max_policy_values: 500

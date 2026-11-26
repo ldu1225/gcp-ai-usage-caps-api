@@ -1,4 +1,13 @@
-"""Spend cap policy, per-user cap status, safety gates (G1-G7), auto/manual enforcement, and Block/Unblock."""
+"""Spend cap policy, per-user cap status, safety gates (G1-G7), auto/manual enforcement, and Block/Unblock.
+
+Multi-project model (one hub governs every managed project):
+- Usage is always measured per (user, project) from logs; a user may use several projects.
+- `cap_scope` (policy or per-user rule): `total` = one cap across all projects (default), `per_project` = the cap
+  applies separately in each project. Explicit per-project caps (`project_caps` on a user rule, `project_defaults`
+  on the policy) are evaluated in addition to the total cap.
+- Blocks / suspensions apply to all managed projects (default) or only to `projects: [...]`; an over-cap in one
+  project only suspends that project. Enforcement is IAM Deny v2 per attachment point (services/enforcers.py).
+"""
 
 from __future__ import annotations
 
@@ -71,6 +80,59 @@ def _opt_nonneg_int(val, field: str, hi: int = 10 ** 12) -> int | None:
     return int(val)
 
 
+CAP_SCOPES = ("total", "per_project")
+MAX_PROJECT_CAPS = 500
+
+
+def _validate_projects(ctx, raw, field: str = "projects") -> list[str] | None:
+    """None (= all managed projects) or a de-duplicated list of managed project IDs."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or len(raw) > MAX_PROJECT_CAPS:
+        raise ApiError("bad_request", "Field '%s' must be a list of project IDs (max %d)." % (field, MAX_PROJECT_CAPS))
+    managed = set(ctx.all_projects)
+    out = []
+    for item in raw:
+        pid = str(item or "").strip().lower()
+        if not config.valid_project(pid):
+            raise ApiError("bad_request", "Invalid project id '%s' in '%s'." % (pid, field))
+        if pid not in managed:
+            raise ApiError("bad_request", "Project '%s' is not a managed project of this hub." % pid)
+        if pid not in out:
+            out.append(pid)
+    if not out:
+        raise ApiError("bad_request", "Field '%s' must not be empty (omit it to target every managed project)." % field)
+    return out
+
+
+def _validate_project_caps(ctx, raw, field: str) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or len(raw) > MAX_PROJECT_CAPS:
+        raise ApiError("bad_request", "Field '%s' must be an object {project_id: {cost_cap, token_cap, request_cap}}." % field)
+    managed = set(ctx.all_projects)
+    out = {}
+    for pid, lim in raw.items():
+        pid = str(pid or "").strip().lower()
+        if not config.valid_project(pid) or pid not in managed:
+            raise ApiError("bad_request", "Project '%s' in '%s' is not a managed project of this hub." % (pid, field))
+        if lim is None:
+            continue
+        if not isinstance(lim, dict):
+            raise ApiError("bad_request", "Each entry of '%s' must be an object." % field)
+        c = _opt_nonneg_float(lim.get("cost_cap"), "%s.%s.cost_cap" % (field, pid))
+        t = _opt_nonneg_int(lim.get("token_cap"), "%s.%s.token_cap" % (field, pid))
+        r = _opt_nonneg_int(lim.get("request_cap"), "%s.%s.request_cap" % (field, pid), hi=10 ** 9)
+        if c is None and t is None and r is None:
+            raise ApiError("bad_request", "%s.%s needs at least one of cost_cap, token_cap, request_cap." % (field, pid))
+        out[pid] = {"cost_cap": c, "token_cap": t, "request_cap": r}
+    return out
+
+
+def _applies(projects: list[str] | None, project: str) -> bool:
+    return projects is None or project in projects
+
+
 def _period_info(ctx, policy: dict, now: dt.datetime | None = None) -> dict:
     tz = policy.get("reset_timezone") or ctx.tz_name
     return timeutil.period_window(
@@ -114,6 +176,9 @@ def public_policy_view(ctx, policy: dict, now: dt.datetime | None = None) -> dic
         "change_budget_ratio": float(policy.get("change_budget_ratio") or 0.2),
         "surge_guard_min": int(policy.get("surge_guard_min") or 10),
         "surge_guard_ratio": float(policy.get("surge_guard_ratio") or 0.5),
+        "cap_scope": policy.get("cap_scope") or "total",
+        "project_defaults": dict(policy.get("project_defaults") or {}),
+        "metered_surfaces": list(policy.get("metered_surfaces") or config.VALID_SERVICES),
         "current_window": {
             "start": win["start_iso"],
             "end": win["period_end_iso"],
@@ -210,6 +275,14 @@ def update_policy(ctx) -> dict:
     if "surge_guard_ratio" in body:
         sgr = _opt_nonneg_float(body["surge_guard_ratio"], "surge_guard_ratio", hi=1.0)
         updates["surge_guard_ratio"] = sgr
+    if "cap_scope" in body:
+        if body["cap_scope"] not in CAP_SCOPES:
+            raise ApiError("bad_request", "Field 'cap_scope' must be 'total' or 'per_project'.")
+        updates["cap_scope"] = body["cap_scope"]
+    if "project_defaults" in body:
+        updates["project_defaults"] = _validate_project_caps(ctx, body["project_defaults"], "project_defaults")
+    if "metered_surfaces" in body:
+        updates["metered_surfaces"] = _validate_services(body["metered_surfaces"])
 
     def save(doc):
         pol = dict(doc.get("policy") or {})
@@ -306,29 +379,46 @@ def evaluate_gates_and_plan(users: list[dict], *, deny_readable: bool, telemetry
     })
 
     suspend_list, block_list, restore_list, review_list = [], [], [], []
+    suspend_projects: dict[str, list[str]] = {}
     withheld_restores = False
     for u in users:
         email = u["email"]
         rule = u.get("rule")
         mblock = u.get("manual_block")
         rtype = (rule or {}).get("type")
-        currently_denied = bool(u.get("blocked_services"))
+        denied_all = bool(u.get("blocked_services"))
+        denied_projects = set((u.get("blocked_projects") or {}).keys())
+        currently_denied = denied_all or bool(denied_projects)
         over = u.get("over_cap")
+        over_scope = u.get("over_scope", "all" if over is True else None)
         susp = u.get("suspension")
 
         if mblock or rtype == "block":
-            src_block = mblock or rule or {}
-            desired_svcs = set(src_block.get("services") or policy.get("default_block_services") or config.VALID_SERVICES)
-            if set(u.get("blocked_services") or ()) != desired_svcs:
+            if "block_in_sync" in u:
+                in_sync = bool(u["block_in_sync"])
+            else:
+                src_block = mblock or rule or {}
+                desired_svcs = set(src_block.get("services") or policy.get("default_block_services") or config.VALID_SERVICES)
+                in_sync = set(u.get("blocked_services") or ()) == desired_svcs
+            if not in_sync:
                 block_list.append(email)
             continue
         if rtype == "allow":
             if currently_denied:
                 restore_list.append(email)
             continue
-        if not currently_denied and over is True:
+        missing: list[str] | None = None
+        if over is True and over_scope == "all" and not denied_all:
+            missing = []
+        elif over is True and isinstance(over_scope, list) and not denied_all:
+            missing = [p for p in over_scope if p not in denied_projects]
+            if not missing:
+                missing = None
+        if missing is not None:
             if mode == "auto":
                 suspend_list.append(email)
+                if missing:
+                    suspend_projects[email] = missing
             else:
                 review_list.append(email)
         elif currently_denied and over is not True:
@@ -420,6 +510,7 @@ def evaluate_gates_and_plan(users: list[dict], *, deny_readable: bool, telemetry
     failed = [g for g in gates if g["status"] == "fail"]
     plan = {
         "suspend": suspend_list,
+        "suspend_projects": {em: ps for em, ps in suspend_projects.items() if em in suspend_list},
         "block": block_list,
         "restore": restore_list,
         "review": review_list,
@@ -448,17 +539,67 @@ def _load_user_caps_state(ctx) -> dict:
     }
 
 
+def _scoped_projects(state: dict) -> set[str]:
+    out: set[str] = set()
+    for section in ("blocks", "rules", "suspensions"):
+        for rec in (state.get(section) or {}).values():
+            if isinstance(rec, dict) and isinstance(rec.get("projects"), list):
+                out.update(p for p in rec["projects"] if config.valid_project(p))
+    return out
+
+
+def _limit_view(c_cap: float, t_cap: int, r_cap: int, currency: str) -> dict:
+    return {"cost_cap": c_cap if c_cap > 0 else None, "token_cap": t_cap if t_cap > 0 else None,
+            "request_cap": r_cap if r_cap > 0 else None, "currency": currency}
+
+
+def _usage_view(rec: dict, cost, partial, currency) -> dict:
+    return {
+        "requests": int(rec.get("requests") or 0),
+        "input_tokens": int(rec.get("input_tokens") or 0),
+        "output_tokens": int(rec.get("output_tokens") or 0),
+        "cached_tokens": int(rec.get("cached_tokens") or 0),
+        "total_tokens": int(rec.get("total_tokens") or 0),
+        "estimated_cost": cost,
+        "cost_partial": partial,
+        "currency": currency if cost is not None else None,
+        "last_active": iso(rec.get("last_active")),
+    }
+
+
+def _remaining(c_cap, t_cap, r_cap, rec, cost) -> dict:
+    return {
+        "cost": round(max(0.0, c_cap - cost), 6) if (c_cap > 0 and cost is not None) else None,
+        "tokens": max(0, t_cap - int(rec.get("total_tokens") or 0)) if t_cap > 0 else None,
+        "requests": max(0, r_cap - int(rec.get("requests") or 0)) if r_cap > 0 else None,
+    }
+
+
+def _block_in_sync(src: dict, def_svcs, blocked_global: set, blocked_projects: dict) -> bool:
+    desired = set(src.get("services") or def_svcs)
+    projects = src.get("projects")
+    if projects is None:
+        return blocked_global == desired
+    for p in projects:
+        have = set(blocked_projects.get(p) or ()) | blocked_global
+        if have != desired:
+            return False
+    return True
+
+
 def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = None,
                         deny_client: enforcers.DenyPolicyClient | None = None) -> tuple[dict, dict]:
-    """Computes full per-user cap status, safety gates, and enforcement plan."""
+    """Computes full per-user (and per-user-per-project) cap status, safety gates, and the enforcement plan."""
     now = now or utcnow()
     policy = effective_policy(ctx)
     win = _period_info(ctx, policy, now)
     state = _load_user_caps_state(ctx)
     backend = policy.get("enforcement_backend") or "iam_deny"
+    metered = list(policy.get("metered_surfaces") or config.VALID_SERVICES)
 
     tasks = {
-        "usage": lambda: usage_svc.antigravity_usage(ctx, win["start"], win["end"], fresh=fresh),
+        "usage": lambda: usage_svc.collect_usage(ctx.child(params={}), win["start"], win["end"], fresh=fresh,
+                                                 surfaces=metered),
         "pricing": lambda: pricing_svc.resolve_pricing(ctx, policy),
     }
     if backend == "iam_deny":
@@ -468,18 +609,24 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
     usage_res = res["usage"][1] if res["usage"][0] else usage_svc.UsageResult("unavailable")
     pricing = res["pricing"][1] if res["pricing"][0] else pricing_svc.Pricing(currency=policy.get("currency") or "USD")
     deny_state = res["deny"][1] if ("deny" in res and res["deny"][0]) else enforcers.DenyState([])
+    if backend == "iam_deny" and deny_state.attachments:
+        extra = [enforcers.project_attachment(p) for p in _scoped_projects(state)]
+        deny_state = enforcers.extend_state(ctx, deny_state, [ap for ap in extra if ap], client=deny_client)
 
     deny_by_person = deny_state.services_by_person if backend == "iam_deny" else {}
+    deny_projects = deny_state.projects_by_person() if backend == "iam_deny" else {}
     active_rules = {em: r for em, r in state["rules"].items() if isinstance(r, dict) and not _rule_expired(r, now)}
     active_blocks = {em: b for em, b in state["blocks"].items() if isinstance(b, dict) and not _rule_expired(b, now)}
     suspensions = state["suspensions"]
 
     all_people = sorted(set(usage_res.users.keys()) | set(active_rules.keys()) | set(active_blocks.keys()) |
-                        set(suspensions.keys()) | set(deny_by_person.keys()))
+                        set(suspensions.keys()) | set(deny_by_person.keys()) | set(deny_projects.keys()))
     def_cost = float(policy.get("cost_cap") or 0.0)
     def_tok = int(policy.get("token_cap") or 0)
     def_req = int(policy.get("request_cap") or 0)
     def_svcs = list(policy.get("default_block_services") or config.VALID_SERVICES)
+    proj_defaults = policy.get("project_defaults") or {}
+    currency = pricing.currency
 
     rows = []
     for email in all_people:
@@ -490,80 +637,154 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
         susp = suspensions.get(email)
         urec = usage_res.users.get(email) or {
             "requests": 0, "input_tokens": 0, "output_tokens": 0,
-            "cached_tokens": 0, "total_tokens": 0, "by_model": {}, "last_active": None,
+            "cached_tokens": 0, "total_tokens": 0, "by_model": {}, "by_project": {}, "last_active": None,
         }
         est_cost, cost_partial = pricing_svc.estimate_cost(urec, pricing) if usage_res.ok else (None, False)
-        if rule and rule.get("type") == "limit":
+        is_limit = bool(rule and rule.get("type") == "limit")
+        if is_limit:
             c_cap = float(rule["cost_cap"]) if rule.get("cost_cap") is not None else def_cost
             t_cap = int(rule["token_cap"]) if rule.get("token_cap") is not None else def_tok
             r_cap = int(rule["request_cap"]) if rule.get("request_cap") is not None else def_req
         else:
             c_cap, t_cap, r_cap = def_cost, def_tok, def_req
+        scope = ((rule or {}).get("scope") if is_limit else None) or policy.get("cap_scope") or "total"
+        user_pcaps = ((rule or {}).get("project_caps") or {}) if is_limit else {}
 
-        if usage_res.ok:
-            over, ratio_val, reasons = cap_check(urec["total_tokens"], urec["requests"], t_cap, r_cap, est_cost, c_cap)
+        if usage_res.ok and scope == "total":
+            over_t, ratio_t, reasons = cap_check(urec["total_tokens"], urec["requests"], t_cap, r_cap, est_cost, c_cap)
+        elif usage_res.ok:
+            over_t, ratio_t, reasons = False, None, []
         else:
-            over, ratio_val, reasons = None, None, []
+            over_t, ratio_t, reasons = None, None, []
 
+        blocked_global = set(deny_by_person.get(email) or ())
+        blocked_projects_raw = {p: set(v) for p, v in (deny_projects.get(email) or {}).items()}
+        blocked_projects = {p: sorted(v - blocked_global) for p, v in blocked_projects_raw.items() if v - blocked_global}
+
+        # Per-project evaluation (a user can be assigned to / use several managed projects).
+        proj_names = set((urec.get("by_project") or {}).keys()) | set(user_pcaps.keys()) | set(blocked_projects.keys())
+        for src in (mblock, rule if (rule or {}).get("type") == "block" else None, susp):
+            if isinstance(src, dict) and isinstance(src.get("projects"), list):
+                proj_names |= set(src["projects"])
+        proj_names.discard("unknown")
+        project_rows, over_projects, ratios = [], [], [ratio_t] if ratio_t is not None else []
+        for p in sorted(proj_names):
+            prec = (urec.get("by_project") or {}).get(p) or {"requests": 0, "total_tokens": 0, "by_model": {}}
+            p_cost, p_partial = pricing_svc.estimate_cost(prec, pricing) if usage_res.ok else (None, False)
+            lim_src = user_pcaps.get(p) or proj_defaults.get(p)
+            if lim_src:
+                pc = float(lim_src.get("cost_cap") or 0.0)
+                pt = int(lim_src.get("token_cap") or 0)
+                pr = int(lim_src.get("request_cap") or 0)
+                lim_origin = "user_project_cap" if p in user_pcaps else "project_default"
+            elif scope == "per_project":
+                pc, pt, pr, lim_origin = c_cap, t_cap, r_cap, "per_project_scope"
+            else:
+                pc = pt = pr = 0
+                lim_origin = None
+            if lim_origin and usage_res.ok:
+                p_over, p_ratio, p_reasons = cap_check(int(prec.get("total_tokens") or 0), int(prec.get("requests") or 0),
+                                                       pt, pr, p_cost, pc)
+            else:
+                p_over, p_ratio, p_reasons = (False if usage_res.ok else None), None, []
+            if p_over:
+                over_projects.append(p)
+            if p_ratio is not None:
+                ratios.append(p_ratio)
+            p_blocked = sorted(blocked_global | set(blocked_projects_raw.get(p) or ()))
+            p_block_rec = None
+            for src in (mblock, rule if (rule or {}).get("type") == "block" else None):
+                if isinstance(src, dict) and _applies(src.get("projects"), p):
+                    p_block_rec = src
+            p_susp = susp if (isinstance(susp, dict) and _applies(susp.get("projects"), p)
+                              and not _suspension_ended(susp, now)) else None
+            if p_block_rec is not None or (p_blocked and not p_susp and not (susp and _applies(susp.get("projects"), p))):
+                p_status = "blocked"
+            elif p_blocked or p_susp:
+                p_status = "suspended"
+            elif p_over:
+                p_status = "over_cap"
+            else:
+                p_status = "active"
+            project_rows.append({
+                "project": p,
+                "status": p_status,
+                "over_cap": p_over,
+                "over_cap_reasons": p_reasons,
+                "utilization_pct": round(p_ratio * 100.0, 2) if p_ratio is not None else None,
+                "limit": dict(_limit_view(pc, pt, pr, currency), source=lim_origin) if lim_origin else None,
+                "usage": _usage_view(prec, p_cost, p_partial, currency),
+                "remaining": _remaining(pc, pt, pr, prec, p_cost) if lim_origin else None,
+                "blocked_services": p_blocked,
+            })
+
+        if not usage_res.ok:
+            over = None
+        else:
+            over = bool(over_t) or bool(over_projects)
+        over_scope = "all" if over_t else (sorted(over_projects) if over_projects else None)
+        ratio_val = max(ratios) if ratios else None
         util_pct = round(ratio_val * 100.0, 2) if ratio_val is not None else None
-        blocked_svcs = sorted(deny_by_person.get(email) or ())
+        blocked_svcs = sorted(blocked_global)
         if backend == "notify_only" and (mblock or (rule and rule.get("type") == "block")):
-            blocked_svcs = sorted((mblock or rule).get("services") or def_svcs)
+            src_b = mblock or rule
+            if src_b.get("projects") is None:
+                blocked_svcs = sorted(src_b.get("services") or def_svcs)
+            else:
+                for p in src_b["projects"]:
+                    blocked_projects[p] = sorted(src_b.get("services") or def_svcs)
 
-        # Determine clean status: blocked | suspended | over_cap | active
-        if mblock or (rule and rule.get("type") == "block") or (blocked_svcs and not susp):
+        block_src = mblock or (rule if (rule and rule.get("type") == "block") else None)
+        global_block = bool(block_src and block_src.get("projects") is None)
+        susp_active = bool(susp and not _suspension_ended(susp, now))
+        susp_global = susp_active and susp.get("projects") is None
+        status_scope = "all"
+        if global_block or (blocked_svcs and not susp):
             status = "blocked"
-        elif blocked_svcs or (susp and not _suspension_ended(susp, now)):
+        elif blocked_svcs or susp_global:
             status = "suspended"
+        elif block_src is not None:
+            status, status_scope = "blocked", "projects"
+        elif blocked_projects or susp_active:
+            status, status_scope = "suspended", "projects"
         elif over is True and not (rule and rule.get("type") == "allow"):
-            status = "over_cap"
+            status, status_scope = "over_cap", ("all" if over_t else "projects")
         else:
-            status = "active"
+            status, status_scope = "active", None
 
-        rem_cost = round(max(0.0, c_cap - est_cost), 6) if (c_cap > 0 and est_cost is not None) else None
-        rem_tok = max(0, t_cap - urec["total_tokens"]) if t_cap > 0 else None
-        rem_req = max(0, r_cap - urec["requests"]) if r_cap > 0 else None
         restore_at = None
         if status == "suspended":
             restore_at = (susp or {}).get("until") or win["next_reset_iso"]
         elif status == "blocked":
-            restore_at = (mblock or {}).get("until") or (rule or {}).get("until")
+            restore_at = (block_src or {}).get("until")
 
         raw_block = state["blocks"].get(email) if isinstance(state["blocks"].get(email), dict) else None
         rows.append({
             "email": email,
             "uid": identity.uid_for(email),
             "status": status,
+            "status_scope": status_scope,
             "block_source": ((mblock or {}).get("source") or "manual") if mblock else
                             ("rule" if (rule and rule.get("type") == "block") else
                              ("auto_cap" if status == "suspended" else None)),
             "expired_block": bool(raw_block and _rule_expired(raw_block, now) and not mblock),
             "blocked_services": blocked_svcs,
+            "blocked_projects": blocked_projects,
+            "block_in_sync": (_block_in_sync(block_src, def_svcs, blocked_global, blocked_projects_raw)
+                              if (block_src and backend == "iam_deny") else True),
             "over_cap": over,
-            "over_cap_reasons": reasons,
+            "over_cap_reasons": reasons if over_t else sorted({r for pr_ in project_rows if pr_["over_cap"]
+                                                              for r in pr_["over_cap_reasons"]}),
+            "over_scope": over_scope,
             "utilization_pct": util_pct,
-            "limit": {
-                "cost_cap": c_cap if c_cap > 0 else None,
-                "token_cap": t_cap if t_cap > 0 else None,
-                "request_cap": r_cap if r_cap > 0 else None,
-                "currency": pricing.currency,
-            },
-            "usage": {
-                "requests": urec["requests"],
-                "input_tokens": urec["input_tokens"],
-                "output_tokens": urec["output_tokens"],
-                "cached_tokens": urec["cached_tokens"],
-                "total_tokens": urec["total_tokens"],
-                "estimated_cost": est_cost,
-                "cost_partial": cost_partial,
-                "currency": pricing.currency if est_cost is not None else None,
-                "last_active": iso(urec.get("last_active")),
-            },
-            "remaining": {
-                "cost": rem_cost,
-                "tokens": rem_tok,
-                "requests": rem_req,
-            },
+            "cap_scope": scope,
+            "limit": _limit_view(c_cap, t_cap, r_cap, currency) if scope == "total" else
+                     dict(_limit_view(c_cap, t_cap, r_cap, currency), applies="per_project"),
+            "usage": _usage_view(urec, est_cost, cost_partial, currency),
+            "remaining": _remaining(c_cap, t_cap, r_cap, urec, est_cost) if scope == "total" else
+                         {"cost": None, "tokens": None, "requests": None},
+            "projects": project_rows,
+            "multi_project": sum(1 for pr_ in project_rows if pr_["usage"]["requests"]) > 1,
             "restore_at": restore_at,
             "rule": rule,
             "manual_block": mblock,
@@ -572,7 +793,7 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
 
     deny_meta = {
         "attachments": [st.attachment for st in deny_state.attachments],
-        "current_principals": len(deny_state.principals),
+        "current_principals": deny_state.max_principals(),
         "unreadable": sum(1 for st in deny_state.attachments if st.error is not None),
         "foreign": sum(1 for st in deny_state.attachments if st.foreign),
     }
@@ -599,6 +820,7 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
         "gates": gates,
         "plan": plan,
         "last_run": state.get("last_run"),
+        "telemetry": usage_svc.usage_meta(usage_res),
     }
     internal = {
         "policy": policy,
@@ -620,11 +842,12 @@ def _public_user_cap(row: dict) -> dict:
     out.pop("suspension", None)
     out.pop("manual_block", None)
     out.pop("expired_block", None)
+    out.pop("block_in_sync", None)
     return out
 
 
 def list_user_caps(ctx) -> dict:
-    """GET /v1/caps/users?status=&email=&limit=&cursor="""
+    """GET /v1/caps/users?status=&email=&project=&multi_project=&limit=&cursor="""
     payload, _ = compute_caps_status(ctx)
     rows = [_public_user_cap(r) for r in payload["users"]]
     status_f = (ctx.params.get("status") or "").strip().lower()
@@ -635,6 +858,11 @@ def list_user_caps(ctx) -> dict:
     email_f = (ctx.params.get("email") or "").strip().lower()
     if email_f:
         rows = [r for r in rows if r["email"] == email_f]
+    project_f = (ctx.params.get("project") or "").strip().lower()
+    if project_f and project_f != "all":
+        rows = [r for r in rows if any(p["project"] == project_f for p in r.get("projects") or [])]
+    if str(ctx.params.get("multi_project") or "").lower() in ("1", "true"):
+        rows = [r for r in rows if r.get("multi_project")]
     page = paginate_list(rows, ctx.params, default_limit=100, max_limit=500)
     page["period"] = payload["period"]
     page["summary"] = {
@@ -657,8 +885,14 @@ def get_user_cap_snapshot(ctx, email: str) -> dict:
         "email": email,
         "uid": identity.uid_for(email),
         "status": "active",
+        "status_scope": None,
         "blocked_services": [],
+        "blocked_projects": {},
         "over_cap": False,
+        "over_scope": None,
+        "cap_scope": pol.get("cap_scope") or "total",
+        "projects": [],
+        "multi_project": False,
         "over_cap_reasons": [],
         "utilization_pct": 0.0,
         "limit": {
@@ -720,13 +954,19 @@ def put_user_cap(ctx) -> dict:
         c = _opt_nonneg_float(body.get("cost_cap"), "cost_cap")
         t = _opt_nonneg_int(body.get("token_cap"), "token_cap")
         r = _opt_nonneg_int(body.get("request_cap"), "request_cap", hi=10 ** 9)
-        if c is None and t is None and r is None:
-            raise ApiError("bad_request", "At least one of cost_cap, token_cap, or request_cap is required for type='limit'.")
-        rule.update(cost_cap=c, token_cap=t, request_cap=r)
+        scope = body.get("scope")
+        if scope is not None and scope not in CAP_SCOPES:
+            raise ApiError("bad_request", "Field 'scope' must be 'total' or 'per_project'.")
+        pcaps = _validate_project_caps(ctx, body.get("project_caps"), "project_caps")
+        if c is None and t is None and r is None and not pcaps:
+            raise ApiError("bad_request", "At least one of cost_cap, token_cap, request_cap or project_caps is "
+                                          "required for type='limit'.")
+        rule.update(cost_cap=c, token_cap=t, request_cap=r, scope=scope, project_caps=pcaps)
         if "services" in body:
             rule["services"] = _validate_services(body["services"])
     elif rtype == "block":
         rule["services"] = _validate_services(body.get("services"), default=policy.get("default_block_services"))
+        rule["projects"] = _validate_projects(ctx, body.get("projects"))
 
     def save(doc):
         rules = dict(doc.get("rules") or {})
@@ -763,45 +1003,77 @@ def delete_user_cap(ctx) -> dict:
 # Immediate User Block / Unblock: POST /v1/users/{email}/block & /unblock
 # ---------------------------------------------------------------------------
 
-def _desired_deny_map(ctx, policy: dict, state: dict, deny_state: enforcers.DenyState,
-                      usage_res: usage_svc.UsageResult | None = None,
-                      add_suspensions: list[str] = (), add_blocks: list[str] = (),
-                      restores: list[str] = ()) -> dict[str, frozenset[str]]:
-    """Computes desired {deny_principal_uri: frozenset(services)} for IAM Deny v2."""
+def _desired_by_attachment(ctx, policy: dict, state: dict, deny_state: enforcers.DenyState,
+                           usage_res: usage_svc.UsageResult | None = None,
+                           add_suspensions: list[str] = (), suspend_projects: dict | None = None,
+                           add_blocks: list[str] = (), restores: list[str] = (),
+                           restore_projects: dict | None = None) -> dict[str, dict[str, frozenset[str]]]:
+    """Computes desired {attachment_point: {deny_principal_uri: frozenset(services)}} for IAM Deny v2.
+
+    Global entries (projects=None) apply to every scope attachment point; project-scoped entries apply only to the
+    `projects/{id}` attachment point of the listed projects."""
     now = utcnow()
     def_svcs = frozenset(policy.get("default_block_services") or config.VALID_SERVICES)
     rules = {em: r for em, r in (state.get("rules") or {}).items() if isinstance(r, dict) and not _rule_expired(r, now)}
     blocks = {em: b for em, b in (state.get("blocks") or {}).items() if isinstance(b, dict) and not _rule_expired(b, now)}
     logged_principals = (usage_res.principals if usage_res is not None else {}) or {}
+    suspend_projects = suspend_projects or {}
+    restore_projects = restore_projects or {}
+    scope_aps = set(enforcers.attachment_points(ctx))
+    aps = [st.attachment for st in deny_state.attachments]
 
-    current_by_person: dict[str, set[str]] = {
-        em: set(svcs) for em, svcs in deny_state.services_by_person.items()
-    }
-    for em in restores:
-        current_by_person.pop(em, None)
-    for em in add_suspensions:
-        rule = rules.get(em) or {}
-        current_by_person[em] = set(rule.get("services") or def_svcs)
-    for em in add_blocks:
-        src = blocks.get(em) or rules.get(em) or {}
-        current_by_person[em] = set(src.get("services") or def_svcs)
-    for em, rule in rules.items():
-        if rule.get("type") == "block":
-            current_by_person[em] = set(rule.get("services") or def_svcs)
-        elif rule.get("type") == "allow" and em not in blocks:
-            current_by_person.pop(em, None)
-    for em, blk in blocks.items():
-        current_by_person[em] = set(blk.get("services") or def_svcs)
+    def applies(ap: str, projects) -> bool:
+        if projects is None:
+            return ap in scope_aps
+        pid = enforcers.attachment_project(ap)
+        return pid is not None and pid in projects
 
-    out: dict[str, frozenset[str]] = {}
-    for person, svcs in current_by_person.items():
-        if not svcs:
-            continue
-        raw = logged_principals.get(person) or person
-        uri = identity.deny_principal(raw)
-        if uri:
-            out[uri] = frozenset(svcs)
+    current: dict[str, dict[str, set[str]]] = {
+        ap: {em: set(svcs) for em, svcs in deny_state.services_at(ap).items()} for ap in aps}
+    for ap in aps:
+        cur = current[ap]
+        for em in restores:
+            cur.pop(em, None)
+        for em, projs in restore_projects.items():
+            if applies(ap, projs):
+                cur.pop(em, None)
+        for em in add_suspensions:
+            if applies(ap, suspend_projects.get(em)):
+                rule = rules.get(em) or {}
+                cur[em] = set(cur.get(em) or ()) | set(rule.get("services") or def_svcs)
+        for em in add_blocks:
+            src = blocks.get(em) or rules.get(em) or {}
+            if applies(ap, src.get("projects")):
+                cur[em] = set(src.get("services") or def_svcs)
+        for em, rule in rules.items():
+            if rule.get("type") == "block" and applies(ap, rule.get("projects")):
+                cur[em] = set(rule.get("services") or def_svcs)
+            elif rule.get("type") == "allow" and em not in blocks:
+                cur.pop(em, None)
+        for em, blk in blocks.items():
+            if applies(ap, blk.get("projects")):
+                cur[em] = set(blk.get("services") or def_svcs)
+
+    out: dict[str, dict[str, frozenset[str]]] = {}
+    for ap, people in current.items():
+        m: dict[str, frozenset[str]] = {}
+        for person, svcs in people.items():
+            if not svcs:
+                continue
+            uri = identity.deny_principal(logged_principals.get(person) or person)
+            if uri:
+                m[uri] = frozenset(svcs)
+        out[ap] = m
     return out
+
+
+def _desired_deny_map(ctx, policy: dict, state: dict, deny_state: enforcers.DenyState, **kwargs) -> dict[str, frozenset[str]]:
+    """Backwards-compatible union view of `_desired_by_attachment` (principal -> services at any attachment)."""
+    union: dict[str, frozenset[str]] = {}
+    for ap_map in _desired_by_attachment(ctx, policy, state, deny_state, **kwargs).values():
+        for p, svcs in ap_map.items():
+            union[p] = frozenset(union.get(p, frozenset()) | svcs)
+    return union
 
 
 def _trigger_enforcer_job(ctx) -> dict | None:
@@ -814,13 +1086,14 @@ def _trigger_enforcer_job(ctx) -> dict | None:
 
 
 def block_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) -> dict:
-    """POST /v1/users/{email}/block {services?: [...], reason?: str, until?: rfc3339}"""
+    """POST /v1/users/{email}/block {services?: [...], projects?: [...], reason?: str, until?: rfc3339}"""
     email = identity.person_key(ctx.path_params.get("email") or "")
     if not email:
         raise ApiError("bad_request", "Path parameter 'email' must be a valid email or workforce principal.")
     body = ctx.body or {}
     policy = effective_policy(ctx)
     services = _validate_services(body.get("services"), default=policy.get("default_block_services"))
+    projects = _validate_projects(ctx, body.get("projects"))
     reason = str(body.get("reason") or body.get("note") or "")[:200]
     until = body.get("until")
     if until is not None and until != "":
@@ -833,8 +1106,10 @@ def block_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) ->
         blk = {
             "email": email,
             "services": services,
+            "projects": projects,
             "until": until,
             "reason": reason,
+            "source": "manual",
             "updated_at": now_iso(),
             "updated_by": ctx.caller.id,
         }
@@ -849,9 +1124,10 @@ def block_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) ->
         enforcement = _reconcile_direct_change(ctx, policy, doc, deny_client=deny_client)
 
     audit.write_audit(ctx, "user.blocked", target=email,
-                      details={"services": services, "reason": reason, "until": until, "enforcement": enforcement})
+                      details={"services": services, "projects": projects, "reason": reason, "until": until,
+                               "enforcement": enforcement})
     webhooks.dispatch_event(ctx, "user.blocked", {
-        "email": email, "services": services, "reason": reason, "until": until,
+        "email": email, "services": services, "projects": projects or "all", "reason": reason, "until": until,
         "trigger": "manual", "actor": ctx.caller.id,
     })
     return {
@@ -859,24 +1135,40 @@ def block_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) ->
         "email": email,
         "status": "blocked",
         "blocked_services": services,
+        "projects": projects,
+        "scope": "projects" if projects else "all",
         "reason": reason or None,
         "until": until,
         "enforcement": enforcement,
     }
 
 
+def _narrow(rec: dict | None, target_projects: list[str], managed: list[str]) -> dict | None:
+    """Removes `target_projects` from a block / suspension record (global -> all managed minus targets)."""
+    if not isinstance(rec, dict):
+        return rec
+    current = rec.get("projects")
+    base = list(managed) if current is None else list(current)
+    left = [p for p in base if p not in set(target_projects)]
+    if not left:
+        return None
+    return dict(rec, projects=left)
+
+
 def unblock_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) -> dict:
-    """POST /v1/users/{email}/unblock {services?: [...], reason?: str}"""
+    """POST /v1/users/{email}/unblock {services?: [...], projects?: [...], reason?: str}"""
     email = identity.person_key(ctx.path_params.get("email") or "")
     if not email:
         raise ApiError("bad_request", "Path parameter 'email' must be a valid email or workforce principal.")
     body = ctx.body or {}
     policy = effective_policy(ctx)
     target_services = _validate_services(body.get("services"), allow_empty=True) if "services" in body else None
+    target_projects = _validate_projects(ctx, body.get("projects")) if body.get("projects") is not None else None
     reason = str(body.get("reason") or body.get("note") or "")[:200]
+    managed = list(ctx.all_projects)
 
     with _WRITE_LOCK:
-        remaining_holder: dict = {"services": []}
+        remaining_holder: dict = {"services": [], "projects": None, "any": False}
 
         def save(doc):
             blocks = dict(doc.get("blocks") or {})
@@ -884,11 +1176,29 @@ def unblock_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) 
             susps = dict(doc.get("suspensions") or {})
             existing_blk = blocks.get(email)
             existing_rule = rules.get(email)
-            if target_services is not None and existing_blk:
+            if target_projects is not None:
+                for coll in (blocks, susps):
+                    if email in coll:
+                        narrowed = _narrow(coll[email], target_projects, managed)
+                        if narrowed is None:
+                            coll.pop(email, None)
+                        else:
+                            coll[email] = dict(narrowed, updated_at=now_iso(), updated_by=ctx.caller.id)
+                if existing_rule and existing_rule.get("type") == "block":
+                    narrowed = _narrow(existing_rule, target_projects, managed)
+                    if narrowed is None:
+                        rules.pop(email, None)
+                    else:
+                        rules[email] = dict(narrowed, updated_at=now_iso(), updated_by=ctx.caller.id)
+                left = blocks.get(email) or (rules.get(email) if (rules.get(email) or {}).get("type") == "block" else None)
+                if left:
+                    remaining_holder.update(services=list(left.get("services") or []), projects=left.get("projects"),
+                                            any=True)
+            elif target_services is not None and existing_blk:
                 rem = [s for s in (existing_blk.get("services") or []) if s not in set(target_services)]
                 if rem:
                     blocks[email] = dict(existing_blk, services=rem, updated_at=now_iso(), updated_by=ctx.caller.id)
-                    remaining_holder["services"] = rem
+                    remaining_holder.update(services=rem, projects=existing_blk.get("projects"), any=True)
                 else:
                     blocks.pop(email, None)
                     susps.pop(email, None)
@@ -896,7 +1206,7 @@ def unblock_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) 
                 rem = [s for s in (existing_rule.get("services") or []) if s not in set(target_services)]
                 if rem:
                     rules[email] = dict(existing_rule, services=rem, updated_at=now_iso(), updated_by=ctx.caller.id)
-                    remaining_holder["services"] = rem
+                    remaining_holder.update(services=rem, projects=existing_rule.get("projects"), any=True)
                 else:
                     rules.pop(email, None)
                     susps.pop(email, None)
@@ -911,26 +1221,35 @@ def unblock_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) 
             return doc
 
         doc = ctx.store.mutate(USER_CAPS_DOC, save)
-        enforcement = _reconcile_direct_change(
-            ctx, policy, doc, deny_client=deny_client,
-            force_unblock=email if not remaining_holder["services"] else None,
-        )
+        if target_projects is not None:
+            enforcement = _reconcile_direct_change(ctx, policy, doc, deny_client=deny_client,
+                                                   restore_projects={email: target_projects})
+        else:
+            enforcement = _reconcile_direct_change(
+                ctx, policy, doc, deny_client=deny_client,
+                force_unblock=email if not remaining_holder["any"] else None,
+            )
 
-    status = "blocked" if remaining_holder["services"] else "active"
+    status = "blocked" if remaining_holder["any"] else "active"
     audit.write_audit(ctx, "user.unblocked", target=email,
                       details={"unblocked_services": target_services or list(config.VALID_SERVICES),
+                               "unblocked_projects": target_projects or "all",
                                "remaining_services": remaining_holder["services"],
+                               "remaining_projects": remaining_holder["projects"],
                                "reason": reason, "enforcement": enforcement})
     webhooks.dispatch_event(ctx, "user.unblocked", {
         "email": email, "unblocked_services": target_services or list(config.VALID_SERVICES),
-        "remaining_services": remaining_holder["services"], "reason": reason,
-        "trigger": "manual", "actor": ctx.caller.id,
+        "unblocked_projects": target_projects or "all",
+        "remaining_services": remaining_holder["services"], "remaining_projects": remaining_holder["projects"],
+        "reason": reason, "trigger": "manual", "actor": ctx.caller.id,
     })
     return {
         "object": "user_unblock",
         "email": email,
         "status": status,
         "blocked_services": remaining_holder["services"],
+        "blocked_projects": remaining_holder["projects"] if remaining_holder["any"] else None,
+        "unblocked_projects": target_projects,
         "reason": reason or None,
         "enforcement": enforcement,
     }
@@ -938,25 +1257,39 @@ def unblock_user(ctx, *, deny_client: enforcers.DenyPolicyClient | None = None) 
 
 def _reconcile_direct_change(ctx, policy: dict, state_doc: dict, *,
                              deny_client: enforcers.DenyPolicyClient | None = None,
-                             force_unblock: str | None = None) -> dict:
+                             force_unblock: str | None = None,
+                             restore_projects: dict | None = None) -> dict:
     backend = policy.get("enforcement_backend") or "iam_deny"
-    if backend == "notify_only" and not force_unblock:
+    breakglass = force_unblock or restore_projects
+    if backend == "notify_only" and not breakglass:
         return {"backend": "notify_only", "applied": False, "detail": "Notify-only mode; no IAM change applied."}
     if backend == "notify_only":
         # Break-glass: notify_only never adds principals, but an unblock still removes any existing deny entries.
         try:
             deny_state = enforcers.read_state(ctx, client=deny_client)
+            deny_state = enforcers.extend_state(
+                ctx, deny_state, [enforcers.project_attachment(p) for ps in (restore_projects or {}).values()
+                                  for p in ps if enforcers.project_attachment(p)], client=deny_client)
         except Exception:  # pylint: disable=broad-except
             return {"backend": "notify_only", "applied": False, "error": "deny_policy_unreadable"}
-        if not deny_state.readable or force_unblock not in deny_state.services_by_person:
+        targets = {force_unblock} if force_unblock else set((restore_projects or {}).keys())
+        present = any(t in deny_state.services_at(st.attachment) for st in deny_state.attachments for t in targets)
+        if not deny_state.readable or not present:
             return {"backend": "notify_only", "applied": False, "detail": "No IAM deny entry to remove."}
-        desired = {}
-        for person, svcs in deny_state.services_by_person.items():
-            if person != force_unblock and svcs:
+        per_ap = {}
+        for st in deny_state.attachments:
+            pid = enforcers.attachment_project(st.attachment)
+            m = {}
+            for person, svcs in deny_state.services_at(st.attachment).items():
+                if person == force_unblock:
+                    continue
+                if restore_projects and person in restore_projects and pid in restore_projects[person]:
+                    continue
                 uri = identity.deny_principal(person)
-                if uri:
-                    desired[uri] = frozenset(svcs)
-        res = enforcers.apply(ctx, deny_state, desired, dry_run=False, client=deny_client)
+                if uri and svcs:
+                    m[uri] = frozenset(svcs)
+            per_ap[st.attachment] = m
+        res = enforcers.apply(ctx, deny_state, {}, dry_run=False, client=deny_client, per_attachment=per_ap)
         return {"backend": "notify_only", "applied": bool(res.get("applied")), "items": res.get("items") or [],
                 "note": "Existing IAM deny entry removed (break-glass unblock in notify_only mode)."}
     # If an external Cloud Run Enforcer Job is configured and no explicit direct client is injected, trigger it.
@@ -968,13 +1301,17 @@ def _reconcile_direct_change(ctx, policy: dict, state_doc: dict, *,
         except GcpError as err:
             return {"backend": "iam_deny", "applied": False, "error": err.kind}
     deny_state = enforcers.read_state(ctx, client=deny_client)
+    scoped = _scoped_projects(state_doc) | {p for ps in (restore_projects or {}).values() for p in ps}
+    deny_state = enforcers.extend_state(ctx, deny_state, [enforcers.project_attachment(p) for p in scoped
+                                                          if enforcers.project_attachment(p)], client=deny_client)
     if not deny_state.readable:
         return {"backend": "iam_deny", "applied": False, "error": "deny_policy_unreadable"}
-    desired = _desired_deny_map(
+    per_ap = _desired_by_attachment(
         ctx, policy, state_doc, deny_state,
         restores=[force_unblock] if force_unblock else (),
+        restore_projects=restore_projects,
     )
-    res = enforcers.apply(ctx, deny_state, desired, dry_run=False, client=deny_client)
+    res = enforcers.apply(ctx, deny_state, {}, dry_run=False, client=deny_client, per_attachment=per_ap)
     return {
         "backend": "iam_deny",
         "applied": bool(res.get("applied")),
@@ -1005,15 +1342,38 @@ def enforce_cycle(ctx, *, trigger: str = "api", dry_run: bool = False,
         thresholds = sorted(int(t) for t in (policy.get("webhook_thresholds") or [80, 100]))
         if not dry_run:
             for u in payload["users"]:
-                pct = u.get("utilization_pct")
-                if pct is None or (u.get("rule") or {}).get("type") == "allow":
+                if (u.get("rule") or {}).get("type") == "allow":
                     continue
-                for thr in thresholds:
-                    if pct >= thr:
-                        webhooks.notify_threshold_once(
-                            ctx, email=u["email"], period_start=win["start_iso"] or "all",
-                            threshold_pct=thr, utilization_pct=pct, usage=u["usage"], limit=u["limit"],
-                        )
+                pct = u.get("utilization_pct") if u.get("cap_scope", "total") == "total" else None
+                if pct is not None and u.get("limit", {}).get("applies") != "per_project":
+                    total_pct = None
+                    lim = u.get("limit") or {}
+                    usage_v = u.get("usage") or {}
+                    ratios = []
+                    if lim.get("cost_cap") and usage_v.get("estimated_cost") is not None:
+                        ratios.append(usage_v["estimated_cost"] / lim["cost_cap"] * 100.0)
+                    if lim.get("token_cap"):
+                        ratios.append(usage_v.get("total_tokens", 0) / lim["token_cap"] * 100.0)
+                    if lim.get("request_cap"):
+                        ratios.append(usage_v.get("requests", 0) / lim["request_cap"] * 100.0)
+                    total_pct = max(ratios) if ratios else None
+                    for thr in thresholds:
+                        if total_pct is not None and total_pct >= thr:
+                            webhooks.notify_threshold_once(
+                                ctx, email=u["email"], period_start=win["start_iso"] or "all",
+                                threshold_pct=thr, utilization_pct=total_pct, usage=u["usage"], limit=u["limit"],
+                            )
+                for prow in u.get("projects") or []:
+                    ppct = prow.get("utilization_pct")
+                    if ppct is None or not prow.get("limit"):
+                        continue
+                    for thr in thresholds:
+                        if ppct >= thr:
+                            webhooks.notify_threshold_once(
+                                ctx, email=u["email"], period_start=win["start_iso"] or "all",
+                                threshold_pct=thr, utilization_pct=ppct, usage=prow["usage"], limit=prow["limit"],
+                                project=prow["project"],
+                            )
 
         # 2. If dry_run, aborted by safety gates, or notify_only: change nothing.
         changes = []
@@ -1053,14 +1413,19 @@ def enforce_cycle(ctx, *, trigger: str = "api", dry_run: bool = False,
                 }
 
         # 4. Direct IAM Deny v2 apply
-        desired = _desired_deny_map(
-            ctx, policy, internal["state"], internal["deny_state"],
+        deny_state = internal["deny_state"]
+        scoped = {p for ps in (plan.get("suspend_projects") or {}).values() for p in ps}
+        deny_state = enforcers.extend_state(ctx, deny_state, [enforcers.project_attachment(p) for p in scoped
+                                                              if enforcers.project_attachment(p)], client=deny_client)
+        per_ap = _desired_by_attachment(
+            ctx, policy, internal["state"], deny_state,
             usage_res=internal["usage"],
             add_suspensions=plan["suspend"],
+            suspend_projects=plan.get("suspend_projects"),
             add_blocks=plan["block"],
             restores=plan["restore"],
         )
-        apply_res = enforcers.apply(ctx, internal["deny_state"], desired, dry_run=False, client=deny_client)
+        apply_res = enforcers.apply(ctx, deny_state, {}, dry_run=False, client=deny_client, per_attachment=per_ap)
         ok_apply = not apply_res["violations"] and all(
             it.get("status") in ("applied", "pending", "skipped") for it in apply_res["items"]
         )
@@ -1095,11 +1460,18 @@ def enforce_cycle(ctx, *, trigger: str = "api", dry_run: bool = False,
                 doc["blocks"] = blocks
                 for em in plan["suspend"]:
                     u = users_by_email.get(em) or {}
+                    new_projects = (plan.get("suspend_projects") or {}).get(em)
+                    prev = susps.get(em) if isinstance(susps.get(em), dict) else None
+                    if new_projects is not None and prev is not None and prev.get("projects") is not None:
+                        new_projects = sorted(set(prev["projects"]) | set(new_projects))
+                    elif new_projects is not None and prev is not None and prev.get("projects") is None:
+                        new_projects = None
                     susps[em] = {
                         "email": em,
-                        "since": iso(now),
+                        "since": (prev or {}).get("since") or iso(now),
                         "until": win["next_reset_iso"],
                         "trigger": "auto",
+                        "projects": new_projects,
                         "reasons": list(u.get("over_cap_reasons") or []),
                         "usage": u.get("usage") or {},
                     }
@@ -1118,6 +1490,7 @@ def enforce_cycle(ctx, *, trigger: str = "api", dry_run: bool = False,
             for em in plan["suspend"]:
                 webhooks.dispatch_event(ctx, "user.blocked", {
                     "email": em, "services": def_svcs, "trigger": "auto_cap",
+                    "projects": (plan.get("suspend_projects") or {}).get(em) or "all",
                     "until": win["next_reset_iso"],
                     "reasons": (users_by_email.get(em) or {}).get("over_cap_reasons") or [],
                 })

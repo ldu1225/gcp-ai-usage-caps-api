@@ -44,10 +44,18 @@ RUNTIME_ROLES = ["roles/browser", "roles/serviceusage.serviceUsageConsumer", "ro
                  "roles/logging.privateLogViewer", "roles/bigquery.jobUser", "roles/bigquery.dataViewer",
                  "roles/cloudquotas.admin", "roles/monitoring.viewer", "roles/discoveryengine.editor"]
 ALL_PERMS_GRANTED = None  # sentinel: testIamPermissions grants everything asked
-AI_FILTER = ('log_id("businessaicode.googleapis.com/inference_response") OR (log_id("cloudaudit.googleapis.com/'
-             'data_access") AND protoPayload.serviceName="aiplatform.googleapis.com") OR log_id("discoveryengine.'
-             'googleapis.com/gemini_enterprise_user_activity") OR log_id("discoveryengine.googleapis.com/'
-             'gen_ai_user_message")')
+AI_FILTER = ('log_id("businessaicode.googleapis.com/inference_response") OR log_id("aiplatform.googleapis.com/'
+             'inference_request") OR (log_id("cloudaudit.googleapis.com/data_access") AND protoPayload.serviceName='
+             '"aiplatform.googleapis.com") OR log_id("discoveryengine.googleapis.com/gemini_enterprise_user_activity") '
+             'OR log_id("discoveryengine.googleapis.com/gen_ai_user_message")')
+# Sink filter of installs before v1.2 (no Vertex AI inference_request log).
+LEGACY_AI_FILTER = ('log_id("businessaicode.googleapis.com/inference_response") OR (log_id("cloudaudit.googleapis.com/'
+                    'data_access") AND protoPayload.serviceName="aiplatform.googleapis.com") OR log_id("discoveryengine.'
+                    'googleapis.com/gemini_enterprise_user_activity") OR log_id("discoveryengine.googleapis.com/'
+                    'gen_ai_user_message")')
+REALTIME_FILTER = ('log_id("businessaicode.googleapis.com/inference_response") OR '
+                   'log_id("aiplatform.googleapis.com/inference_request")')
+VERTEX_READER = "gcpAiCapsVertexLoggingReader"
 
 
 def _now_ms() -> str:
@@ -64,10 +72,11 @@ def green_project(pid: str, hub: bool) -> dict:
         {"name": "gcp-ai-usage-caps-api-ai-logs", "filter": AI_FILTER, "writerIdentity": writer,
          "destination": "bigquery.googleapis.com/projects/%s/datasets/ge_analytics" % HUB},
         {"name": "gcp-ai-usage-caps-api-usage-events",
-         "filter": 'log_id("businessaicode.googleapis.com/inference_response")', "writerIdentity": writer,
+         "filter": REALTIME_FILTER, "writerIdentity": writer,
          "destination": "pubsub.googleapis.com/projects/%s/topics/gcp-ai-usage-caps-api-usage-events" % HUB},
     ]
-    bindings = [{"role": r, "members": ["serviceAccount:%s" % RUNTIME]} for r in RUNTIME_ROLES]
+    bindings = [{"role": r, "members": ["serviceAccount:%s" % RUNTIME]}
+                for r in RUNTIME_ROLES + ["projects/%s/roles/%s" % (pid, VERTEX_READER)]]
     bindings += [{"role": r, "members": ["serviceAccount:%s" % ENFORCER]}
                  for r in ("roles/logging.viewer", "roles/logging.privateLogViewer")]
     model = {
@@ -88,17 +97,18 @@ def green_project(pid: str, hub: bool) -> dict:
         "devtools": {"global": {"devToolsEnabled": True}},
         "logs": True,
         "granted": ALL_PERMS_GRANTED,
+        # fetchPublisherModelConfig: state string, or a GcpError raised by the fake.
+        "vertex_logging": "ENABLED",
     }
     if hub:
         model["datasets"] = {
             "ge_analytics": {"location": "asia-northeast3", "tables": {
                 "businessaicode_googleapis_com_inference_response": _now_ms(),
+                "aiplatform_googleapis_com_inference_request": _now_ms(),
                 "cloudaudit_googleapis_com_data_access": _now_ms(),
                 "discoveryengine_googleapis_com_gen_ai_user_message": _now_ms()},
                 "access": [{"role": "WRITER", "userByEmail": "service-%s@gcp-sa-logging.iam.gserviceaccount.com"
                             % n} for n in NUMBERS.values()]},
-            "billing_export": {"location": "asia-northeast3",
-                               "tables": {"gcp_billing_export_resource_v1_0X0X0X": _now_ms()}, "access": []},
         }
         model["topic_iam"] = {"bindings": [{"role": "roles/pubsub.publisher", "members": [
             "serviceAccount:service-%s@gcp-sa-logging.iam.gserviceaccount.com" % n for n in NUMBERS.values()]}]}
@@ -218,8 +228,17 @@ class FakeCloud:
                 if cfg is None:
                     raise self._nf()
                 return cfg
+        m = re.match(r"^/v1beta1/projects/([^/:]+):fetchPublisherModelConfig$", path)
+        if "aiplatform" in host and m:
+            state = self._proj(m.group(1)).get("vertex_logging")
+            if isinstance(state, GcpError):
+                raise state
+            if state is None:
+                return {}
+            # Asymmetric nesting of the real API: the fetch response is the PublisherModelConfig itself.
+            return {"inferenceEventLoggingConfig": {"state": state}}
         if "aiplatform" in host and "/publishers/google/models" in path:
-            return {"publisherModels": [{"name": "publishers/google/models/gemini-2.5-pro"}]}
+            return {"publisherModels": [{"name": "publishers/google/models/gemini-test-pro"}]}
         if host.startswith("cloudquotas"):
             m = re.match(r"^/v1/projects/([^/]+)/locations/global/services/[^/]+/quotaInfos$", path)
             if m:
@@ -311,8 +330,7 @@ def make_ctx(cloud: FakeCloud, **overrides):
     cfg = copy.deepcopy(config.DEFAULTS)
     cfg["workspace"].update({"project_id": HUB, "projects": [SPOKE], "scan_all_projects": False,
                              "audit_project": HUB,
-                             "billing": {"project_id": HUB, "dataset": "billing_export",
-                                         "table": "gcp_billing_export_resource_v1_0X0X0X", "account_id": ""}})
+                             "billing": {"account_id": ""}})
     cfg["storage"]["backend"] = "memory"
     cfg["quotas"]["contact_email"] = "ops@example.com"
     cfg = config.deep_merge(cfg, overrides)
@@ -624,6 +642,168 @@ class ReadinessEngineTests(unittest.TestCase):
         with self.assertRaises(ApiError):
             readiness.run_readiness(ctx, projects=["other-proj"])
 
+    # -- v1.2: no billing export, Vertex AI inference request metadata logging ---------------------------------------
+    def test_no_billing_export_check_and_no_billing_env(self):
+        report = self.run_report(FakeCloud())
+        self.assertEqual(find(report, "bq.billing_export"), [])
+        env = dict(line.split("=", 1) for line in preflight.env_lines(report))
+        self.assertFalse([k for k in env if k.startswith("PREFLIGHT_BILLING")])
+        self.assertEqual(one(report, "bq.freshness.vertex_ai", HUB)["data"]["table"],
+                         "hub-proj:ge_analytics.aiplatform_googleapis_com_inference_request")
+        self.assertEqual(one(report, "bq.dataset.location_consistency")["status"], "pass")
+
+    def test_vertex_inference_logging_enabled_passes(self):
+        cloud = FakeCloud()
+        report = self.run_report(cloud)
+        for pid in (HUB, SPOKE):
+            c = one(report, "logging.vertex_inference_logging", pid)
+            self.assertEqual(c["status"], "pass")
+            self.assertTrue(c["data"]["enabled"])
+            self.assertEqual(c["category"], "logging")
+            self.assertTrue(c["title_ko"] and c["title_en"])
+        urls = [u for _, u, _, _ in cloud.calls if "fetchPublisherModelConfig" in u]
+        self.assertIn("https://aiplatform.googleapis.com/v1beta1/projects/spoke-proj:fetchPublisherModelConfig", urls)
+        env = dict(line.split("=", 1) for line in preflight.env_lines(report))
+        self.assertEqual(env["PREFLIGHT_VERTEX_LOGGING_DISABLED"], "")
+        self.assertEqual(env["PREFLIGHT_VERTEX_LOGGING_ENABLED"], "%s,%s" % (HUB, SPOKE))
+
+    def test_vertex_inference_logging_disabled_warns_with_enable_commands(self):
+        cloud = FakeCloud()
+        cloud.projects[SPOKE]["vertex_logging"] = "DISABLED"
+        report = self.run_report(cloud)
+        c = one(report, "logging.vertex_inference_logging", SPOKE)
+        self.assertEqual(c["status"], "warn")  # never a failure
+        self.assertNotIn("blocking", c)
+        self.assertFalse(c["data"]["enabled"])
+        self.assertIn("vertex_ai", c["impact"])
+        self.assertIn("Cloud Logging", c["detail"])
+        cmds = "\n".join(c["remediation"]["commands"])
+        self.assertIn("https://aiplatform.googleapis.com/v1beta1/projects/spoke-proj:setPublisherModelConfig", cmds)
+        self.assertIn('"inferenceEventLoggingConfig":{"state":"ENABLED"}', cmds)
+        self.assertIn("gcloud auth print-access-token", cmds)
+        self.assertIn("POST", cmds)
+        self.assertIn("/v1/projects/spoke-proj/vertex-logging/enable", cmds)
+        self.assertIn("inference-metadata-logging", c["remediation"]["docs_url"])
+        self.assertEqual(report["overall"], "ready_with_warnings")
+        self.assertIn("setPublisherModelConfig", report["remediation_script"])
+        env = dict(line.split("=", 1) for line in preflight.env_lines(report))
+        self.assertEqual(env["PREFLIGHT_VERTEX_LOGGING_DISABLED"], SPOKE)
+        self.assertEqual(env["PREFLIGHT_VERTEX_LOGGING_ENABLED"], HUB)
+        # A project where no PublisherModelConfig was ever written (NOT_FOUND / empty) is disabled too.
+        cloud.projects[SPOKE]["vertex_logging"] = GcpError("not_found", status=404, message="config not found")
+        cloud.projects[HUB]["vertex_logging"] = None
+        report = self.run_report(cloud)
+        self.assertEqual(one(report, "logging.vertex_inference_logging", SPOKE)["status"], "warn")
+        self.assertEqual(one(report, "logging.vertex_inference_logging", HUB)["data"]["state"], "STATE_UNSPECIFIED")
+
+    def test_vertex_inference_logging_denied_or_vpcsc_is_skip(self):
+        cloud = FakeCloud()
+        cloud.projects[SPOKE]["vertex_logging"] = GcpError(
+            "denied", status=403, message="Permission 'aiplatform.endpoints.fetchPublisherModelConfig' denied")
+        cloud.projects[HUB]["vertex_logging"] = GcpError(
+            "denied", status=403, message="Request is prohibited by organization's policy. vpcServiceControls")
+        report = self.run_report(cloud)
+        c = one(report, "logging.vertex_inference_logging", SPOKE)
+        self.assertEqual(c["status"], "skip")
+        self.assertIn("permission denied", c["detail"])
+        self.assertIsNone(c["data"]["enabled"])
+        h = one(report, "logging.vertex_inference_logging", HUB)
+        self.assertEqual(h["status"], "skip")
+        self.assertIn("VPC Service Controls", h["detail"])
+        self.assertNotEqual(report["overall"], "blocked")
+        env = dict(line.split("=", 1) for line in preflight.env_lines(report))
+        self.assertEqual(env["PREFLIGHT_VERTEX_LOGGING_UNKNOWN"], "%s,%s" % (HUB, SPOKE))
+        # Inside Cloud Run (caller = runtime SA) the skip suggests the one-permission custom role.
+        with mock.patch.dict(os.environ, {"K_SERVICE": "caps"}):
+            report = self.run_report(cloud)
+        cmds = one(report, "logging.vertex_inference_logging", SPOKE)["remediation"]["commands"]
+        self.assertTrue(any("gcloud iam roles create %s --project=spoke-proj" % VERTEX_READER in x for x in cmds))
+        self.assertTrue(any("--role=projects/spoke-proj/roles/%s" % VERTEX_READER in x for x in cmds))
+
+    def test_vertex_inference_logging_not_applicable_without_aiplatform(self):
+        cloud = FakeCloud()
+        cloud.projects[SPOKE]["services"].discard("aiplatform.googleapis.com")
+        report = self.run_report(cloud)
+        c = one(report, "logging.vertex_inference_logging", SPOKE)
+        self.assertEqual(c["status"], "info")
+        self.assertFalse([u for _, u, _, _ in cloud.calls if "spoke-proj:fetchPublisherModelConfig" in u])
+        env = dict(line.split("=", 1) for line in preflight.env_lines(report))
+        self.assertEqual(env["PREFLIGHT_VERTEX_LOGGING_NA"], SPOKE)
+
+    def test_legacy_sink_without_inference_request_is_reported(self):
+        cloud = FakeCloud()
+        sinks = cloud.projects[SPOKE]["sinks"]
+        sinks[2] = dict(sinks[2], filter=LEGACY_AI_FILTER)
+        sinks[3] = dict(sinks[3], filter='log_id("businessaicode.googleapis.com/inference_response")')
+        report = self.run_report(cloud)
+        c = one(report, "logging.sink.bigquery", SPOKE)
+        self.assertEqual(c["status"], "warn")
+        self.assertEqual(c["data"]["missing"], ["vertex_ai"])
+        self.assertEqual(c["data"]["missing_logs"], ["aiplatform.googleapis.com/inference_request"])
+        self.assertIn("aiplatform.googleapis.com/inference_request", c["detail"])
+        self.assertTrue(c["auto_fixable"])
+        # Our own sink exists: the fix updates its filter instead of creating a duplicate.
+        self.assertTrue(c["remediation"]["commands"][0].startswith(
+            "gcloud logging sinks update gcp-ai-usage-caps-api-ai-logs "))
+        self.assertIn('log_id("aiplatform.googleapis.com/inference_request")', c["remediation"]["commands"][0])
+        p = one(report, "logging.sink.pubsub", SPOKE)
+        self.assertEqual(p["status"], "info")
+        self.assertEqual(p["data"]["missing_logs"], ["aiplatform.googleapis.com/inference_request"])
+        self.assertTrue(p["remediation"]["commands"][0].startswith(
+            "gcloud logging sinks update gcp-ai-usage-caps-api-usage-events "))
+        # The hub keeps the current filters.
+        self.assertEqual(one(report, "logging.sink.bigquery", HUB)["status"], "pass")
+        self.assertEqual(one(report, "logging.sink.pubsub", HUB)["status"], "pass")
+
+    def test_exclusion_dropping_inference_request_flags_default_sink(self):
+        cloud = FakeCloud()
+        cloud.projects[SPOKE]["sinks"][1]["exclusions"] = [
+            {"name": "drop-vertex", "filter": 'log_id("aiplatform.googleapis.com/inference_request")'}]
+        report = self.run_report(cloud)
+        self.assertEqual(one(report, "logging.default_sink", SPOKE)["status"], "warn")
+
+    def test_runtime_vertex_reader_custom_role_mapping(self):
+        cloud = FakeCloud()
+        cloud.projects[SPOKE]["iam"]["bindings"] = [
+            b for b in cloud.projects[SPOKE]["iam"]["bindings"] if VERTEX_READER not in b["role"]]
+        report = self.run_report(cloud, hub={"runtime_service_account": RUNTIME})
+        c = one(report, "iam.runtime.permissions", SPOKE)
+        self.assertEqual(c["status"], "warn")  # optional feature
+        self.assertEqual(c["data"]["missing"], ["aiplatform.endpoints.fetchPublisherModelConfig"])
+        self.assertEqual(c["data"]["missing_roles"], ["projects/spoke-proj/roles/%s" % VERTEX_READER])
+        cmds = c["remediation"]["commands"]
+        self.assertIn("gcloud iam roles create %s --project=spoke-proj" % VERTEX_READER, cmds[0])
+        self.assertIn("--permissions=aiplatform.endpoints.fetchPublisherModelConfig", cmds[0])
+        self.assertIn("--role=projects/spoke-proj/roles/%s" % VERTEX_READER, cmds[1])
+        self.assertEqual(one(report, "iam.runtime.permissions", HUB)["status"], "pass")
+
+    def test_deployer_missing_vertex_permissions_only_warns(self):
+        cloud = FakeCloud()
+        optional = {"aiplatform.endpoints.setPublisherModelConfig", "aiplatform.endpoints.fetchPublisherModelConfig",
+                    "iam.roles.create"}
+
+        class Partial(FakeCloud):
+            def request(self, method, url, **kw):
+                payload, hdr = super().request(method, url, **kw)
+                if url.endswith("spoke-proj:testIamPermissions"):
+                    payload = {"permissions": [p for p in payload.get("permissions") or [] if p not in optional]}
+                return payload, hdr
+        part = Partial()
+        part.projects = cloud.projects
+        report = self.run_report(part)
+        c = one(report, "iam.deployer.permissions", SPOKE)
+        self.assertEqual(c["status"], "warn")
+        self.assertEqual(sorted(c["data"]["missing_optional"]), sorted(optional))
+        self.assertIn("roles/aiplatform.admin", c["data"]["missing_roles"])
+        self.assertIn("roles/iam.roleAdmin", c["data"]["missing_roles"])
+        self.assertNotEqual(report["overall"], "blocked")
+        self.assertEqual(one(report, "iam.deployer.permissions", HUB)["status"], "pass")
+
+    def test_project_api_table_has_no_billing_export(self):
+        report = self.run_report(FakeCloud())
+        c = one(report, "api.bigquery.enabled", HUB)
+        self.assertNotIn("billing export", json.dumps(c).lower())
+
 
 class ReadinessHandlerTests(unittest.TestCase):
     def test_get_caches_and_refresh_and_project_filter(self):
@@ -844,6 +1024,45 @@ class ScriptTests(unittest.TestCase):
             self.assertNotIn("bq --project_id=spoke-a mk", out)
             self.assertIn("Data Access audit logs", out)
             self.assertIn("roles/bigquery.dataEditor", out)
+            # v1.2: the BigQuery sink filter routes Vertex AI inference request metadata logs ...
+            for line in out.splitlines():
+                if "gcloud logging sinks create gcp-ai-usage-caps-api-ai-logs" in line:
+                    self.assertIn('log_id("aiplatform.googleapis.com/inference_request")', line)
+            # ... and every project gets inference request metadata logging enabled through setPublisherModelConfig.
+            for pid in ("spoke-a", "spoke-b", HUB):
+                self.assertIn("https://aiplatform.googleapis.com/v1beta1/projects/%s:setPublisherModelConfig" % pid, out)
+                self.assertIn("https://aiplatform.googleapis.com/v1beta1/projects/%s:fetchPublisherModelConfig" % pid, out)
+            self.assertIn('{"publisherModelConfig":{"inferenceEventLoggingConfig":{"state":"ENABLED"}}}', out)
+            self.assertIn("409", out)
+            self.assertIn("Cost note", out)
+            self.assertIn("Cloud Logging ingestion/storage pricing", out)
+
+    def test_prepare_vertex_logging_opt_out_and_preflight_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _ = _stub_env(tmp)
+            res = self._run("prepare.sh", ["--project", HUB, "--managed-projects", "spoke-a",
+                                           "--no-vertex-inference-logging", "--dry-run"], env)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertNotIn("setPublisherModelConfig", res.stdout.replace("-> setPublisherModelConfig", ""))
+            self.assertIn("ENABLE_VERTEX_INFERENCE_LOGGING=false", res.stdout)
+            env2 = dict(env, ENABLE_VERTEX_INFERENCE_LOGGING="false")
+            res = self._run("prepare.sh", ["--project", HUB, "--managed-projects", "spoke-a", "--dry-run"], env2)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertNotIn("projects/spoke-a:setPublisherModelConfig", res.stdout)
+            pf = os.path.join(tmp, "pf.env")
+            with open(pf, "w", encoding="utf-8") as fh:
+                fh.write("PREFLIGHT_OVERALL=ready_with_warnings\nPREFLIGHT_VERTEX_LOGGING_ENABLED=hub-proj\n"
+                         "PREFLIGHT_VERTEX_LOGGING_DISABLED=spoke-a\nPREFLIGHT_VERTEX_LOGGING_NA=spoke-b\n")
+            env3 = dict(env, CAPS_API_PREFLIGHT_ENV=pf)
+            res = self._run("prepare.sh", ["--project", HUB, "--managed-projects", "spoke-a,spoke-b", "--dry-run"],
+                            env3)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertNotIn("projects/hub-proj:setPublisherModelConfig", res.stdout)
+            self.assertNotIn("projects/spoke-b:setPublisherModelConfig", res.stdout)
+            self.assertIn("projects/spoke-a:setPublisherModelConfig", res.stdout)
+            self.assertIn("hub-proj: already ENABLED (preflight)", res.stdout)
+            res = self._run("prepare.sh", ["--project", HUB, "--dry-run"], dict(env, ENABLE_VERTEX_INFERENCE_LOGGING="maybe"))
+            self.assertNotEqual(res.returncode, 0)
 
     def test_prepare_dry_run_legacy_per_project_and_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -881,6 +1100,61 @@ class ScriptTests(unittest.TestCase):
             self.assertIn("AUDIT_PROJECT_ID=hub-proj", out)
             self.assertIn("MODEL_VIOLATION_ACTION=block_service", out)
             self.assertIn("--allow-unauthenticated", out)
+            # v1.2: no billing export wiring, combined real-time filter, pricing sync scheduler, Vertex reader role.
+            for gone in ("BILLING_DATASET_ID", "BILLING_TABLE_ID", "BILLING_PROJECT_ID"):
+                self.assertNotIn(gone, out)
+            self.assertIn("ENFORCEMENT_BACKEND=iam_deny", out)
+            for line in out.splitlines():
+                if "gcloud logging sinks create gcp-ai-usage-caps-api-usage-events" in line:
+                    self.assertIn('log_id("aiplatform.googleapis.com/inference_request")', line)
+            sched = [line for line in out.splitlines() if "gcloud scheduler jobs create http gcp-ai-usage-caps-api-pricing-sync"
+                     in line]
+            self.assertEqual(len(sched), 1, out)
+            self.assertIn("--uri=https://gcp-ai-usage-caps-api-111111111111.asia-northeast3.run.app/v1/internal/pricing/sync",
+                          sched[0])
+            self.assertIn("--oidc-service-account-email=%s" % RUNTIME, sched[0])
+            self.assertIn("--oidc-token-audience=https://gcp-ai-usage-caps-api-111111111111.asia-northeast3.run.app"
+                          "/v1/internal/pricing/sync", sched[0])
+            self.assertIn("--http-method=POST", sched[0])
+            for pid in (HUB, "spoke-a", "spoke-b"):
+                self.assertIn("gcloud iam roles create gcpAiCapsVertexLoggingReader --project=%s" % pid, out)
+                self.assertIn("--member=serviceAccount:%s --role=projects/%s/roles/gcpAiCapsVertexLoggingReader"
+                              % (RUNTIME, pid), out)
+            self.assertIn("--permissions=aiplatform.endpoints.fetchPublisherModelConfig", out)
+
+    def test_deploy_dry_run_respects_backend_and_optional_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _ = _stub_env(tmp)
+            env.update({"ENFORCEMENT_BACKEND": "notify_only", "CAP_SCOPE": "per_project",
+                        "VERTEX_USER_HEADER_LABEL": "end_user", "METERED_SURFACES": "vertex_ai,antigravity",
+                        "MODEL_VIOLATION_BLOCK_SCOPE": "project"})
+            res = self._run("deploy.sh", ["--project", HUB, "--managed-projects", "spoke-a", "--dry-run"], env)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            out = res.stdout
+            self.assertIn("ENFORCEMENT_BACKEND=notify_only", out)
+            self.assertNotIn("ENFORCEMENT_BACKEND=iam_deny", out)
+            self.assertIn("|CAP_SCOPE=per_project", out)
+            self.assertIn("|VERTEX_USER_HEADER_LABEL=end_user", out)
+            self.assertIn("|METERED_SURFACES=vertex_ai,antigravity", out)
+            self.assertIn("|MODEL_VIOLATION_BLOCK_SCOPE=project", out)
+            res = self._run("deploy.sh", ["--project", HUB, "--dry-run", "--enforcement-backend", "iam_deny",
+                                          "--cap-scope", "total"], env)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            self.assertIn("ENFORCEMENT_BACKEND=iam_deny", res.stdout)
+            self.assertIn("|CAP_SCOPE=total", res.stdout)
+            res = self._run("deploy.sh", ["--project", HUB, "--dry-run"], dict(env, ENFORCEMENT_BACKEND="bogus"))
+            self.assertNotEqual(res.returncode, 0)
+            # Without optional settings none of them is passed.
+            sub = os.path.join(tmp, "b")
+            os.makedirs(sub)
+            env, _ = _stub_env(sub)
+            for var in ("ENFORCEMENT_BACKEND", "CAP_SCOPE", "VERTEX_USER_HEADER_LABEL", "METERED_SURFACES",
+                        "MODEL_VIOLATION_BLOCK_SCOPE"):
+                env.pop(var, None)
+            res = self._run("deploy.sh", ["--project", HUB, "--dry-run"], env)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            for var in ("CAP_SCOPE=", "VERTEX_USER_HEADER_LABEL=", "METERED_SURFACES=", "MODEL_VIOLATION_BLOCK_SCOPE="):
+                self.assertNotIn("|" + var, res.stdout)
 
     def test_deploy_dry_run_adapts_to_preflight_env(self):
         with tempfile.TemporaryDirectory() as tmp:

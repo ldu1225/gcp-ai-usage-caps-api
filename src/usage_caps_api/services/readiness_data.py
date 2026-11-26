@@ -1,6 +1,10 @@
-"""Readiness categories `bigquery` and `logging`: datasets, existing AI log tables (adoption), freshness, billing
-export auto-detection, Log Router sinks (project + aggregated org/folder sinks, adoption, writer access, disabled
-sinks), the `_Default` sink, and Data Access audit log configuration for Vertex AI.
+"""Readiness categories `bigquery` and `logging`: datasets, existing AI log tables (adoption), freshness, Log Router
+sinks (project + aggregated org/folder sinks, adoption, writer access, disabled sinks), the `_Default` sink, Data
+Access audit log configuration for Vertex AI and Vertex AI inference request metadata logging
+(`aiplatform.googleapis.com/inference_request`, the per-request token source of Vertex AI usage).
+
+Costs are computed from log token counts x official Cloud Billing Catalog SKU prices, so no Cloud Billing export is
+detected or required.
 
 Adoption-first: when a customer environment already routes the needed logs somewhere (an existing dataset holding
 `businessaicode_googleapis_com_inference_response*` tables, an aggregated organization sink, a Pub/Sub sink), the checks
@@ -12,22 +16,30 @@ from __future__ import annotations
 import time
 import urllib.parse
 
-from .readiness_core import (BQ_V2, CRM_V1, CRM_V3, DOCS, LOGGING_V2, PUBSUB_V1, check, cmd_enable, q, reason_of,
-                             skipped)
+from . import vertex_logging as vlog
+from .readiness_core import BQ_V2, CRM_V1, CRM_V3, DOCS, LOGGING_V2, PUBSUB_V1, check, cmd_enable, q, skipped
 
+VERTEX_INFERENCE_LOG = "aiplatform.googleapis.com/inference_request"
+VERTEX_INFERENCE_TABLE = "aiplatform_googleapis_com_inference_request"
+
+# Table prefixes per surface, in order of preference (the first prefix with tables is used for freshness).
 AI_TABLES = {
     "antigravity": ("businessaicode_googleapis_com_inference_response",),
-    "vertex_ai": ("cloudaudit_googleapis_com_data_access",),
+    "vertex_ai": (VERTEX_INFERENCE_TABLE, "cloudaudit_googleapis_com_data_access"),
     "gemini_enterprise": ("discoveryengine_googleapis_com_gen_ai_user_message",
                           "discoveryengine_googleapis_com_gemini_enterprise_user_activity"),
 }
 NEEDED_LOGS = {
     "antigravity": ("businessaicode.googleapis.com/inference_response",),
-    "vertex_ai": ("cloudaudit.googleapis.com/data_access",),
+    # Tokens come from inference_request; per-user attribution of Vertex AI calls also needs the Data Access audit log.
+    "vertex_ai": (VERTEX_INFERENCE_LOG, "cloudaudit.googleapis.com/data_access"),
     "gemini_enterprise": ("discoveryengine.googleapis.com/gen_ai_user_message",
                           "discoveryengine.googleapis.com/gemini_enterprise_user_activity"),
 }
-BILLING_PREFIXES = ("gcp_billing_export_resource_v1_", "gcp_billing_export_v1_")
+# Surfaces where routing ANY one of the listed logs is enough (the others are complementary).
+ANY_OF_KINDS = ("gemini_enterprise",)
+# Logs pushed to the hub topic for real-time enforcement.
+REALTIME_LOGS = ("businessaicode.googleapis.com/inference_response", VERTEX_INFERENCE_LOG)
 FRESH_DAYS = 7
 MAX_DATASETS = 50
 MAX_SINKS_ACCESS = 10
@@ -40,11 +52,13 @@ PUBLISHER_ROLES = ("roles/pubsub.publisher", "roles/pubsub.editor", "roles/pubsu
 
 AI_LOG_FILTER = (
     'log_id("businessaicode.googleapis.com/inference_response") OR '
+    'log_id("aiplatform.googleapis.com/inference_request") OR '
     '(log_id("cloudaudit.googleapis.com/data_access") AND protoPayload.serviceName="aiplatform.googleapis.com") OR '
     'log_id("discoveryengine.googleapis.com/gemini_enterprise_user_activity") OR '
     'log_id("discoveryengine.googleapis.com/gen_ai_user_message")'
 )
-REALTIME_FILTER = 'log_id("businessaicode.googleapis.com/inference_response")'
+REALTIME_FILTER = ('log_id("businessaicode.googleapis.com/inference_response") OR '
+                   'log_id("aiplatform.googleapis.com/inference_request")')
 
 
 def sink_name(run) -> str:
@@ -75,28 +89,31 @@ def _list_tables(run, pid: str, dataset: str) -> list[str]:
 
 
 def _classify(tables: list[str]) -> dict:
-    """{kind: latest_table_id} for AI log tables (sharded `_YYYYMMDD` or partitioned)."""
+    """{kind: latest_table_id} for AI log tables (sharded `_YYYYMMDD` or partitioned). The first prefix of a kind
+    with tables wins (Vertex AI: the inference_request token log before the Data Access audit log)."""
     out = {}
     for kind, prefixes in AI_TABLES.items():
-        hits = [t for t in tables if any(t == p or t.startswith(p + "_") for p in prefixes)]
-        if hits:
-            out[kind] = sorted(hits)[-1]
+        for prefix in prefixes:
+            hits = [t for t in tables if t == prefix or t.startswith(prefix + "_")]
+            if hits:
+                out[kind] = sorted(hits)[-1]
+                break
     return out
 
 
 def scan_project_tables(run, pid: str):
-    """({dataset: {kind: latest_table}}, {dataset: [billing tables]}, err). Memoized per project."""
+    """({dataset: {kind: latest_table}}, err). Memoized per project."""
     cached = run.fact(pid, "ai_tables")
     if cached is not None:
-        return cached, run.fact(pid, "billing_tables") or {}, None
+        return cached, None
     try:
         datasets = _list_datasets(run, pid)
     except Exception as err:  # pylint: disable=broad-except
-        return None, None, err
-    datasets = sorted(datasets, key=lambda n: (0 if (n == run.dataset or "billing" in n.lower()) else 1, n))
+        return None, err
+    datasets = sorted(datasets, key=lambda n: (0 if n == run.dataset else 1, n))
     datasets = datasets[:MAX_DATASETS]
     res = run.parallel({ds: (lambda d=ds: _list_tables(run, pid, d)) for ds in datasets})
-    ai, billing = {}, {}
+    ai = {}
     for ds in datasets:
         ok, tables = res.get(ds, (False, None))
         if not ok or not tables:
@@ -104,13 +121,9 @@ def scan_project_tables(run, pid: str):
         kinds = _classify(tables)
         if kinds:
             ai[ds] = kinds
-        bills = sorted(t for t in tables if t.startswith(BILLING_PREFIXES))
-        if bills:
-            billing[ds] = bills
     run.set_fact(pid, "ai_tables", ai)
-    run.set_fact(pid, "billing_tables", billing)
     run.set_fact(pid, "datasets", datasets)
-    return ai, billing, None
+    return ai, None
 
 
 def _table_meta(run, pid: str, dataset: str, table: str):
@@ -129,8 +142,6 @@ def bigquery_checks(run, pid: str) -> list[dict]:
     if hosts_dataset:
         out.append(dataset_exists_check(run, pid))
     out.extend(_ai_tables_checks(run, pid, hosts_dataset))
-    if run.is_hub(pid):
-        out.append(billing_export_check(run))
     return out
 
 
@@ -159,7 +170,7 @@ def dataset_exists_check(run, pid: str) -> dict:
 
 def _ai_tables_checks(run, pid: str, hosts_dataset: bool) -> list[dict]:
     title = ("기존 AI 로그 테이블 탐지", "Existing AI log tables")
-    ai, _, err = scan_project_tables(run, pid)
+    ai, err = scan_project_tables(run, pid)
     if err is not None:
         return [skipped("bq.ai_tables.discovered", "bigquery", *title, err,
                         what="BigQuery datasets of %s (bigquery.datasets.get / tables.list)" % pid)]
@@ -236,55 +247,6 @@ def _freshness(run, pid: str, dataset: str, tables: dict) -> list[dict]:
     return out
 
 
-def billing_export_check(run) -> dict:
-    title = ("결제 내보내기(Billing export) 테이블", "Billing export table")
-    bil = run.ws.get("billing") or {}
-    bproject = (bil.get("project_id") or "").strip().lower() or run.hub
-    bdataset = (bil.get("dataset") or "").strip()
-    btable = (bil.get("table") or "").strip()
-    if bdataset and btable:
-        meta, err = _table_meta(run, bproject, bdataset, btable)
-        if err is None:
-            loc = str((meta or {}).get("location") or "")
-            run.set_fact(run.hub, "billing_location", loc)
-            return check("bq.billing_export", "bigquery", "pass", *title,
-                         "Configured billing export %s:%s.%s is readable (%s)." % (bproject, bdataset, btable, loc),
-                         data={"location": loc})
-        return check("bq.billing_export", "bigquery", "warn", *title,
-                     "Configured billing export %s:%s.%s cannot be read (%s): costs fall back to list prices."
-                     % (bproject, bdataset, btable, reason_of(err)), impact=["chargeback", "pricing"])
-    candidates = [bproject] + ([run.hub] if bproject != run.hub else [])
-    found, fallback, errors = None, None, []
-    for project in candidates:
-        _, billing, err = scan_project_tables(run, project)
-        if err is not None:
-            errors.append(err)
-            continue
-        for ds in sorted(billing, key=lambda n: (0 if "billing" in n.lower() else 1, n)):
-            for table in billing[ds]:
-                if table.startswith(BILLING_PREFIXES[0]) and not found:
-                    found = (project, ds, table)
-                elif table.startswith(BILLING_PREFIXES[1]) and not fallback:
-                    fallback = (project, ds, table)
-    pick = found or fallback
-    if pick:
-        project, ds, table = pick
-        adopt = {"workspace.billing.project_id": project, "workspace.billing.dataset": ds,
-                 "workspace.billing.table": table}
-        return check("bq.billing_export", "bigquery", "info", *title,
-                     "Detected %s billing export %s:%s.%s; set %s to use exact costs." % (
-                         "detailed (resource)" if pick is found else "standard", project, ds, table,
-                         ", ".join("%s=%s" % kv for kv in adopt.items())),
-                     data={"adopt": {"config": adopt, "env": {"BILLING_PROJECT_ID": project, "BILLING_DATASET_ID": ds,
-                                                              "BILLING_TABLE_ID": table}}})
-    if errors and len(errors) == len(candidates):
-        return skipped("bq.billing_export", "bigquery", *title, errors[0], what="BigQuery datasets of %s" % bproject)
-    return check("bq.billing_export", "bigquery", "warn", *title,
-                 "No Cloud Billing export table found in %s: costs are estimated from list prices (credits, "
-                 "discounts and Gemini Enterprise seat SKUs are not reflected)." % ", ".join(candidates),
-                 impact=["chargeback", "pricing"], docs_url=DOCS["billing_export"])
-
-
 def location_consistency_check(run) -> dict | None:
     """bq.dataset.location_consistency (cross-project)."""
     locs = {}
@@ -293,18 +255,12 @@ def location_consistency_check(run) -> dict | None:
         if loc:
             locs[pid] = loc.lower()
     title = ("데이터세트 위치 일관성", "Dataset location consistency")
-    bloc = (run.fact(run.hub, "billing_location") or "").lower()
     distinct = sorted(set(locs.values()))
     if len(distinct) > 1:
         return check("bq.dataset.location_consistency", "bigquery", "warn", *title,
                      "Audit datasets live in different locations (%s). Queries spanning projects cannot join tables "
                      "across locations; use the central hub dataset (--central-dataset) or one location." %
                      ", ".join("%s=%s" % kv for kv in sorted(locs.items())), impact=["usage"], data={"locations": locs})
-    if distinct and bloc and bloc != distinct[0]:
-        return check("bq.dataset.location_consistency", "bigquery", "info", *title,
-                     "Audit dataset location %s differs from the billing export location %s: usage and billing are "
-                     "queried separately (no cross-location joins)." % (distinct[0], bloc),
-                     data={"locations": locs, "billing_location": bloc})
     if distinct:
         return check("bq.dataset.location_consistency", "bigquery", "pass", *title,
                      "All audit datasets are in %s." % distinct[0], data={"locations": locs})
@@ -387,16 +343,32 @@ def logging_checks(run, pid: str) -> list[dict]:
         out.extend(_sink_checks(run, pid, sinks, aggregated))
         out.append(_default_sink_check(run, pid, sinks))
     out.append(audit_config_check(run, pid))
+    out.append(vertex_inference_logging_check(run, pid))
     return out
+
+
+def _missing_logs(log_cover: dict) -> tuple[list[str], list[str]]:
+    """(missing kinds, missing log ids) from {log_id: [sinks]}. A kind is missing when one of its needed logs is not
+    routed (any one log suffices for ANY_OF_KINDS)."""
+    kinds, logs = [], []
+    for k, ids in NEEDED_LOGS.items():
+        absent = [lid for lid in ids if not log_cover.get(lid)]
+        if k in ANY_OF_KINDS and len(absent) < len(ids):
+            continue
+        if absent:
+            kinds.append(k)
+            logs.extend(absent)
+    return kinds, logs
 
 
 def _sink_checks(run, pid: str, sinks: list[dict], aggregated: list[dict]) -> list[dict]:
     out = []
     all_sinks = [dict(s, _scope="projects/%s" % pid) for s in sinks if s.get("name") not in ("_Required", "_Default")]
     all_sinks += aggregated
+    own_names = {str(s.get("name") or "") for s in sinks}
     expected = "bigquery.googleapis.com/projects/%s/datasets/%s" % (run.dataset_project if run.central else pid,
                                                                    run.dataset)
-    bq_cover, ps_cover, disabled = {}, [], []
+    bq_cover, log_cover, ps_cover, ps_log_cover, disabled = {}, {}, [], {}, []
     for s in all_sinks:
         dest = str(s.get("destination") or "")
         kind = _dest_kind(dest)
@@ -406,10 +378,17 @@ def _sink_checks(run, pid: str, sinks: list[dict], aggregated: list[dict]) -> li
             continue
         if kind == "bigquery":
             for k, ids in NEEDED_LOGS.items():
-                if any(_covers(s, lid) for lid in ids):
+                hit = [lid for lid in ids if _covers(s, lid)]
+                if hit:
                     bq_cover.setdefault(k, []).append(s)
-        elif kind == "pubsub" and _covers(s, NEEDED_LOGS["antigravity"][0]):
-            ps_cover.append(s)
+                for lid in hit:
+                    log_cover.setdefault(lid, []).append(s)
+        elif kind == "pubsub":
+            hit = [lid for lid in REALTIME_LOGS if _covers(s, lid)]
+            if hit:
+                ps_cover.append(s)
+            for lid in hit:
+                ps_log_cover.setdefault(lid, []).append(s)
 
     title = ("AI 로그 BigQuery 싱크", "AI logs BigQuery sink")
     adopt = []
@@ -420,11 +399,15 @@ def _sink_checks(run, pid: str, sinks: list[dict], aggregated: list[dict]) -> li
                 proj, ds = _dest_parts(dest)
                 adopt.append({"sink": s.get("name"), "scope": s["_scope"], "kind": k, "destination": dest,
                               "config": {"workspace.audit_project": proj, "workspace.audit_dataset": ds}})
-    missing = [k for k in NEEDED_LOGS if k not in bq_cover]
+    missing, missing_logs = _missing_logs(log_cover)
     data = {"covered": {k: [s.get("name") for s in v] for k, v in bq_cover.items()}, "missing": missing,
-            "adopt": adopt, "expected_destination": expected}
-    create_cmd = ("gcloud logging sinks create %s %s --project=%s --log-filter=%s --use-partitioned-tables" %
-                  (sink_name(run), expected, pid, q(AI_LOG_FILTER)))
+            "missing_logs": missing_logs, "adopt": adopt, "expected_destination": expected}
+    if sink_name(run) in own_names:
+        fix_cmd = "gcloud logging sinks update %s %s --project=%s --log-filter=%s" % (
+            sink_name(run), expected, pid, q(AI_LOG_FILTER))
+    else:
+        fix_cmd = ("gcloud logging sinks create %s %s --project=%s --log-filter=%s --use-partitioned-tables" %
+                   (sink_name(run), expected, pid, q(AI_LOG_FILTER)))
     if not missing and not adopt:
         out.append(check("logging.sink.bigquery", "logging", "pass", *title,
                          "Every needed AI log is routed to %s." % expected, data=data))
@@ -435,30 +418,48 @@ def _sink_checks(run, pid: str, sinks: list[dict], aggregated: list[dict]) -> li
                          "duplicate sink." % "; ".join("%s -> %s" % (a["sink"], a["destination"]) for a in adopt[:5]),
                          data=data))
     else:
-        detail = "No sink routes %s logs of %s to BigQuery." % (", ".join(missing), pid)
+        detail = "No sink routes %s logs of %s to BigQuery (missing log IDs: %s)." % (
+            ", ".join(missing), pid, ", ".join(missing_logs))
+        if VERTEX_INFERENCE_LOG in missing_logs:
+            detail += (" Vertex AI token usage comes from %s: sinks created before v1.2 lack it in their filter."
+                       % VERTEX_INFERENCE_LOG)
         if adopt:
             detail += " Existing sinks cover: %s." % "; ".join("%s (%s)" % (a["sink"], a["kind"]) for a in adopt[:5])
-        detail += " prepare.sh creates %s -> %s." % (sink_name(run), expected)
+        detail += " prepare.sh %s %s -> %s." % ("updates" if sink_name(run) in own_names else "creates",
+                                               sink_name(run), expected)
         out.append(check("logging.sink.bigquery", "logging", "warn", *title, detail, impact=["usage"] + missing,
-                         commands=[create_cmd], auto_fixable=True, data=data, docs_url=DOCS["sinks"]))
+                         commands=[fix_cmd], auto_fixable=True, data=data, docs_url=DOCS["sinks"]))
     if adopt:
         run.set_fact(pid, "adopt_sinks", adopt)
 
     ps_title = ("실시간 Pub/Sub 싱크", "Real-time Pub/Sub sink")
     topic_path = "pubsub.googleapis.com/projects/%s/topics/%s" % (run.hub, run.topic)
-    if ps_cover:
+    usage_sink = "%s-usage-events" % run.service_name
+    ps_missing = [lid for lid in REALTIME_LOGS if not ps_log_cover.get(lid)]
+    ps_data = {"sinks": [{"name": s.get("name"), "destination": s.get("destination"), "scope": s["_scope"]}
+                         for s in ps_cover], "missing_logs": ps_missing}
+    if usage_sink in own_names:
+        ps_cmd = "gcloud logging sinks update %s %s --project=%s --log-filter=%s" % (
+            usage_sink, topic_path, pid, q(REALTIME_FILTER))
+    else:
+        ps_cmd = "gcloud logging sinks create %s %s --project=%s --log-filter=%s" % (
+            usage_sink, topic_path, pid, q(REALTIME_FILTER))
+    if ps_cover and not ps_missing:
         out.append(check("logging.sink.pubsub", "logging", "pass", *ps_title,
-                         "Antigravity inference logs are pushed to Pub/Sub by %s." % ", ".join(
+                         "Antigravity and Vertex AI inference logs are pushed to Pub/Sub by %s." % ", ".join(
                              "%s -> %s" % (s.get("name"), s.get("destination")) for s in ps_cover[:3]),
-                         data={"sinks": [{"name": s.get("name"), "destination": s.get("destination"),
-                                          "scope": s["_scope"]} for s in ps_cover]}))
+                         data=ps_data))
+    elif ps_cover:
+        out.append(check("logging.sink.pubsub", "logging", "info", *ps_title,
+                         "Pub/Sub sink(s) %s do not route %s: those requests are enforced by the 5-minute scheduler "
+                         "instead of in real time. deploy.sh updates %s with the combined filter." % (
+                             ", ".join(str(s.get("name")) for s in ps_cover[:3]), ", ".join(ps_missing), usage_sink),
+                         impact=["realtime"], auto_fixable=True, commands=[ps_cmd], data=ps_data))
     else:
         out.append(check("logging.sink.pubsub", "logging", "info", *ps_title,
-                         "No Pub/Sub sink for Antigravity inference logs in %s: real-time enforcement falls back to "
-                         "the 5-minute scheduler. deploy.sh creates one publishing to the hub topic." % pid,
-                         impact=["realtime"], auto_fixable=True,
-                         commands=["gcloud logging sinks create %s-usage-events %s --project=%s --log-filter=%s" % (
-                             run.service_name, topic_path, pid, q(REALTIME_FILTER))]))
+                         "No Pub/Sub sink for Antigravity / Vertex AI inference logs in %s: real-time enforcement "
+                         "falls back to the 5-minute scheduler. deploy.sh creates one publishing to the hub topic."
+                         % pid, impact=["realtime"], auto_fixable=True, commands=[ps_cmd], data=ps_data))
     if disabled:
         out.append(check("logging.sink.disabled", "logging", "warn", "비활성화된 AI 로그 싱크", "Disabled AI log sinks",
                          "Sink(s) %s would route AI logs but are disabled." % ", ".join(
@@ -617,3 +618,67 @@ def audit_config_check(run, pid: str) -> dict:
                  commands=["scripts/prepare.sh --project %s --managed-projects %s --enable-data-access-logs" % (
                      run.hub, pid) if not run.is_hub(pid) else
                            "scripts/prepare.sh --project %s --enable-data-access-logs" % run.hub])
+
+
+# ---------------------------------------------------------------------------
+# Vertex AI inference request metadata logging (per project)
+# ---------------------------------------------------------------------------
+
+VERTEX_LOGGING_READER_ROLE = "gcpAiCapsVertexLoggingReader"
+VERTEX_LOGGING_BODY = '{"publisherModelConfig":{"inferenceEventLoggingConfig":{"state":"ENABLED"}}}'
+
+
+def vertex_enable_curl(endpoint: str, pid: str) -> str:
+    """Copy-paste curl that enables inference request metadata logging on one project (409 = already enabled)."""
+    return ("curl -sS -X POST -H \"Authorization: Bearer $(gcloud auth print-access-token)\" "
+            "-H \"Content-Type: application/json\" \"%s/projects/%s:setPublisherModelConfig\" -d '%s'"
+            % (endpoint, pid, VERTEX_LOGGING_BODY))
+
+
+def vertex_inference_logging_check(run, pid: str) -> dict:
+    """logging.vertex_inference_logging: is `aiplatform.googleapis.com/inference_request` logging ENABLED?
+
+    Same semantics as services.vertex_logging.status (v1beta1 fetchPublisherModelConfig). Disabled is a warning,
+    never a failure: Antigravity / Gemini Enterprise usage keeps working, only Vertex AI token usage is missing."""
+    title = ("Vertex AI 추론 요청 메타데이터 로깅", "Vertex AI inference request metadata logging")
+    cid = "logging.vertex_inference_logging"
+    if run.api_enabled(pid, "aiplatform.googleapis.com") is False:
+        return check(cid, "logging", "info", *title,
+                     "aiplatform.googleapis.com is not enabled on %s; Vertex AI inference logging is not applicable."
+                     % pid, data={"enabled": None, "state": None, "readable": False, "applicable": False})
+    endpoint = vlog._endpoint(run.ctx)  # pylint: disable=protected-access
+    url = "%s/projects/%s:fetchPublisherModelConfig" % (endpoint, urllib.parse.quote(pid, safe=""))
+    payload, err = run.try_call("GET", url, project_hint=pid)
+    enable_cmds = [
+        vertex_enable_curl(endpoint, pid),
+        "# or through this API (runtime SA needs aiplatform.endpoints.setPublisherModelConfig on %s): "
+        "curl -X POST -H \"Authorization: Bearer $ADMIN_API_KEY\" \"$CAPS_API_URL/v1/projects/%s/vertex-logging/enable\""
+        % (pid, pid),
+    ]
+    if err is not None and getattr(err, "kind", "") != "not_found":
+        cmds = []
+        if getattr(err, "kind", "") == "denied" and run.identity_mode == "caller":
+            cmds = ["gcloud iam roles create %s --project=%s --permissions=aiplatform.endpoints."
+                    "fetchPublisherModelConfig --stage=GA" % (VERTEX_LOGGING_READER_ROLE, pid),
+                    "gcloud projects add-iam-policy-binding %s --member=serviceAccount:%s "
+                    "--role=projects/%s/roles/%s --condition=None" % (pid, run.runtime_sa, pid,
+                                                                       VERTEX_LOGGING_READER_ROLE)]
+        return skipped(cid, "logging", *title, err,
+                       what="the publisher model config of %s (aiplatform.endpoints.fetchPublisherModelConfig)" % pid,
+                       impact=["vertex_ai"], commands=cmds, docs_url=DOCS["vertex_inference_logging"],
+                       data={"enabled": None, "state": None, "readable": False,
+                             "error": getattr(err, "kind", "error")})
+    # NOT_FOUND: no publisher model config was ever written on the project -> logging is off.
+    state = (vlog._state_of(payload) if err is None else None) or "STATE_UNSPECIFIED"  # pylint: disable=protected-access
+    data = {"enabled": state == "ENABLED", "state": state, "readable": True, "endpoint": endpoint}
+    if state == "ENABLED":
+        return check(cid, "logging", "pass", *title,
+                     "Inference request metadata logging is ENABLED on %s (%s entries carry Vertex AI token counts)."
+                     % (pid, VERTEX_INFERENCE_LOG), data=data)
+    return check(cid, "logging", "warn", *title,
+                 "Inference request metadata logging is %s on %s: Vertex AI token usage, cost and caps cannot be "
+                 "measured for this project (Antigravity / Gemini Enterprise are unaffected). prepare.sh enables it "
+                 "(ENABLE_VERTEX_INFERENCE_LOGGING=true, default), or run the command below. Entries are ingested "
+                 "into Cloud Logging, so Cloud Logging ingestion/storage pricing applies." % (state, pid),
+                 impact=["vertex_ai", "usage"], auto_fixable=True, commands=enable_cmds, data=data,
+                 docs_url=DOCS["vertex_inference_logging"])

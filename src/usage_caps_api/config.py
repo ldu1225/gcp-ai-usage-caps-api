@@ -63,10 +63,9 @@ DEFAULTS = {
         "scope_max_projects": 300,
         "scope_filter": "none",
         "discovery_engine_locations": ["global"],
+        # Only the billing *account id* is used (project hard spend caps via the Budget API). Costs are never read
+        # from a Cloud Billing export: usage comes from logs, prices from the official Cloud Billing Catalog SKUs.
         "billing": {
-            "project_id": "",
-            "dataset": "",
-            "table": "",
             "account_id": "",
         },
     },
@@ -89,6 +88,12 @@ DEFAULTS = {
     "caps": {
         "usage_source": "auto",
         "inference_log": "businessaicode.googleapis.com%2Finference_response",
+        "vertex_inference_log": "aiplatform.googleapis.com%2Finference_request",
+        "vertex_user_header_label": "user",
+        "vertex_logging_endpoint": "https://aiplatform.googleapis.com/v1beta1",
+        "cap_scope": "total",
+        "project_defaults": {},
+        "metered_surfaces": list(VALID_SERVICES),
         "audit_log_name": "gcp-ai-usage-caps-audit",
         "max_log_entries": 20000,
         "enforcement_mode": "manual",
@@ -131,6 +136,8 @@ DEFAULTS = {
         "include_partner_models": True,
         "excluded_sku_patterns": list(MANDATORY_EXCLUDED_SKU_PATTERNS),
         "fx_sources": ["https://open.er-api.com/v6/latest/USD"],
+        "long_context_threshold_tokens": 200000,
+        "provisioned_throughput_cost": "on_demand",
     },
     # Facts about the central (hub) deployment that governs every managed project.
     "hub": {
@@ -150,10 +157,13 @@ DEFAULTS = {
         "violation_action": "block_service",
         "violation_block_minutes": 0,
         "violation_notify": True,
+        "violation_block_scope": "project",
         "policy_scopes": ["projects"],
         "allow_org_policy_writes": True,
         "default_actions": ["predict"],
         "always_allow": ["publishers/anthropic/models/count-tokens"],
+        # Model Garden *publishers* (vendors) scanned for the live catalog. This is NOT a model list: models are
+        # discovered live, and any publisher seen in usage logs is added to the scan automatically.
         "publishers": ["google", "anthropic", "meta", "mistralai", "ai21", "deepseek-ai", "qwen", "openai"],
         "catalog_location": "global",
         "catalog_ttl_seconds": 3600,
@@ -323,12 +333,6 @@ def _apply_env(cfg: dict, env: dict) -> dict:
         ws["discovery_engine_locations"] = [loc.lower() for loc in _split_csv(get("DISCOVERY_ENGINE_LOCATIONS"))
                                             if LOCATION_RE.match(loc.lower())]
     bil = ws["billing"]
-    if get("BILLING_PROJECT_ID"):
-        bil["project_id"] = get("BILLING_PROJECT_ID").lower()
-    if get("BILLING_DATASET_ID"):
-        bil["dataset"] = get("BILLING_DATASET_ID")
-    if get("BILLING_TABLE_ID"):
-        bil["table"] = get("BILLING_TABLE_ID")
     if get("BILLING_ACCOUNT_ID"):
         acct = get("BILLING_ACCOUNT_ID").upper()
         if ACCOUNT_RE.match(acct):
@@ -373,6 +377,16 @@ def _apply_env(cfg: dict, env: dict) -> dict:
         caps["usage_events_subscription"] = get("USAGE_EVENTS_SUBSCRIPTION")
     if env.get("SPEND_CAPS_ENABLED") is not None and env.get("SPEND_CAPS_ENABLED") != "":
         caps["spend_caps_enabled"] = _parse_bool(env["SPEND_CAPS_ENABLED"])
+    if get("CAP_SCOPE") in ("total", "per_project"):
+        caps["cap_scope"] = get("CAP_SCOPE")
+    if get("VERTEX_USER_HEADER_LABEL"):
+        caps["vertex_user_header_label"] = re.sub(r"[^a-z0-9_\-]", "", get("VERTEX_USER_HEADER_LABEL").lower())[:40] or "user"
+    if get("VERTEX_LOGGING_ENDPOINT") and re.match(r"^https://[a-z0-9.\-]+(:[0-9]+)?/v1beta1$", get("VERTEX_LOGGING_ENDPOINT")):
+        caps["vertex_logging_endpoint"] = get("VERTEX_LOGGING_ENDPOINT")
+    if get("METERED_SURFACES"):
+        ms = [x for x in _split_csv(get("METERED_SURFACES")) if x in VALID_SERVICES]
+        if ms:
+            caps["metered_surfaces"] = ms
     if get("CAP_CURRENCY") and CURRENCY_RE.match(get("CAP_CURRENCY").upper()):
         caps["currency"] = get("CAP_CURRENCY").upper()
         out["pricing"]["currency"] = get("CAP_CURRENCY").upper()
@@ -400,8 +414,20 @@ def _apply_env(cfg: dict, env: dict) -> dict:
             models["policy_scopes"] = scopes
     if env.get("ALLOW_ORG_POLICY_WRITES") is not None and env.get("ALLOW_ORG_POLICY_WRITES") != "":
         models["allow_org_policy_writes"] = _parse_bool(env["ALLOW_ORG_POLICY_WRITES"])
+    if get("MODEL_VIOLATION_BLOCK_SCOPE") in ("project", "all"):
+        models["violation_block_scope"] = get("MODEL_VIOLATION_BLOCK_SCOPE")
+    if get("MODEL_PUBLISHERS"):
+        pubs = [x.lower() for x in _split_csv(get("MODEL_PUBLISHERS")) if re.match(r"^[a-z0-9][a-z0-9\-]{0,62}$", x.lower())]
+        if pubs:
+            models["publishers"] = pubs
     if get("MODEL_PROTECTED_PRINCIPALS"):
         models["protected_principals"] = [e.lower() for e in _split_csv(get("MODEL_PROTECTED_PRINCIPALS"))]
+
+    pricing_cfg = out["pricing"]
+    if get("LONG_CONTEXT_THRESHOLD_TOKENS"):
+        pricing_cfg["long_context_threshold_tokens"] = max(1000, int(get("LONG_CONTEXT_THRESHOLD_TOKENS")))
+    if get("PROVISIONED_THROUGHPUT_COST") in ("on_demand", "zero"):
+        pricing_cfg["provisioned_throughput_cost"] = get("PROVISIONED_THROUGHPUT_COST")
 
     quotas = out["quotas"]
     if get("QUOTA_CONTACT_EMAIL") and valid_email(get("QUOTA_CONTACT_EMAIL")):

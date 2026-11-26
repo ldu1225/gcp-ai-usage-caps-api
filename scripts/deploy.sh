@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # Deploy the hub: Cloud Run API service, Enforcer Job, GCS state bucket, bootstrap key, ONE real-time Pub/Sub topic fed
-# by a Log Router sink in EVERY managed project, Cloud Scheduler safety net, and least-privilege grants for the runtime
-# (API) and enforcer service accounts on the hub AND every managed project (or at folder/org level).
+# by a Log Router sink in EVERY managed project (Antigravity inference_response + Vertex AI inference_request), Cloud
+# Scheduler safety net + daily OIDC pricing sync, and least-privilege grants for the runtime (API) and enforcer service
+# accounts on the hub AND every managed project (or at folder/org level), including the one-permission custom role
+# gcpAiCapsVertexLoggingReader (aiplatform.endpoints.fetchPublisherModelConfig) for the runtime.
+#
+# Optional runtime settings are read from the environment (or flags) and passed only when set: ENFORCEMENT_BACKEND
+# (default iam_deny), CAP_SCOPE, VERTEX_USER_HEADER_LABEL, METERED_SURFACES, MODEL_VIOLATION_BLOCK_SCOPE,
+# MODEL_PUBLISHERS, LONG_CONTEXT_THRESHOLD_TOKENS, PROVISIONED_THROUGHPUT_COST; PRICING_SYNC_SCHEDULE /
+# PRICING_SYNC_TIME_ZONE tune the pricing job.
 #
 # Adapts automatically to the readiness preflight (run first; nothing is created when it reports blockers):
 #   domain restricted sharing      -> --no-invoker-iam-check instead of --allow-unauthenticated
@@ -71,6 +78,7 @@ probe gcloud iam service-accounts describe "$ENFORCER_SA" --project="$HUB" || \
   run gcloud iam service-accounts create "$ENFORCER_SA_ID" --display-name="GCP AI Usage Caps Enforcer Job" --project="$HUB"
 for role in $API_HUB_ROLES; do grant_project_role "$HUB" "$API_MEMBER" "$role"; done
 for role in $ENFORCER_HUB_ROLES; do grant_project_role "$HUB" "$ENFORCER_MEMBER" "$role"; done
+ensure_vertex_reader_role "$HUB" "$API_MEMBER"
 if [[ "$DATASET_MODE" == "central" && "$AUDIT_PROJECT" != "$HUB" ]]; then
   grant_project_role "$AUDIT_PROJECT" "$API_MEMBER" "roles/bigquery.dataViewer"
   grant_project_role "$AUDIT_PROJECT" "$ENFORCER_MEMBER" "roles/bigquery.dataViewer"
@@ -78,8 +86,10 @@ fi
 
 log "3/9 Managed project roles (${#MANAGED_ARR[@]} project(s)${SCOPE_IDS:+, scope ${SCOPE_TYPE} ${SCOPE_IDS}})"
 if [[ "$SCOPE_TYPE" != "projects" && "$GRANT_ORG_ROLES" == "1" ]]; then
+  VERTEX_READER_ORG_ROLE=""
+  [[ -n "$ORG_ID" ]] && ensure_vertex_reader_org_role "$ORG_ID"
   for sid in ${SCOPE_ID_ARR[@]+"${SCOPE_ID_ARR[@]}"}; do
-    for role in $API_MANAGED_ROLES; do
+    for role in $API_MANAGED_ROLES ${VERTEX_READER_ORG_ROLE}; do
       if [[ "$SCOPE_TYPE" == "folder" ]]; then grant_folder_role "$sid" "$API_MEMBER" "$role"
       else grant_org_role "$sid" "$API_MEMBER" "$role"; fi
     done
@@ -88,10 +98,14 @@ if [[ "$SCOPE_TYPE" != "projects" && "$GRANT_ORG_ROLES" == "1" ]]; then
       else grant_org_role "$sid" "$ENFORCER_MEMBER" "$role"; fi
     done
   done
+  if [[ -z "$VERTEX_READER_ORG_ROLE" ]]; then
+    for pid in ${MANAGED_ARR[@]+"${MANAGED_ARR[@]}"}; do ensure_vertex_reader_role "$pid" "$API_MEMBER"; done
+  fi
 else
   for pid in ${MANAGED_ARR[@]+"${MANAGED_ARR[@]}"}; do
     for role in $API_MANAGED_ROLES; do grant_project_role "$pid" "$API_MEMBER" "$role"; done
     for role in $ENFORCER_MANAGED_ROLES; do grant_project_role "$pid" "$ENFORCER_MEMBER" "$role"; done
+    ensure_vertex_reader_role "$pid" "$API_MEMBER"
   done
 fi
 
@@ -150,7 +164,7 @@ ENV_PAIRS=(
   "PROJECT_ID=${HUB}" "HUB_REGION=${REGION}" "SERVICE_NAME=${SERVICE_NAME}"
   "AUDIT_DATASET_ID=${DATASET}" "SETTINGS_BUCKET=${STATE_BUCKET}" "PUBLIC_BASE_URL=${RUN_URL}"
   "RUNTIME_SERVICE_ACCOUNT=${API_SA}" "ENFORCER_SERVICE_ACCOUNT=${ENFORCER_SA}"
-  "ENFORCEMENT_BACKEND=iam_deny" "ENFORCEMENT_MODE=${MODE}" "ENFORCEMENT_JOB=${ENFORCER_JOB_REF}"
+  "ENFORCEMENT_BACKEND=${ENFORCEMENT_BACKEND}" "ENFORCEMENT_MODE=${MODE}" "ENFORCEMENT_JOB=${ENFORCER_JOB_REF}"
   "DENY_ATTACHMENT=${DENY_ATTACHMENT}" "SPEND_CAPS_ENABLED=${SPEND_CAPS}"
   "MODEL_VIOLATION_ACTION=${MODEL_VIOLATION_ACTION}" "SCAN_ALL_PROJECTS=false"
 )
@@ -163,8 +177,11 @@ MANAGED_CSV="$(IFS=,; echo "${MANAGED_ARR[*]+"${MANAGED_ARR[*]}"}")"
 [[ "$REALTIME" == "1" ]] && ENV_PAIRS+=("USAGE_EVENTS_TOPIC=${TOPIC}" "USAGE_EVENTS_SUBSCRIPTION=${SUB_REF}")
 [[ -n "$QUOTA_CONTACT_EMAIL" ]] && ENV_PAIRS+=("QUOTA_CONTACT_EMAIL=${QUOTA_CONTACT_EMAIL}")
 [[ -n "$BILLING_ACCOUNT" ]] && ENV_PAIRS+=("BILLING_ACCOUNT_ID=${BILLING_ACCOUNT}")
-[[ -n "${PREFLIGHT_BILLING_TABLE_ID:-}" ]] && ENV_PAIRS+=("BILLING_PROJECT_ID=${PREFLIGHT_BILLING_PROJECT_ID}" \
-  "BILLING_DATASET_ID=${PREFLIGHT_BILLING_DATASET_ID}" "BILLING_TABLE_ID=${PREFLIGHT_BILLING_TABLE_ID}")
+# Optional v1.2 runtime settings (costs = log token counts x Cloud Billing Catalog SKU prices; no billing export).
+for var in CAP_SCOPE VERTEX_USER_HEADER_LABEL METERED_SURFACES MODEL_VIOLATION_BLOCK_SCOPE MODEL_PUBLISHERS \
+           LONG_CONTEXT_THRESHOLD_TOKENS PROVISIONED_THROUGHPUT_COST VERTEX_LOGGING_ENDPOINT; do
+  if [[ -n "${!var}" ]]; then ENV_PAIRS+=("${var}=${!var// /}"); fi
+done
 ENV_VARS="^|^$(IFS='|'; echo "${ENV_PAIRS[*]}")"
 
 # Edge access adapted to organization policies.
@@ -209,7 +226,7 @@ run_quiet gcloud run jobs add-iam-policy-binding "$ENFORCER_JOB" --region="$REGI
 run_quiet gcloud run services add-iam-policy-binding "$SERVICE_NAME" --region="$REGION" --project="$HUB" \
   --member="$API_MEMBER" --role="roles/run.invoker"
 
-log "8/9 Cloud Scheduler safety net (every 5 min)"
+log "8/9 Cloud Scheduler: safety net (every 5 min) + daily official SKU pricing sync"
 SCHED_JOB="${SERVICE_NAME}-enforce-schedule"
 if ! probe gcloud scheduler jobs describe "$SCHED_JOB" --location="$REGION" --project="$HUB"; then
   run gcloud scheduler jobs create http "$SCHED_JOB" \
@@ -219,6 +236,22 @@ if ! probe gcloud scheduler jobs describe "$SCHED_JOB" --location="$REGION" --pr
     --oauth-service-account-email="$API_SA" \
     || warn "Cloud Scheduler job not created (API disabled?); enforcement still runs in real time and on demand"
 fi
+# POST /v1/internal/pricing/sync with a Google OIDC token of the runtime SA (audience = PUBLIC_BASE_URL + path):
+# refreshes Cloud Billing Catalog token prices and FX rates once a day.
+PRICING_JOB="${SERVICE_NAME}-pricing-sync"
+PRICING_URI="${RUN_URL}/v1/internal/pricing/sync"
+PRICING_VERB="create"
+PRICING_HEADERS=(--headers="Content-Type=application/json")
+if probe gcloud scheduler jobs describe "$PRICING_JOB" --location="$REGION" --project="$HUB"; then
+  PRICING_VERB="update"
+  PRICING_HEADERS=(--update-headers="Content-Type=application/json")
+fi
+run gcloud scheduler jobs "$PRICING_VERB" http "$PRICING_JOB" \
+  --project="$HUB" --location="$REGION" \
+  --schedule="$PRICING_SYNC_SCHEDULE" --time-zone="$PRICING_SYNC_TIME_ZONE" --uri="$PRICING_URI" \
+  --http-method=POST --message-body="{}" "${PRICING_HEADERS[@]}" \
+  --oidc-service-account-email="$API_SA" --oidc-token-audience="$PRICING_URI" --attempt-deadline=180s \
+  || warn "pricing sync scheduler not ${PRICING_VERB}d; run it on demand: POST ${PRICING_URI} with an admin API key"
 
 log "9/9 Real-time pipeline: ONE hub topic, a Pub/Sub sink in every project"
 if [[ "$REALTIME" == "1" ]]; then

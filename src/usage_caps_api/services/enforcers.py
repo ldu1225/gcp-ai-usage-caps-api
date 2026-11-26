@@ -12,6 +12,11 @@ This allows blocking user A on `["antigravity"]` while blocking user B on
   non-person principals, or unknown permissions)
 - IAM v2 2,500 denied-principal capacity limit enforcement (Gate G6)
 - ETag optimistic concurrency retry, LRO polling, and deleted/missing principal graceful handling.
+
+Multi-project: every managed project (or the folder / organization scope) is an attachment point. A block can apply
+to ALL attachment points (default) or only to selected projects (`projects: [...]`) - e.g. a user assigned to several
+projects who overspends in one project is suspended only there. Desired state is therefore computed per attachment
+point (`per_attachment` in `plan` / `apply`).
 """
 
 from __future__ import annotations
@@ -97,6 +102,28 @@ def attachment_points(ctx) -> list[str]:
         point = "%s/projects/%s" % (CRM_SERVICE, pid)
         if _ATTACHMENT_RE.fullmatch(point) and point not in seen:
             seen.add(point)
+            out.append(point)
+    return out
+
+
+def project_attachment(pid: str) -> str | None:
+    if not config.valid_project(pid):
+        return None
+    point = "%s/projects/%s" % (CRM_SERVICE, pid)
+    return point if _ATTACHMENT_RE.fullmatch(point) else None
+
+
+def attachment_project(ap: str) -> str | None:
+    prefix = "%s/projects/" % CRM_SERVICE
+    return ap[len(prefix):] if isinstance(ap, str) and ap.startswith(prefix) else None
+
+
+def allowed_attachments(ctx) -> list[str]:
+    """Scope attachment points + a project attachment point for every managed project (project-scoped blocks)."""
+    out = list(attachment_points(ctx))
+    for pid in ctx.all_projects or ():
+        point = project_attachment(pid)
+        if point and point not in out:
             out.append(point)
     return out
 
@@ -279,6 +306,32 @@ class DenyState:
     def by_attachment(self) -> dict[str, AttachmentState]:
         return {st.attachment: st for st in self.attachments}
 
+    def services_at(self, ap: str) -> dict[str, frozenset[str]]:
+        """{person_key: services} denied at one usable attachment point."""
+        st = self.by_attachment.get(ap)
+        if st is None or st.error is not None or st.foreign:
+            return {}
+        out = {}
+        for p, svcs in st.by_principal.items():
+            pkey = identity.person_key(p)
+            if pkey and svcs:
+                out[pkey] = frozenset(svcs)
+        return out
+
+    def projects_by_person(self) -> dict[str, dict[str, frozenset[str]]]:
+        """{person_key: {project_id: services}} for project attachment points (project-scoped view)."""
+        out: dict[str, dict[str, frozenset[str]]] = {}
+        for st in self._usable():
+            pid = attachment_project(st.attachment)
+            if not pid:
+                continue
+            for pkey, svcs in self.services_at(st.attachment).items():
+                out.setdefault(pkey, {})[pid] = svcs
+        return out
+
+    def max_principals(self) -> int:
+        return max((len(st.principals) for st in self._usable()), default=0)
+
 
 def _state_of(ap: str, policy: dict) -> AttachmentState:
     etag = policy.get("etag") if isinstance(policy.get("etag"), str) else None
@@ -370,11 +423,29 @@ def build_policy(desired_by_principal: dict[str, frozenset[str]], etag: str | No
     return pol
 
 
-def plan(state: DenyState, desired_by_principal: dict[str, frozenset[str]]) -> list[dict]:
-    desired = normalize_desired_map(desired_by_principal)
-    desired_principals = frozenset(desired.keys())
+def extend_state(ctx, state: DenyState, extra_points, *, client: DenyPolicyClient | None = None) -> DenyState:
+    """Reads additional attachment points (e.g. project points for project-scoped blocks in folder mode)."""
+    have = {st.attachment for st in state.attachments}
+    missing = [ap for ap in dict.fromkeys(extra_points or ()) if ap not in have]
+    if not missing:
+        return state
+    more = read_state(ctx, attachments=missing, client=client)
+    return DenyState(list(state.attachments) + list(more.attachments))
+
+
+def _desired_for(ap: str, desired: dict, per_attachment: dict | None) -> dict[str, frozenset[str]]:
+    if per_attachment is not None and ap in per_attachment:
+        return normalize_desired_map(per_attachment[ap])
+    return desired
+
+
+def plan(state: DenyState, desired_by_principal: dict[str, frozenset[str]],
+         per_attachment: dict | None = None) -> list[dict]:
+    base_desired = normalize_desired_map(desired_by_principal)
     items = []
     for st in state.attachments:
+        desired = _desired_for(st.attachment, base_desired, per_attachment)
+        desired_principals = frozenset(desired.keys())
         item = {
             "attachment": st.attachment,
             "op": "none",
@@ -495,12 +566,17 @@ def _execute(client: DenyPolicyClient, cfg: dict, pid: str, st: AttachmentState,
 
 
 def apply(ctx, state: DenyState, desired_by_principal: dict[str, frozenset[str]], *,
-          dry_run: bool = False, client: DenyPolicyClient | None = None, attachments=None) -> dict:
+          dry_run: bool = False, client: DenyPolicyClient | None = None, attachments=None,
+          per_attachment: dict | None = None) -> dict:
     cfg = ctx.config
     desired = normalize_desired_map(desired_by_principal)
-    allowed = list(attachments) if attachments is not None else attachment_points(ctx)
-    items = plan(state, desired)
-    violations = check_invariants(cfg, items, desired, allowed)
+    allowed = list(attachments) if attachments is not None else allowed_attachments(ctx)
+    items = plan(state, desired, per_attachment)
+    union: dict[str, frozenset[str]] = dict(desired)
+    for ap_map in (per_attachment or {}).values():
+        for p, svcs in normalize_desired_map(ap_map).items():
+            union[p] = frozenset(union.get(p, frozenset()) | svcs)
+    violations = check_invariants(cfg, items, union, allowed)
     if violations:
         refused = [_done(i, "skipped", i["error"] or ("invariant_violation" if i["op"] != "none" else None))
                    for i in items]
@@ -520,8 +596,9 @@ def apply(ctx, state: DenyState, desired_by_principal: dict[str, frozenset[str]]
             writes.append(idx)
     for start in range(0, len(writes), APPLY_BATCH):
         chunk = writes[start:start + APPLY_BATCH]
-        outcome = ctx.run({i: (lambda i=i: _execute(client, cfg, pid, by_ap[items[i]["attachment"]],
-                                                    items[i], desired, allowed)) for i in chunk})
+        outcome = ctx.run({i: (lambda i=i: _execute(
+            client, cfg, pid, by_ap[items[i]["attachment"]], items[i],
+            _desired_for(items[i]["attachment"], desired, per_attachment), allowed)) for i in chunk})
         for i in chunk:
             ok, val = outcome.get(i, (False, None))
             results[i] = val if (ok and isinstance(val, dict)) else _done(items[i], "failed", _error_kind(val))

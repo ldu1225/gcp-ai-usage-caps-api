@@ -16,14 +16,14 @@ class GovernanceFakeGcp(FakeGcp):
         self.org_policies: dict[str, dict] = {}       # "projects/p/policies/vertexai.allowedModels" -> policy
         self.publisher_models = {
             "google": [
-                {"name": "publishers/google/models/gemini-2.5-pro", "launchStage": "GA", "versionState": "VERSION_STATE_STABLE"},
-                {"name": "publishers/google/models/gemini-2.5-flash", "launchStage": "GA"},
-                {"name": "publishers/google/models/gemini-2.5-flash-lite", "launchStage": "GA"},
-                {"name": "publishers/google/models/gemini-3.0-pro-preview", "launchStage": "PUBLIC_PREVIEW"},
+                {"name": "publishers/google/models/gemini-test-pro", "launchStage": "GA", "versionState": "VERSION_STATE_STABLE"},
+                {"name": "publishers/google/models/gemini-test-flash", "launchStage": "GA"},
+                {"name": "publishers/google/models/gemini-test-flash-lite", "launchStage": "GA"},
+                {"name": "publishers/google/models/gemini-next-pro-preview", "launchStage": "PUBLIC_PREVIEW"},
             ],
             "anthropic": [
-                {"name": "publishers/anthropic/models/claude-sonnet-4-5", "launchStage": "GA"},
-                {"name": "publishers/anthropic/models/claude-haiku-4-5", "launchStage": "GA"},
+                {"name": "publishers/anthropic/models/claude-test-sonnet", "launchStage": "GA"},
+                {"name": "publishers/anthropic/models/claude-test-haiku", "launchStage": "GA"},
             ],
         }
         self.engines: dict[str, list[dict]] = {}      # project -> engines (location global)

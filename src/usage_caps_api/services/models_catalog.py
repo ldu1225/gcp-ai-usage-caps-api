@@ -1,10 +1,13 @@
-"""Model SKU parser, model ID normalizer, and billing export SQL clause helpers."""
+"""Cloud Billing Catalog SKU description parser and model ID normalizer.
+
+`FAMILIES` is only a bootstrap vocabulary of well-known model *family words* used to locate the model name inside a
+free-text SKU description. It is extended at runtime with every family observed in the live Model Garden catalog and
+in usage logs (`learn_families`), so SKUs of brand-new model families are parsed without code changes.
+"""
 
 from __future__ import annotations
 
 import re
-
-from ..schema import expr
 
 QUALIFIER_RE = re.compile(
     r"(?i)(?:<=|>=|=<|=>|<|>|\u2264|\u2265|up to|over|above|below)\s*\d+(?:\.\d+)?\s*[km]\b"
@@ -25,6 +28,8 @@ FAMILIES = {
     "gemini", "gemma", "medgemma", "claude", "llama", "mistral", "mixtral", "codestral",
     "ministral", "pixtral", "imagen", "veo", "chirp", "lyria", "jamba", "deepseek", "qwen", "gpt", "embedding",
 }
+_LEARNED_FAMILIES: set[str] = set()
+_KNOWN_MODELS: dict[tuple[str, ...], str] = {}   # word sequence -> normalized model key (live catalog + logs)
 NON_TOKEN_FAMILIES = frozenset({"imagen", "veo", "chirp", "lyria"})
 TIERS = {
     "pro", "flash", "lite", "ultra", "nano", "omni", "sonnet", "opus", "haiku", "instant",
@@ -53,16 +58,6 @@ GENERIC_WORDS = {
     "nvidia", "partner", "maas",
 }
 ACRONYMS = {"tts": "TTS", "hd": "HD", "gpt": "GPT", "oss": "OSS", "ai": "AI", "api": "API"}
-
-AI_SERVICE_RE = (
-    r"(?i)(vertex ai|agent platform|gemini|generative|text-to-speech|speech-to-text|"
-    r"cloud speech|anthropic|claude|model garden|llama|mistral|ai platform)"
-)
-AI_SKU_RE = r"(?i)(gemini|claude|llama|mistral|gemma|imagen|veo|chirp|lyria|token)"
-INFRA_SKU_RE = (
-    r"(?i)(data index|reasoningengine|reasoning engine|agent engine|vertex ai search|vcpu|memory|"
-    r"storage|training|endpoint|node hour)"
-)
 
 
 def _base_id(model_id: str) -> str:
@@ -105,6 +100,47 @@ def display_from_key(key: str) -> str:
         else:
             words.append(part[:1].upper() + part[1:])
     return " ".join(words)
+
+
+def families() -> set[str]:
+    return FAMILIES | _LEARNED_FAMILIES
+
+
+def learn_families(model_ids) -> int:
+    """Adds the leading word of each model id (e.g. `newbrand` from `newbrand-2-ultra`) to the SKU parser."""
+    added = 0
+    for mid in model_ids or ():
+        head = re.split(r"[-_.@/]", str(mid or "").strip().lower().rsplit("/", 1)[-1], 1)[0]
+        if head and head.isalpha() and 2 < len(head) <= 24 and head not in STOP_WORDS and head not in GENERIC_WORDS \
+                and head not in SKIP_WORDS and head not in families():
+            _LEARNED_FAMILIES.add(head)
+            added += 1
+    return added
+
+
+def learn_models(model_ids) -> int:
+    """Registers concrete model ids (Model Garden + observed in logs) so SKU descriptions that spell the model name
+    without a version number or known tier word are still matched (e.g. a brand-new naming scheme)."""
+    added = learn_families(model_ids)
+    for mid in model_ids or ():
+        key = normalize_model_id(str(mid or ""))
+        words = tuple(w for w in key.split("-") if w)
+        if len(words) >= 2 and words not in _KNOWN_MODELS:
+            _KNOWN_MODELS[words] = key
+            added += 1
+    return added
+
+
+def _known_model(low: list[str]):
+    """Longest known model whose words appear contiguously in the SKU words -> (key, start_index)."""
+    best = None
+    for words, key in _KNOWN_MODELS.items():
+        n = len(words)
+        for i in range(0, len(low) - n + 1):
+            if tuple(low[i:i + n]) == words and (best is None or n > len(best[2])):
+                best = (key, i, words)
+                break
+    return (best[0], best[1]) if best else None
 
 
 def _model_words(low: list[str], i: int, for_form: bool):
@@ -151,17 +187,44 @@ def is_model_service(service: str) -> bool:
 
 
 def parse_sku(description: str, service: str | None = None) -> dict | None:
-    """Identifies the AI model behind a Cloud Billing SKU description."""
+    """Identifies the AI model behind a Cloud Billing SKU description.
+
+    The vocabulary-based parser runs first; when it cannot find a model (e.g. a new naming scheme without a version
+    number) the description is matched against model ids learned from the live catalog and usage logs. A learned
+    match is only accepted when the next word ends the model name, so `<x> flash lite` never maps to `<x>-flash`."""
+    out = _parse_standard(description, service)
+    if out is not None or not _KNOWN_MODELS or not isinstance(description, str):
+        return out
+    text = FOOTNOTE_RE.sub(" ", QUALIFIER_RE.sub(" ", description))
+    original = [w.strip(".") for w in WORD_SPLIT_RE.split(PAREN_RE.sub(" ", text)) if w.strip(".")]
+    low = [w.lower() for w in original]
+    known = _known_model(low)
+    if known is None:
+        return None
+    key, idx = known
+    end = idx + len(key.split("-"))
+    nxt = low[end] if end < len(low) else None
+    if nxt is not None and nxt not in STOP_WORDS and nxt not in GENERIC_WORDS and nxt not in SKIP_WORDS and (
+            nxt in TIERS or DIGIT_RE.search(nxt) or nxt in families()):
+        return None   # looks like the model name continues (e.g. "<x> flash lite" / "<x> pro 2") -> not this model
+    product = [original[j] for j in range(idx) if low[j] not in GENERIC_WORDS and low[j] not in SKIP_WORDS
+               and low[j] not in STOP_WORDS and low[j] not in families() and not DIGIT_RE.search(low[j])]
+    return {"key": key, "name": display_from_key(key), "product": " ".join(product) if product else None}
+
+
+def _parse_standard(description: str, service: str | None = None) -> dict | None:
     if not description or not isinstance(description, str):
         return None
     text = FOOTNOTE_RE.sub(" ", QUALIFIER_RE.sub(" ", description))
     parens = PAREN_RE.findall(text)
     original = [w.strip(".") for w in WORD_SPLIT_RE.split(PAREN_RE.sub(" ", text)) if w.strip(".")]
     low = [w.lower() for w in original]
+
     for_form = False
     product, brand_family, model, model_idx = [], None, None, len(low)
+    fams = families()
     for i, word in enumerate(low):
-        if word in FAMILIES:
+        if word in fams:
             model = _model_words(low, i, for_form)
             if model:
                 model_idx = i
@@ -182,7 +245,7 @@ def parse_sku(description: str, service: str | None = None) -> dict | None:
         for group in parens:
             gl = [w.lower().strip(".") for w in WORD_SPLIT_RE.split(group or "") if w.strip(".")]
             for idx, w in enumerate(gl):
-                if w in FAMILIES:
+                if w in fams:
                     model = _model_words(gl, idx, False)
                     if model:
                         break
@@ -221,32 +284,3 @@ def classify_measure(description: str, unit: str | None = None, pricing_unit: st
     if "input" in low or "prompt" in low:
         return "input_tokens"
     return "other"
-
-
-def billing_fields(src, alias: str = "b") -> dict:
-    s = src.schema
-    return {
-        "sku": expr(alias, s, "sku.description", cast="STRING"),
-        "service": expr(alias, s, "service.description", cast="STRING"),
-        "amount": expr(alias, s, "usage.amount", cast="FLOAT64"),
-        "unit": expr(alias, s, "usage.unit", cast="STRING"),
-        "pricing_unit": expr(alias, s, "usage.pricing_unit", cast="STRING"),
-        "cost": expr(alias, s, "cost", cast="FLOAT64"),
-        "currency": expr(alias, s, "currency", cast="STRING"),
-        "project": expr(alias, s, "project.id", cast="STRING"),
-        "ts": "%s.`usage_start_time`" % alias,
-    }
-
-
-def excluded_clause(f: dict) -> str:
-    sku = "LOWER(IFNULL(%s, ''))" % f["sku"]
-    svc = "LOWER(IFNULL(%s, ''))" % (f["service"] or "''")
-    return ("NOT EXISTS (SELECT 1 FROM UNNEST(@excluded) AS p WHERE STRPOS(%s, p) > 0 OR STRPOS(%s, p) > 0)"
-            % (sku, svc))
-
-
-def ai_clause(f: dict) -> str:
-    svc = "IFNULL(%s, '')" % (f["service"] or "''")
-    sku = "IFNULL(%s, '')" % f["sku"]
-    return ("(REGEXP_CONTAINS(%s, r'%s') OR REGEXP_CONTAINS(%s, r'%s')) AND NOT REGEXP_CONTAINS(%s, r'%s')"
-            % (svc, AI_SERVICE_RE, sku, AI_SKU_RE, sku, INFRA_SKU_RE))

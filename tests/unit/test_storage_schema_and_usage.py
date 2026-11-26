@@ -109,13 +109,13 @@ class StorageSchemaAndUsageTests(unittest.TestCase):
         now = dt.datetime.now(dt.timezone.utc)
         fake_gcp.query_handlers.append((
             lambda sql, params, mod: "businessaicode_googleapis_com_inference_response" in sql,
-            [{"email": "dana@company.com", "model": "gemini-2.5-pro", "project": "test-ai-project",
+            [{"email": "dana@company.com", "model": "gemini-test-pro", "project": "test-ai-project",
               "requests": 5, "tokens": 500_000, "prompt_tokens": 300_000, "candidate_tokens": 200_000,
               "cached_tokens": 50_000, "principal": "user:dana@company.com", "last_ts": now}],
         ))
         fake_gcp.query_handlers.append((
             lambda sql, params, mod: "aiplatform.googleapis.com" in sql,
-            [{"email": "dana@company.com", "model": "gemini-2.5-flash", "project": "test-ai-project",
+            [{"email": "dana@company.com", "model": "gemini-test-flash", "project": "test-ai-project",
               "requests": 12, "last_ts": now}],
         ))
         fake_gcp.query_handlers.append((

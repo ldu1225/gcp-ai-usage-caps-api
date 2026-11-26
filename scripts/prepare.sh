@@ -7,6 +7,9 @@
 #   3. a Log Router sink in EVERY project (or one folder/org aggregated sink) routing AI logs to that dataset; each
 #      writer identity gets BigQuery Data Editor on the destination dataset only
 #   4. optional Vertex AI Data Access audit logs (--enable-data-access-logs), merged without clobbering auditConfigs
+#   5. Vertex AI inference request metadata logging (per-request Vertex AI token counts) on every project via the
+#      v1beta1 setPublisherModelConfig REST call (default on; --no-vertex-inference-logging or
+#      ENABLE_VERTEX_INFERENCE_LOGGING=false to skip). Already-enabled projects are skipped; 409 is tolerated.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -82,6 +85,26 @@ if [[ "$ENABLE_DATA_ACCESS_LOGS" == "1" ]]; then
   done
 else
   info "unchanged (pass --enable-data-access-logs to merge DATA_READ/DATA_WRITE for aiplatform.googleapis.com)"
+fi
+
+log "5. Vertex AI inference request metadata logging (aiplatform.googleapis.com/inference_request -> setPublisherModelConfig)"
+if [[ "$ENABLE_VERTEX_INFERENCE_LOGGING" == "true" ]]; then
+  vertex_logging_cost_note
+  for pid in "${ALL_ARR[@]}"; do
+    if _csv_has "${PREFLIGHT_VERTEX_LOGGING_ENABLED:-}" "$pid"; then
+      info "${pid}: already ENABLED (preflight)"
+      continue
+    fi
+    if _csv_has "${PREFLIGHT_VERTEX_LOGGING_NA:-}" "$pid"; then
+      info "${pid}: aiplatform.googleapis.com not enabled (Vertex AI unused); skipped"
+      continue
+    fi
+    _csv_has "${PREFLIGHT_VERTEX_LOGGING_DISABLED:-}" "$pid" && info "${pid}: disabled according to preflight; enabling"
+    enable_vertex_inference_logging "$pid"
+  done
+else
+  info "skipped (ENABLE_VERTEX_INFERENCE_LOGGING=false): Vertex AI token usage, cost and caps are NOT measured."
+  info "Enable later per project: POST /v1/projects/{project}/vertex-logging/enable (or POST /v1/vertex-logging/enable)"
 fi
 
 echo ""

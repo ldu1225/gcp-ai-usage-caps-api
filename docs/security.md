@@ -99,15 +99,15 @@ flowchart TD
 
 | 스코프 | 대표 엔드포인트 |
 |---|---|
-| `usage:read` | `GET /v1/usage/users`, `/v1/usage/users/{email}`, `/v1/billing/users`, `/v1/usage/models`(또는 `models:read`) |
+| `usage:read` | `GET /v1/usage/users`, `/v1/usage/users/{email}`, `/v1/users/{email}/projects`, `/v1/billing/users`, `/v1/usage/models`(또는 `models:read`), `/v1/pricing`(또는 `models:read`), `/v1/projects/{id}/vertex-logging`(또는 `admin`) |
 | `caps:read` | `GET /v1/caps/policy`, `/v1/caps/users`, `/v1/caps/projects`, `/v1/audit-logs`(또는 `admin`), `/v1/operations` |
 | `caps:write` | `PUT /v1/caps/policy`, `PUT/DELETE /v1/caps/users/{email}`, `POST /v1/caps/enforce`, `PUT /v1/caps/projects/{id}`, `POST /v1/caps/projects/{id}/lift` |
-| `users:write` | `POST /v1/users/{email}/block`, `/unblock` |
+| `users:write` | `POST /v1/users/{email}/block`, `/unblock` (선택 `projects`) |
 | `models:read` | `GET /v1/models…`, `/v1/model-access…`, `/v1/gemini-enterprise/apps…`, `/v1/antigravity/models`, `/v1/model-rules…`, `/v1/model-violations`, 정책 미리보기 |
 | `models:write` | `POST /v1/models/sync`, `PUT/DELETE /v1/model-access/{scope_type}/{scope_id}`, `bulk-apply`, `reconcile`, GE 앱 모델 변경, 모델 규칙 쓰기·평가 |
 | `quotas:read` | `GET /v1/rate-limits…`, `/v1/projects/{id}/rate-limits…`, `/v1/quota-requests…` |
 | `quotas:write` | `PATCH /v1/projects/{id}/rate-limits/{limit_id}`, `POST /v1/quota-requests`, `/cancel`, 사용자 레이트 리밋 쓰기 |
-| `admin` | 위 모든 스코프 포함 + `/v1/admin/api-keys`, `/v1/admin/webhooks`, `/v1/admin/readiness` |
+| `admin` | 위 모든 스코프 포함 + `/v1/admin/api-keys`, `/v1/admin/webhooks`, `/v1/admin/readiness`, `POST /v1/projects/{id}/vertex-logging/enable`, `POST /v1/vertex-logging/enable` |
 | `internal:pubsub` (OIDC 전용, 키에 부여 불가) | `POST /v1/internal/usage-event`, `/v1/internal/pricing/sync` (또는 `admin`) — 런타임 SA와 `auth.oidc_internal_service_accounts`만 보유 |
 
 키 발급 시 업무별로 최소 스코프만 부여하세요. 예: 사용량 대시보드 `usage:read`, 사내 포털 `usage:read,caps:read,
@@ -120,7 +120,7 @@ caps:write,users:write`, 모델 관리 도구 `models:read,models:write`.
 
 | 주체 | 핵심 권한 | 의도적으로 **없는** 권한 |
 |---|---|---|
-| 런타임 SA `ai-usage-caps-api` | 로그·BigQuery 읽기(`logging.viewer`, `privateLogViewer`, `bigquery.dataViewer`, `jobUser`), 감사 로그 쓰기(`logging.logWriter`), 쿼터(`cloudquotas.admin`), GE 앱(`discoveryengine.editor`), 조직 `iam.denyReviewer`(읽기만), 조직 `orgpolicy.policyAdmin`(모델 거버넌스) | IAM Deny 정책 쓰기(`iam.denyAdmin`), 프로젝트 IAM 변경, SA 키 |
+| 런타임 SA `ai-usage-caps-api` | 로그·BigQuery 읽기(`logging.viewer`, `privateLogViewer`, `bigquery.dataViewer`, `jobUser`), 감사 로그 쓰기(`logging.logWriter`), 쿼터(`cloudquotas.admin`), GE 앱(`discoveryengine.editor`), 조직 `iam.denyReviewer`(읽기만), 조직 `orgpolicy.policyAdmin`(모델 거버넌스), 1권한 커스텀 역할 `gcpAiCapsVertexLoggingReader`(`aiplatform.endpoints.fetchPublisherModelConfig`) | IAM Deny 정책 쓰기(`iam.denyAdmin`), 프로젝트 IAM 변경, SA 키, **결제 계정·Billing Export 데이터 읽기**(단가는 공개 Cloud Billing Catalog API), Vertex AI 로그 설정 쓰기(`setPublisherModelConfig` — 필요 시 별도 부여) |
 | 집행 SA `ai-usage-caps-enforcer` | 조직 `iam.denyAdmin`, 로그·BigQuery 읽기 | 조직 정책 쓰기, 쿼터, Discovery Engine |
 | 싱크 writer identity | 감사 **데이터세트에만** WRITER, 허브 토픽에만 publisher | 프로젝트 수준 BigQuery 권한 |
 | Pub/Sub 서비스 에이전트 | 런타임 SA에 대한 `iam.serviceAccountTokenCreator`(푸시 OIDC) | — |
@@ -138,7 +138,9 @@ caps:write,users:write`, 모델 관리 도구 `models:read,models:write`.
 
 | 데이터 | 출처 | 저장 위치 |
 |---|---|---|
-| 사용자 주체(이메일/워크포스 주체), 모델 ID, 서피스, 요청 수, 토큰 수(`promptTokenCount`, `candidatesTokenCount`, 캐시 토큰 등), 타임스탬프, 추정 비용 | Cloud Logging / BigQuery 로그의 **메타데이터 필드** | 응답 시 계산. 정지·위반 기록(사용량 수치 포함)은 `user_caps.json`, `user_model_rules.json` |
+| 사용자 주체(이메일/워크포스 주체), 모델 ID, 서피스, 요청 수, 토큰 수(`promptTokenCount`, `candidatesTokenCount`, 캐시 토큰 등), 트래픽 유형, 타임스탬프, 추정 비용 | Cloud Logging / BigQuery 로그의 **메타데이터 필드** (Vertex AI는 추론 요청 메타데이터 로그 `usageMetadata`·`trafficType`·커스텀 헤더 라벨) | 응답 시 계산. 정지·위반 기록(사용량 수치 포함)은 `user_caps.json`, `user_model_rules.json` |
+| `uid` → 사용자 매핑 (헤더 라벨에 이메일 대신 `uid`를 보낼 때 해석용) | 사용량·캡 규칙에서 관측된 사용자 | `user_directory.json` |
+| 공식 SKU 단가·환율 | 공개 Cloud Billing Catalog API | `pricing.json` |
 | 캡 정책, 차단/해제, 모델 정책 의도, 쿼터 요청, 작업 | API 호출 | GCS 상태 버킷 |
 | API 키 해시, 웹훅 구독(URL, **서명 시크릿**) | 관리 API | `api_keys.json`, `webhooks.json` |
 | 감사 이벤트(행위자, 대상, 세부) | 모든 변경 작업 | Cloud Logging + `audit_local.json`(최근 2,000건) |
@@ -146,15 +148,21 @@ caps:write,users:write`, 모델 관리 도구 `models:read,models:write`.
 > [!IMPORTANT]
 > 제품 코드는 **프롬프트·응답 본문을 읽거나 저장하지 않습니다**. 사용량 파서는 `usageMetadata`의 토큰 수와 모델·주체
 > 같은 메타데이터만 추출합니다(`services/usage.py`, `services/usage_events.py`). 실시간 푸시 메시지도 처리 후 저장하지
-> 않으며 메모리 트래커에만 잠시 유지됩니다.
+> 않으며 메모리 트래커에만 잠시 유지됩니다. Vertex AI 추론 요청 **메타데이터** 로그는 요청/응답 본문을 기록하지 않습니다.
+> 결제 계정 데이터(Billing Export)는 읽지 않습니다.
+
+> [!NOTE]
+> 포털이 보내는 헤더 `x-goog-agent-platform-observability-label-user`의 값은 고객 프로젝트의 Cloud Logging에 기록됩니다.
+> 이메일 노출을 줄이려면 이 API가 반환하는 가명 `uid`(16자리 해시)를 값으로 보내세요(이 API가 이미 아는 사용자만 해석됨).
 
 ### 4.2 고객 환경에 남는 것 (제품 외부)
 
 - Log Router 싱크(`<service>-ai-logs`)는 필터에 맞는 **로그 항목 전체**를 감사 BigQuery 데이터세트로 복사합니다.
   어떤 필드가 포함되는지는 Google 로그 스키마에 따릅니다(예: `discoveryengine.googleapis.com/gen_ai_user_message`,
-  `cloudaudit.googleapis.com/data_access`). 이 데이터세트는 민감 데이터로 취급하고 접근을 제한하세요(런타임/집행 SA는
-  `bigquery.dataViewer`만 보유).
-- Pub/Sub 토픽에는 Antigravity `inference_response` 로그 항목이 흐릅니다. Terraform 구독은 메시지 보존 600초입니다.
+  `cloudaudit.googleapis.com/data_access`, `aiplatform.googleapis.com/inference_request`). 이 데이터세트는 민감 데이터로
+  취급하고 접근을 제한하세요(런타임/집행 SA는 `bigquery.dataViewer`만 보유).
+- Pub/Sub 토픽에는 Antigravity `inference_response`와 Vertex AI `inference_request` 로그 항목이 흐릅니다. Terraform 구독은 메시지 보존 600초입니다.
+- Vertex AI 추론 요청 메타데이터 로깅은 teardown 후에도 켜진 상태로 남습니다(Cloud Logging 요금 지속 — 필요 시 프로젝트별로 끄기).
 - Enforcer Job 표준 출력 요약은 이메일을 `<email>`로 치환합니다.
 
 ## 5. 감사 로깅

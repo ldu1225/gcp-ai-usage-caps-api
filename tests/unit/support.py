@@ -6,6 +6,7 @@ import copy
 import datetime as dt
 import json
 import os
+import re
 import sys
 import threading
 import urllib.error
@@ -51,7 +52,11 @@ class FakeGcp:
         if "logging.googleapis.com/v2/entries:write" in url:
             return {}, {}
         if "logging.googleapis.com/v2/entries:list" in url:
-            return {"entries": copy.deepcopy(self.log_entries)}, {}
+            flt = str((json_body or {}).get("filter") or "")
+            m = re.search(r'logName="([^"]+)"', flt)
+            want = m.group(1) if m else None
+            out = [e for e in self.log_entries if want is None or e.get("logName") == want]
+            return {"entries": copy.deepcopy(out)}, {}
 
         # Default IAM Deny v2 in-memory simulation
         if "iam.googleapis.com/v2/policies/" in url and "/denypolicies" in url:
@@ -164,13 +169,13 @@ def make_test_config(**overrides) -> dict:
     cfg["caps"]["usage_source"] = "logging"
     cfg["pricing"]["source"] = "manual"
     cfg["pricing"]["model_overrides"] = [
-        {"model": "gemini-2.5-pro", "input": 1.25, "output": 10.0, "cached": 0.3125},
-        {"model": "claude-sonnet-4.5", "input": 3.0, "output": 15.0, "cached": 0.3},
+        {"model": "gemini-test-pro", "input": 1.25, "output": 10.0, "cached": 0.3125},
+        {"model": "claude-test-sonnet", "input": 3.0, "output": 15.0, "cached": 0.3},
     ]
     return config.finalize(config.deep_merge(cfg, overrides))
 
 
-def make_inference_entry(email: str, *, project: str = "test-ai-project", model: str = "gemini-2.5-pro",
+def make_inference_entry(email: str, *, project: str = "test-ai-project", model: str = "gemini-test-pro",
                          prompt: int = 100_000, cand: int = 20_000, cached: int = 0, total: int | None = None,
                          ts: dt.datetime | None = None, insert_id: str | None = None) -> dict:
     when = (ts or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -191,6 +196,58 @@ def make_inference_entry(email: str, *, project: str = "test-ai-project", model:
     if insert_id:
         entry["insertId"] = insert_id
     return entry
+
+
+def make_vertex_entry(*, project: str = "test-ai-project", model: str = "gemini-test-pro", publisher: str = "google",
+                      prompt: int = 1000, cand: int = 500, cached: int = 0, thoughts: int = 0, user: str | None = None,
+                      traffic: str = "ON_DEMAND", ts: dt.datetime | None = None, insert_id: str | None = None,
+                      claude: dict | None = None, principal: str | None = None, error: bool = False) -> dict:
+    """Vertex AI inference request metadata log entry (aiplatform.googleapis.com/inference_request)."""
+    when = (ts or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload: dict = {"method": "GENERATE_CONTENT", "requestStartTime": when, "requestDuration": "1.2s"}
+    if not error:
+        payload["trafficType"] = traffic
+        if claude is not None:
+            payload["method"] = "RAW_PREDICT"
+            payload["rawPredictDetails"] = {"usageMetadata": claude}
+        else:
+            payload["generateContentDetails"] = {"usageMetadata": {
+                "promptTokenCount": prompt, "candidatesTokenCount": cand, "cachedContentTokenCount": cached,
+                "thoughtsTokenCount": thoughts, "totalTokenCount": prompt + cand + thoughts}}
+    else:
+        payload["error"] = {"code": 8, "message": "quota"}
+    if user:
+        payload["httpHeaders"] = {"x-goog-agent-platform-observability-label-user": {"values": [user]}}
+    if principal:
+        payload["principal"] = {"email": principal}
+    entry = {
+        "logName": "projects/%s/logs/aiplatform.googleapis.com%%2Finference_request" % project,
+        "timestamp": when,
+        "severity": "ERROR" if error else "INFO",
+        "resource": {"type": "aiplatform.googleapis.com/PublisherModel", "labels": {
+            "resource_container": project, "location": "global", "publisher": publisher, "model_user_id": model}},
+        "labels": {"gen_ai.operation.name": "generate_content"},
+        "jsonPayload": payload,
+    }
+    if insert_id:
+        entry["insertId"] = insert_id
+    return entry
+
+
+def make_audit_entry(email: str, *, project: str = "test-ai-project", model: str = "gemini-test-pro",
+                     publisher: str = "google", ts: dt.datetime | None = None) -> dict:
+    """Cloud Audit Data Access entry for a Vertex AI model call (principalEmail = human caller)."""
+    when = (ts or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "logName": "projects/%s/logs/cloudaudit.googleapis.com%%2Fdata_access" % project,
+        "timestamp": when,
+        "protoPayload": {
+            "serviceName": "aiplatform.googleapis.com",
+            "methodName": "google.cloud.aiplatform.v1.PredictionService.GenerateContent",
+            "resourceName": "projects/%s/locations/global/publishers/%s/models/%s" % (project, publisher, model),
+            "authenticationInfo": {"principalEmail": email},
+        },
+    }
 
 
 class LiveTestServer:

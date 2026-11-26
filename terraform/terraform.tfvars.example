@@ -30,7 +30,15 @@ vpc_network                 = ""
 vpc_subnet                  = ""
 vpc_egress                  = "all-traffic"
 
-# Optional billing export & project hard spend caps
+# Vertex AI inference request metadata logging (aiplatform.googleapis.com/inference_request = Vertex AI token source).
+# No native Terraform resource exists (hashicorp/terraform-provider-google#30642): a local-exec curl calls the v1beta1
+# setPublisherModelConfig method per project (needs bash + curl). Cloud Logging ingestion/storage pricing applies.
+enable_vertex_inference_logging   = true
+vertex_logging_endpoint           = "https://aiplatform.googleapis.com/v1beta1"
+create_vertex_logging_reader_role = true
+
+# Project hard spend caps (costs come from log token counts x official Cloud Billing Catalog SKU prices;
+# no Cloud Billing export is needed)
 billing_account_id = ""
 spend_caps_enabled = false
 
@@ -42,3 +50,10 @@ model_violation_action = "block_service"
 quota_contact_email    = ""
 workspace_timezone     = "Asia/Seoul"
 cap_currency           = "USD"
+pricing_sync_schedule  = "0 3 * * *"
+
+# Optional runtime settings (empty = application defaults)
+cap_scope                   = "" # total | per_project
+vertex_user_header_label    = ""
+metered_surfaces            = []
+model_violation_block_scope = "" # project | all

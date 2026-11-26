@@ -14,7 +14,7 @@ from .httpkit import ApiError, BaseHandler, Router, Server, now_iso, parse_json_
 from .schema import SchemaRegistry
 from .services import (audit, base as svc_base, caps, chargeback, model_access, model_registry, operations,
                        pricing_sync, quotas, readiness, spend_caps, surface_models, usage, usage_events,
-                       user_model_rules, webhooks)
+                       user_model_rules, vertex_logging, webhooks)
 from .store import make_doc_store
 
 LOG = logging.getLogger("usage_caps_api.app")
@@ -129,6 +129,8 @@ ROUTER.route("POST", "/v1/caps/enforce", scope="caps:write", rate="enforce")(cap
 
 ROUTER.route("POST", "/v1/users/{email}/block", scope="users:write", rate="write")(caps.block_user)
 ROUTER.route("POST", "/v1/users/{email}/unblock", scope="users:write", rate="write")(caps.unblock_user)
+ROUTER.route("GET", "/v1/users/{email}/projects", scope="usage:read", range=True,
+             rate="general")(usage.get_user_projects)
 
 ROUTER.route("GET", "/v1/caps/projects", scope="caps:read", rate="general")(spend_caps.list_project_caps)
 ROUTER.route("PUT", "/v1/caps/projects/{project_id}", scope="caps:write", rate="write")(spend_caps.put_project_cap)
@@ -138,6 +140,12 @@ ROUTER.route("GET", "/v1/audit-logs", scope=("caps:read", "admin"), rate="genera
 
 ROUTER.route("POST", "/v1/internal/usage-event", scope=(auth.INTERNAL_SCOPE, "admin"), rate="usage_event")(usage_events.handle_usage_event)
 ROUTER.route("POST", "/v1/internal/pricing/sync", scope=(auth.INTERNAL_SCOPE, "admin"), rate="enforce")(pricing_sync.sync_pricing)
+ROUTER.route("GET", "/v1/pricing", scope=("usage:read", "models:read"), rate="general")(pricing_sync.get_pricing)
+ROUTER.route("GET", "/v1/projects/{project_id}/vertex-logging", scope=("usage:read", "admin"),
+             rate="general")(vertex_logging.get_handler)
+ROUTER.route("POST", "/v1/projects/{project_id}/vertex-logging/enable", scope="admin",
+             rate="write")(vertex_logging.enable_handler)
+ROUTER.route("POST", "/v1/vertex-logging/enable", scope="admin", rate="enforce")(vertex_logging.bulk_enable_handler)
 
 ROUTER.route("GET", "/v1/admin/api-keys", scope="admin", rate="general")(_admin_list_keys)
 ROUTER.route("POST", "/v1/admin/api-keys", scope="admin", rate="write")(_admin_create_key)

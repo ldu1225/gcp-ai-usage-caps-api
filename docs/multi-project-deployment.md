@@ -3,12 +3,14 @@
 > **English summary** — One **hub** project hosts the Cloud Run API, the Enforcer Job, the GCS state bucket, the
 > Pub/Sub real-time topic and Cloud Scheduler, and governs any number of **managed (spoke)** projects. Every managed
 > project gets a Log Router sink into one central BigQuery dataset (default) and a Pub/Sub sink into the single hub
-> topic, plus least-privilege grants for the runtime and enforcer service accounts. IAM Deny Admin/Reviewer and
-> Organization Policy Administrator are **organization-level-only** roles required for per-user IAM Deny enforcement and
-> model-governance writes. Scope can be an explicit list (`--managed-projects`), a folder/organization
-> (`--scope-type`/`--scope-ids`, optionally with one `--aggregated-sink`). Install with the one-click `install.sh`,
-> `prepare.sh` + `deploy.sh`, or Terraform (including the `terraform state mv` migration from v1.0 `count` resources to
-> `for_each`). Teardown keeps data and deny policies.
+> topic (Antigravity `inference_response` + Vertex AI `inference_request`), Vertex AI inference request logging, plus
+> least-privilege grants for the runtime and enforcer service accounts. Users ↔ projects are **N:M**: usage is
+> measured per (user, project) and caps can be total or per project, so an over-cap in one project suspends the user
+> only there. IAM Deny Admin/Reviewer and Organization Policy Administrator are **organization-level-only** roles
+> required for per-user IAM Deny enforcement and model-governance writes. No Cloud Billing export is needed. Scope can
+> be an explicit list (`--managed-projects`), a folder/organization (`--scope-type`/`--scope-ids`, optionally with one
+> `--aggregated-sink`). Install with the one-click `install.sh`, `prepare.sh` + `deploy.sh`, or Terraform (including
+> the `terraform state mv` migration from v1.0 `count` resources to `for_each`). Teardown keeps data and deny policies.
 
 ---
 
@@ -24,6 +26,7 @@
 8. [설치 경로 C — Terraform](#8-설치-경로-c--terraform)
 9. [나중에 관리 프로젝트 추가하기](#9-나중에-관리-프로젝트-추가하기)
 10. [제거 (Teardown)](#10-제거-teardown)
+11. [사용자 ↔ 프로젝트 N:M · 프로젝트별 캡](#11-사용자--프로젝트-nm--프로젝트별-캡)
 
 ---
 
@@ -73,8 +76,8 @@ Secret Manager 부트스트랩 키, 중앙 BigQuery 데이터세트(기본), Pub
 flowchart LR
     subgraph A["관리 프로젝트 team-a"]
         LA["Cloud Logging"]
-        SA1["싱크 SERVICE-ai-logs (AI 로그 4종)"]
-        SA2["싱크 SERVICE-usage-events (inference_response)"]
+        SA1["싱크 SERVICE-ai-logs (AI 로그 5종)"]
+        SA2["싱크 SERVICE-usage-events (inference_response · inference_request)"]
     end
     subgraph B["관리 프로젝트 team-b"]
         LB["Cloud Logging"]
@@ -96,10 +99,13 @@ flowchart LR
 
 | 싱크 | 필터 | 목적지 | writer identity 권한 |
 |---|---|---|---|
-| `<service>-ai-logs` | `log_id("businessaicode.googleapis.com/inference_response") OR (log_id("cloudaudit.googleapis.com/data_access") AND protoPayload.serviceName="aiplatform.googleapis.com") OR log_id("discoveryengine.googleapis.com/gemini_enterprise_user_activity") OR log_id("discoveryengine.googleapis.com/gen_ai_user_message")` | `bigquery.googleapis.com/projects/<감사 프로젝트>/datasets/<데이터세트>` (`--use-partitioned-tables`) | 해당 **데이터세트에만** WRITER(`roles/bigquery.dataEditor`) — 프로젝트 IAM은 건드리지 않음 |
-| `<service>-usage-events` | `log_id("businessaicode.googleapis.com/inference_response")` | `pubsub.googleapis.com/projects/<HUB>/topics/<service>-usage-events` | 허브 토픽에 `roles/pubsub.publisher` |
+| `<service>-ai-logs` | `log_id("businessaicode.googleapis.com/inference_response") OR log_id("aiplatform.googleapis.com/inference_request") OR (log_id("cloudaudit.googleapis.com/data_access") AND protoPayload.serviceName="aiplatform.googleapis.com") OR log_id("discoveryengine.googleapis.com/gemini_enterprise_user_activity") OR log_id("discoveryengine.googleapis.com/gen_ai_user_message")` | `bigquery.googleapis.com/projects/<감사 프로젝트>/datasets/<데이터세트>` (`--use-partitioned-tables`) | 해당 **데이터세트에만** WRITER(`roles/bigquery.dataEditor`) — 프로젝트 IAM은 건드리지 않음 |
+| `<service>-usage-events` | `log_id("businessaicode.googleapis.com/inference_response") OR log_id("aiplatform.googleapis.com/inference_request")` | `pubsub.googleapis.com/projects/<HUB>/topics/<service>-usage-events` | 허브 토픽에 `roles/pubsub.publisher` |
 
-- 실시간 경로: Antigravity 추론 로그 → 각 프로젝트 Pub/Sub 싱크 → **하나의** 허브 토픽 → 푸시 구독(OIDC, 런타임 SA
+> [!NOTE]
+> `aiplatform.googleapis.com/inference_request`는 Vertex AI 토큰 수의 유일한 로그 출처이며, 프로젝트마다 **추론 요청 메타데이터 로깅**을 켜야 생성됩니다(`prepare.sh` 5단계 / Terraform `enable_vertex_inference_logging`, 기본 켜짐). 1.1 이하에서 만든 싱크를 채택(`--reuse-sinks`)했다면 필터에 이 로그를 추가하세요. 결제 내보내기(Billing Export) 싱크·데이터세트는 필요 없습니다.
+
+- 실시간 경로: Antigravity 추론 로그와 Vertex AI 추론 요청 로그 → 각 프로젝트 Pub/Sub 싱크 → **하나의** 허브 토픽 → 푸시 구독(OIDC, 런타임 SA
   서명) → `POST /v1/internal/usage-event`. Pub/Sub 서비스 에이전트
   (`service-<허브 번호>@gcp-sa-pubsub.iam.gserviceaccount.com`)에 런타임 SA의 `roles/iam.serviceAccountTokenCreator`가
   부여됩니다.
@@ -119,6 +125,7 @@ flowchart LR
 | 허브 프로젝트 | `roles/browser`, `roles/bigquery.dataViewer`, `roles/bigquery.jobUser`, `roles/logging.viewer`, `roles/logging.privateLogViewer`, `roles/logging.logWriter`, `roles/serviceusage.serviceUsageConsumer`, `roles/monitoring.viewer`, `roles/cloudquotas.admin`, `roles/discoveryengine.editor` | 사용량 쿼리, 감사 로그 기록, 쿼터·GE 앱 관리 |
 | 관리 프로젝트 (각각) | `roles/browser`, `roles/logging.viewer`, `roles/logging.privateLogViewer`, `roles/monitoring.viewer`, `roles/cloudquotas.admin`, `roles/discoveryengine.editor`, `roles/serviceusage.serviceUsageConsumer` (+ 프로젝트별 데이터세트 모드면 `roles/bigquery.dataViewer`) | 로그·쿼터·GE 앱 |
 | 중앙 감사 프로젝트(허브가 아닐 때) | `roles/bigquery.dataViewer` | 중앙 데이터세트 읽기 |
+| 허브 + 관리 프로젝트 (각각) | 커스텀 역할 `gcpAiCapsVertexLoggingReader` (1권한: `aiplatform.endpoints.fetchPublisherModelConfig`) | Vertex AI 추론 요청 로그 상태 조회(`GET /v1/projects/{id}/vertex-logging`, 사전점검). API로 **활성화**하려면 `aiplatform.endpoints.setPublisherModelConfig`를 별도로 부여 |
 | GCS 상태 버킷 | `roles/storage.objectAdmin` | 상태 문서 읽기/쓰기 |
 | 부트스트랩 시크릿 | `roles/secretmanager.secretAccessor` (`deploy.sh`) | `BOOTSTRAP_ADMIN_KEY` |
 | Cloud Run 서비스 | `roles/run.invoker` | 푸시 구독/스케줄러 OIDC 호출 |
@@ -270,17 +277,25 @@ scripts/install.sh --project HUB_PROJECT --managed-projects PROJECT_B \
 | `--worker-pool projects/P/locations/R/workerPools/W` / `--image IMAGE` | Cloud Build 전용 풀 / 사전 빌드 이미지 |
 | `--quota-contact-email EMAIL` | 쿼터 증설 요청 연락처 |
 | `--model-violation-action ACT` | 기본 `block_service` |
+| `--no-vertex-inference-logging` | (prepare/install) Vertex AI 추론 요청 로그 활성화 생략 (`ENABLE_VERTEX_INFERENCE_LOGGING=false`). 생략하면 Vertex AI 토큰·비용·캡을 측정할 수 없음 |
+| `--enforcement-backend iam_deny\|notify_only` | 집행 백엔드 (`ENFORCEMENT_BACKEND`) |
+| `--cap-scope total\|per_project` | 기본 캡 범위 (`CAP_SCOPE`) |
+| `--metered-surfaces antigravity,vertex_ai,gemini_enterprise` | 캡 계산 대상 서비스 (`METERED_SURFACES`) |
+| `--vertex-user-header-label LABEL` | Vertex AI 사용자 헤더 라벨 접미사 (`VERTEX_USER_HEADER_LABEL`, 기본 `user`) |
+| `--model-violation-block-scope project\|all` | 모델 규칙 위반 차단 범위 (`MODEL_VIOLATION_BLOCK_SCOPE`, 기본 `project`) |
 | `--skip-preflight` / `--skip-preflight-blockers` | 사전 점검 생략 / 차단 항목 무시 |
 | `--keep-log-sinks` | (teardown) BigQuery 싱크 유지 |
 | `--lang ko\|en` | 사전 점검 출력 언어 |
 | `--dry-run` | 명령만 출력 |
 
+추가 환경변수: `ENABLE_VERTEX_INFERENCE_LOGGING`(기본 `true`), `VERTEX_LOGGING_ENDPOINT`(기본 `https://aiplatform.googleapis.com/v1beta1`), `PRICING_SYNC_SCHEDULE`/`PRICING_SYNC_TIME_ZONE`(일일 단가 동기화 스케줄), `MODEL_PUBLISHERS`, `LONG_CONTEXT_THRESHOLD_TOKENS`, `PROVISIONED_THROUGHPUT_COST`. **Billing Export 관련 플래그·변수(`BILLING_PROJECT_ID`/`BILLING_DATASET_ID`/`BILLING_TABLE_ID`)는 없습니다.**
+
 ## 7. 설치 경로 B — `prepare.sh` + `deploy.sh`
 
 | 스크립트 | 단계 |
 |---|---|
-| `prepare.sh` | 0) 사전 점검 → 1) API 활성화(일괄 → 실패 시 개별, required 실패는 중단) → 2) 감사 데이터세트(중앙/채택/프로젝트별) → 3) BigQuery 싱크(프로젝트별 또는 집계 + 허브 자체 싱크), writer에 데이터세트 WRITER → 4) (선택) Data Access 감사 로그 병합 |
-| `deploy.sh` | 1/9 허브 API → 2/9 SA 생성 + 허브 역할 → 3/9 관리 프로젝트(또는 폴더/조직) 역할 → 4/9 조직 역할 → 5/9 GCS 상태 버킷(버전 관리, 균일 접근, 공개 차단) + 부트스트랩 키 → 6/9 컨테이너 이미지(Cloud Build / 전용 풀 / Docker / 사전 빌드) → 7/9 Cloud Run 서비스 + Enforcer Job → 8/9 Cloud Scheduler 5분 → 9/9 실시간 토픽 + 프로젝트별 Pub/Sub 싱크 + 푸시 구독 |
+| `prepare.sh` | 0) 사전 점검 → 1) API 활성화(일괄 → 실패 시 개별, required 실패는 중단) → 2) 감사 데이터세트(중앙/채택/프로젝트별) → 3) BigQuery 싱크(프로젝트별 또는 집계 + 허브 자체 싱크), writer에 데이터세트 WRITER → 4) (선택) Data Access 감사 로그 병합 → 5) **Vertex AI 추론 요청 로그 활성화**(프로젝트별 `setPublisherModelConfig`, 이미 켜진 프로젝트·aiplatform 미사용 프로젝트는 건너뜀, 409 허용, Cloud Logging 비용 안내) |
+| `deploy.sh` | 1/9 허브 API → 2/9 SA 생성 + 허브 역할 → 3/9 관리 프로젝트(또는 폴더/조직) 역할(+ `gcpAiCapsVertexLoggingReader`) → 4/9 조직 역할 → 5/9 GCS 상태 버킷(버전 관리, 균일 접근, 공개 차단) + 부트스트랩 키 → 6/9 컨테이너 이미지(Cloud Build / 전용 풀 / Docker / 사전 빌드) → 7/9 Cloud Run 서비스 + Enforcer Job → 8/9 Cloud Scheduler 5분 + 일일 `…-pricing-sync`(OIDC) → 9/9 실시간 토픽 + 프로젝트별 Pub/Sub 싱크(`inference_response` + `inference_request`) + 푸시 구독 |
 
 ```bash
 scripts/prepare.sh --project hub-prj --managed-projects team-a,team-b --enable-data-access-logs
@@ -343,7 +358,9 @@ terraform init && terraform plan && terraform apply
 | `bootstrap_admin_key_secret` | `""` | 기존 시크릿 이름 |
 | `public_base_url` | `""` (= run.app URL) | OIDC audience 기준 URL |
 | `oidc_allowed_service_accounts` | `[]` | OIDC 허용 외부 SA |
-| `quota_contact_email`, `model_violation_action`, `spend_caps_enabled`, `billing_*`, `cap_currency`, `workspace_timezone` | — | 기타 |
+| `enable_vertex_inference_logging` / `vertex_logging_endpoint` / `create_vertex_logging_reader_role` | `true` / v1beta1 / `true` | Vertex AI 추론 요청 로그 활성화(네이티브 리소스가 없어 `terraform_data` local-exec로 `setPublisherModelConfig` 호출 — Terraform 실행 환경에 bash·curl과 `aiplatform.endpoints.setPublisherModelConfig` 필요, hashicorp/terraform-provider-google#30642) / 런타임 SA용 1권한 조회 역할 |
+| `cap_scope` / `metered_surfaces` / `vertex_user_header_label` / `model_violation_block_scope` | `total` / 3개 / `user` / `project` | 멀티 프로젝트 캡·귀속 설정 (환경변수로 전달) |
+| `quota_contact_email`, `model_violation_action`, `spend_caps_enabled`, `billing_account_id`(하드캡 전용), `cap_currency`, `workspace_timezone` | — | 기타 (Billing Export 관련 변수 없음) |
 
 출력: `api_url`, `openapi_url`, `api_service_account`, `enforcer_service_account`, `enforcer_job_name`,
 `state_bucket`, `org_iam_commands`(`grant_org_roles=false`일 때 조직 관리자용 명령), `managed_projects`,
@@ -398,7 +415,7 @@ flowchart LR
    `scripts/preflight.sh --project HUB --managed-projects team-a,team-b,team-new`
    (새 프로젝트의 `api.*`, `orgpolicy.*`, `vpcsc.cross_project`, `logging.*` 확인)
 2. **로그 수집 준비** — `scripts/prepare.sh --project HUB --managed-projects team-a,team-b,team-new
-   [--enable-data-access-logs]` (API 활성화, 싱크, writer 권한. 기존 프로젝트는 변경 없음)
+   [--enable-data-access-logs]` (API 활성화, 싱크, writer 권한, **Vertex AI 추론 요청 로그 활성화**. 기존 프로젝트는 변경 없음)
 3. **배포 갱신** — `scripts/deploy.sh --project HUB --managed-projects team-a,team-b,team-new [기존과 동일한 옵션]`
    (`SCAN_PROJECTS` 교체, 새 프로젝트 역할, Pub/Sub 싱크 + publisher 권한, Cloud Run 새 리비전).
    **기존 프로젝트를 빼먹으면 그 프로젝트는 관리 대상에서 제외됩니다** — 반드시 전체 목록을 전달하세요.
@@ -406,8 +423,10 @@ flowchart LR
    역할이 필요합니다.
 5. **VPC-SC** — 새 프로젝트가 다른 경계에 있으면 `vpcsc.cross_project`가 생성한 YAML을 적용합니다.
 6. **검증** — `GET /v1/admin/readiness?refresh=true&project=team-new`, 서피스·권한 요약은
-   `GET /v1/projects/team-new/capabilities`(`models:read`/`quotas:read`/`caps:read`), 몇 분 뒤 `bq.freshness.*`·사용량
-   API 확인.
+   `GET /v1/projects/team-new/capabilities`(`models:read`/`quotas:read`/`caps:read`), Vertex AI 로그는
+   `GET /v1/projects/team-new/vertex-logging`(`enabled: true`), 몇 분 뒤 `bq.freshness.*`·사용량 API의
+   `telemetry.token_sources` 확인.
+7. **캡** — 새 프로젝트에 프로젝트 기본 캡이 필요하면 `PUT /v1/caps/policy {"project_defaults": {...}}`에 추가([11장](#11-사용자--프로젝트-nm--프로젝트별-캡)).
 
 Terraform: `managed_projects`에 추가 후 `terraform apply`.
 폴더/조직 스코프: 런타임이 새 프로젝트를 자동 탐색하고 집계 싱크가 로그를 수집합니다. 다만 프로젝트별 역할
@@ -422,7 +441,7 @@ scripts/teardown.sh --project HUB --managed-projects team-a,team-b [--scope-type
 
 | 삭제 | 유지 |
 |---|---|
-| Scheduler 작업(`…-enforce-schedule`, `…-pricing-sync`), 푸시 구독, 토픽, Cloud Run 서비스, Enforcer Job, 프로젝트별 Pub/Sub 싱크, (`--keep-log-sinks`가 없으면) 프로젝트별·집계 BigQuery 싱크 | BigQuery 데이터세트, GCS 상태 버킷, 부트스트랩 시크릿, Artifact Registry, 서비스 계정과 IAM 바인딩, **IAM Deny 정책** |
+| Scheduler 작업(`…-enforce-schedule`, `…-pricing-sync`), 푸시 구독, 토픽, Cloud Run 서비스, Enforcer Job, 프로젝트별 Pub/Sub 싱크, (`--keep-log-sinks`가 없으면) 프로젝트별·집계 BigQuery 싱크 | BigQuery 데이터세트, GCS 상태 버킷, 부트스트랩 시크릿, Artifact Registry, 서비스 계정과 IAM 바인딩, **IAM Deny 정책**, **Vertex AI 추론 요청 로그 설정**(켜진 상태 유지 — Cloud Logging 비용을 줄이려면 프로젝트별로 직접 끄세요) |
 
 > [!CAUTION]
 > Teardown은 IAM Deny 정책을 지우지 않습니다(차단된 사용자가 조용히 풀리지 않도록). 서비스를 내리기 **전에**
@@ -434,5 +453,53 @@ scripts/teardown.sh --project HUB --managed-projects team-a,team-b [--scope-type
 Terraform `destroy` 시: 데이터세트는 `delete_contents_on_destroy = false`, 버킷은 `force_destroy = false`이므로
 내용이 있으면 삭제가 실패합니다(데이터 보호). 백업 후 수동으로 비우거나 `terraform state rm`으로 관리에서 제외하세요.
 
+## 11. 사용자 ↔ 프로젝트 N:M · 프로젝트별 캡
+
+한 사용자는 보통 1개 프로젝트에 배정되지만 여러 관리 프로젝트에서 일할 수 있습니다(N:M). 이 API는 모든 사용량을
+**(사용자, 프로젝트)** 단위로 집계하므로 별도 매핑 테이블이 필요 없습니다 — 로그에 기록된 프로젝트가 곧 귀속 프로젝트입니다.
+
+```mermaid
+flowchart LR
+    U1["alice@company.com"] --> PA["team-a-prod"]
+    U1 --> PB["team-b-prod"]
+    U2["bob@company.com"] --> PB
+    U3["carol@company.com"] --> PC["team-c-batch"]
+    PA & PB & PC --> F["(사용자, 프로젝트) 사실값<br/>사용량 · 비용 · 캡 · 차단"]
+```
+
+| 기능 | 설정 / API | 동작 |
+|---|---|---|
+| 합산 캡 | 정책 `cap_scope: total` (기본) | 사용자의 모든 프로젝트 사용량 합계에 캡 1개 → 초과 시 **모든 프로젝트**에서 정지 |
+| 프로젝트별 동일 캡 | 정책 `cap_scope: per_project` 또는 사용자 규칙 `scope: per_project` | 같은 캡을 프로젝트마다 따로 평가 → 초과한 **그 프로젝트만** 정지 |
+| 사용자 × 프로젝트 캡 | 사용자 규칙 `project_caps: {project: {cost_cap, token_cap, request_cap}}` | 합산 캡과 **함께** 평가 (`limit.source = user_project_cap`) |
+| 프로젝트 기본 캡 | 정책 `project_defaults: {project: {...}}` | 그 프로젝트의 모든 사용자에게 적용 (`limit.source = project_default`) |
+| 계측 서비스 | 정책 `metered_surfaces` (`METERED_SURFACES`) | 캡 계산에 포함할 서비스 |
+| 프로젝트 한정 차단 | `POST /v1/users/{email}/block {"projects":[...]}` | 해당 프로젝트 부착점에만 IAM Deny |
+| 프로젝트 한정 해제 | `POST /v1/users/{email}/unblock {"projects":[...]}` | 해당 프로젝트만 해제, 나머지 유지 |
+| 사용자 프로젝트 조회 | `GET /v1/users/{email}/projects?include=iam` | 사용·배정된 모든 프로젝트의 사용량·비용·모델·캡 상태, 직접 `user:` IAM 바인딩 |
+| 모델 규칙 위반 차단 범위 | `models.violation_block_scope` (`MODEL_VIOLATION_BLOCK_SCOPE`) `project` (기본) \| `all` | 위반 프로젝트만 / 모든 프로젝트 |
+
+```bash
+# 프로젝트별 캡 정책 + 배치 프로젝트 기본 캡
+curl -s -X PUT "$BASE/v1/caps/policy" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"cost_cap":100,"period":"monthly","enforcement_mode":"auto","cap_scope":"per_project",
+       "project_defaults":{"team-c-batch":{"token_cap":50000000}}}'
+
+# alice: 합산 $200 + team-b-prod $50
+curl -s -X PUT "$BASE/v1/caps/users/alice%40company.com" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"type":"limit","cost_cap":200,"scope":"total","project_caps":{"team-b-prod":{"cost_cap":50}}}'
+
+# 확인
+curl -s "$BASE/v1/caps/users/alice%40company.com" -H "Authorization: Bearer $KEY" \
+  | jq '{status, status_scope, over_scope, blocked_projects, projects: [.projects[] | {project, status, limit, remaining}]}'
+curl -s "$BASE/v1/users/alice%40company.com/projects?include=iam" -H "Authorization: Bearer $KEY"
+```
+
+> [!NOTE]
+> `deny_attachment=projects`(기본)에서는 모든 관리 프로젝트가 이미 부착점이므로 프로젝트 한정 차단에 추가 설정이 없습니다.
+> `deny_attachment=scope`(폴더/조직 부착)에서는 프로젝트 한정 항목이 생길 때 해당 `projects/{id}` 부착점에도 관리형
+> 정책을 만들므로, 집행 SA의 `roles/iam.denyAdmin`(조직 수준)이 그대로 사용됩니다. 상세 규칙은
+> [enforcement-logic.md](enforcement-logic.md#3-멀티-프로젝트-집행-120).
+
 관련 문서: [preflight-checklist.md](preflight-checklist.md) · [operations-runbook.md](operations-runbook.md) ·
-[security.md](security.md) · [enforcement-logic.md](enforcement-logic.md)
+[security.md](security.md) · [enforcement-logic.md](enforcement-logic.md) · [cost-methodology.md](cost-methodology.md)

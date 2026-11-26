@@ -14,6 +14,12 @@ per-key limits feel to a customer portal:
      the IAM Deny v2 managed policy for the violating surface(s) (same engine as spend-cap blocks, ~1-2 min to apply),
      a `user.model_violation` webhook + audit entry is emitted, and the block lifts automatically at `until`
      (window reset / block_minutes) or on POST /v1/users/{email}/unblock.
+  4. Multi-project: by default (`models.violation_block_scope: project`) the block applies only to the managed
+     project(s) where the violating request ran - a user assigned to several projects keeps working elsewhere.
+     Set `all` to block the user in every managed project.
+
+Model patterns are matched against the model id recorded in the log; publisher-qualified patterns
+(`anthropic/*`) use the publisher from the log resource / Model Garden, never a name-based guess.
 """
 
 from __future__ import annotations
@@ -174,27 +180,36 @@ def effective_rule(state: dict, email: str, now: dt.datetime | None = None) -> t
     return None, "none"
 
 
-def access_violation(rule: dict, model: str, surface: str) -> str | None:
+def access_violation(rule: dict, model: str, surface: str, publisher: str | None = None) -> str | None:
     """Returns 'model_not_allowed' / 'model_denied' / None for one model use on one surface."""
     if not rule or surface not in (rule.get("surfaces") or config.VALID_SERVICES):
         return None
     mode = rule.get("mode")
     models = rule.get("models") or []
     if mode == "allow_list":
-        if not any(_pattern_hit(model, p) for p in models):
+        if not any(_pattern_hit(model, p, publisher) for p in models):
             return "model_not_allowed"
     elif mode == "deny_list":
-        if any(_pattern_hit(model, p) for p in models):
+        if any(_pattern_hit(model, p, publisher) for p in models):
             return "model_denied"
     return None
 
 
-def _pattern_hit(model: str, pattern: str) -> bool:
-    pat = pattern.split("/", 1)[-1] if "/" in pattern else pattern
-    pub = pattern.split("/", 1)[0] if "/" in pattern else None
-    if pub and pub != (reg.guess_publisher(model) or pub):
-        return False
-    return reg.matches(model, pat)
+def _pattern_hit(model: str, pattern: str, publisher: str | None = None) -> bool:
+    if pattern.startswith("publishers/"):
+        try:
+            ppub, ppat, _ = reg.parse_model_ref(pattern)
+        except ApiError:
+            return False
+    elif "/" in pattern:
+        ppub, ppat = pattern.split("/", 1)
+    else:
+        ppub, ppat = None, pattern
+    if ppub:
+        actual = publisher or reg.guess_publisher(model)
+        if actual is None or actual != ppub:
+            return False
+    return reg.matches(model, ppat)
 
 
 def limit_violations(rule: dict, stats: dict, *, metrics=LIMIT_METRICS) -> list[dict]:
@@ -259,6 +274,17 @@ def _protected(ctx, email: str) -> bool:
     return bool(domain) and ("*@" + domain) in prot
 
 
+def _block_scope(ctx) -> str:
+    val = str((ctx.config.get("models") or {}).get("violation_block_scope") or "project").lower()
+    return val if val in ("project", "all") else "project"
+
+
+def _merge_projects(a, b):
+    if a is None or b is None:
+        return None
+    return sorted(set(a) | set(b))
+
+
 def apply_violations(ctx, found: list[dict], *, trigger: str, dry_run: bool = False,
                      period_win: dict | None = None, population: int = 0) -> dict:
     """found: [{email, rule, violations: [...], surface_hits: set, window_id, counts}] -> blocks + notifications."""
@@ -291,13 +317,16 @@ def apply_violations(ctx, found: list[dict], *, trigger: str, dry_run: bool = Fa
                     action, reason = "notify", "enforcement_backend=notify_only"
                 elif _protected(ctx, email) or (caps_rules.get(email) or {}).get("type") == "allow":
                     action, reason = "notify", "protected principal / allow override"
+            v_projects = sorted({p for p in (v.get("projects") or []) if p and p != "unknown"})
             rec = {
                 "object": "model_violation",
                 "id": "mv_" + secrets.token_hex(8),
                 "email": email,
                 "type": v["type"],
                 "model": v.get("model"),
+                "publisher": v.get("publisher"),
                 "surface": v.get("surface"),
+                "projects": v_projects,
                 "metric": v.get("metric"),
                 "limit": v.get("limit"),
                 "observed": v.get("observed"),
@@ -312,9 +341,12 @@ def apply_violations(ctx, found: list[dict], *, trigger: str, dry_run: bool = Fa
                 services = rule.get("block_services") or sorted(item.get("surface_hits") or []) or \
                     list(policy.get("default_block_services") or config.VALID_SERVICES)
                 until = _window_until(ctx, v, rule, now, period_win)
+                b_projects = v_projects if (_block_scope(ctx) == "project" and v_projects) else None
                 active = (caps_doc.get("blocks") or {}).get(email)
                 if isinstance(active, dict) and not _expired(active, now) and \
-                        set(services) <= set(active.get("services") or []):
+                        set(services) <= set(active.get("services") or []) and \
+                        (active.get("projects") is None or (b_projects is not None and
+                                                            set(b_projects) <= set(active.get("projects") or []))):
                     rec["action"], rec["action_note"] = "already_blocked", active.get("source") or "manual"
                     records.append((key, count, rec))
                     continue
@@ -324,12 +356,15 @@ def apply_violations(ctx, found: list[dict], *, trigger: str, dry_run: bool = Fa
                         deferred.append(email)
                         rec["action"], rec["action_note"] = "deferred", "change budget (G4) reached"
                     else:
-                        to_block[email] = {"services": set(services), "until": until, "violations": [rec]}
+                        to_block[email] = {"services": set(services), "until": until, "violations": [rec],
+                                           "projects": b_projects}
                 else:
                     cur["services"] |= set(services)
                     cur["until"] = None if (cur["until"] is None or until is None) else max(cur["until"], until)
+                    cur["projects"] = _merge_projects(cur.get("projects"), b_projects)
                     cur["violations"].append(rec)
                 rec["block_services"] = sorted(services)
+                rec["block_projects"] = b_projects or "all"
                 rec["block_until"] = until
             records.append((key, count, rec))
     result = {"violations": [r for _, _, r in records if r["action"] != "already_blocked"],
@@ -362,11 +397,14 @@ def apply_violations(ctx, found: list[dict], *, trigger: str, dry_run: bool = Fa
                     existing = blocks.get(email)
                     if existing and existing.get("source") != "model_policy":
                         merged = set(existing.get("services") or []) | b["services"]
-                        blocks[email] = dict(existing, services=sorted(merged))
+                        blocks[email] = dict(existing, services=sorted(merged),
+                                             projects=_merge_projects(existing.get("projects"), b.get("projects")))
                         continue
                     until = b["until"]
+                    projects = b.get("projects")
                     if existing and existing.get("source") == "model_policy":
                         b["services"] |= set(existing.get("services") or [])
+                        projects = _merge_projects(existing.get("projects"), projects)
                         if existing.get("until") is None or until is None:
                             until = None
                         else:
@@ -375,6 +413,7 @@ def apply_violations(ctx, found: list[dict], *, trigger: str, dry_run: bool = Fa
                     blocks[email] = {
                         "email": email,
                         "services": sorted(b["services"]),
+                        "projects": projects,
                         "until": until,
                         "reason": "model policy violation: %s %s" % (first["type"], first.get("model") or
                                                                      first.get("metric") or ""),
@@ -395,14 +434,15 @@ def apply_violations(ctx, found: list[dict], *, trigger: str, dry_run: bool = Fa
         if rec["action"] == "already_blocked":
             continue
         audit.write_audit(ctx, "user_model_rule.violation", target=rec["email"], details={
-            k: rec.get(k) for k in ("type", "model", "surface", "metric", "limit", "observed", "action",
-                                    "block_services", "block_until", "trigger")})
+            k: rec.get(k) for k in ("type", "model", "publisher", "surface", "projects", "metric", "limit", "observed",
+                                    "action", "block_services", "block_projects", "block_until", "trigger")})
         if (ctx.config.get("models") or {}).get("violation_notify", True):
             webhooks.dispatch_event(ctx, "user.model_violation", dict(rec, enforcement_applied=bool(
                 enforcement and enforcement.get("applied")) if rec["action"] == "block_service" else False))
     for email, b in to_block.items():
         webhooks.dispatch_event(ctx, "user.blocked", {
             "email": email, "services": sorted(b["services"]), "until": b["until"], "trigger": "model_policy",
+            "projects": b.get("projects") or "all",
             "reasons": sorted({r["type"] for r in b["violations"]}),
         })
     return result
@@ -444,11 +484,16 @@ def evaluate_all(ctx, *, dry_run: bool = False, now: dt.datetime | None = None, 
             continue
         violations, hits = [], set()
         rec = day_usage.users.get(email) or {}
+        model_projects: dict[str, set] = {}
+        for proj, prec in (rec.get("by_project") or {}).items():
+            for model in (prec.get("by_model") or {}):
+                model_projects.setdefault(model, set()).add(proj)
         for model, mrec in (rec.get("by_model") or {}).items():
             surface = mrec.get("surface") or "antigravity"
-            kind = access_violation(rule, model, surface)
+            kind = access_violation(rule, model, surface, mrec.get("publisher"))
             if kind:
-                violations.append({"type": kind, "model": model, "surface": surface,
+                violations.append({"type": kind, "model": model, "publisher": mrec.get("publisher"),
+                                   "surface": surface, "projects": sorted(model_projects.get(model) or ()),
                                    "requests": mrec.get("requests", 0), "observed": mrec.get("requests", 0)})
                 hits.add(surface)
         stats = {}
@@ -464,6 +509,7 @@ def evaluate_all(ctx, *, dry_run: bool = False, now: dt.datetime | None = None, 
                     cost, _ = pricing_svc.estimate_cost({"by_model": {model: mrec}}, pricing)
                     s["month_cost"] = cost
         for lv in limit_violations(rule, stats, metrics=[m for m in LIMIT_METRICS if m not in REALTIME_METRICS]):
+            lv["projects"] = sorted({p for m in lv["models"] for p in (model_projects.get(m) or ())})
             violations.append(lv)
             for m in lv["models"]:
                 hits.add(((rec.get("by_model") or {}).get(m) or {}).get("surface") or "antigravity")
@@ -495,13 +541,17 @@ def check_event(ctx, item: dict, recent_items: list[dict]) -> dict | None:
         return None
     from . import caps as caps_svc
     caps_doc, _ = ctx.store.load(caps_svc.USER_CAPS_DOC)
+    surface = item.get("surface") or "antigravity"
+    project = item.get("project")
     blk = (caps_doc.get("blocks") or {}).get(email)
-    if isinstance(blk, dict) and "antigravity" in (blk.get("services") or []) and not _expired(blk, now):
+    if isinstance(blk, dict) and surface in (blk.get("services") or []) and not _expired(blk, now) and \
+            (blk.get("projects") is None or project in (blk.get("projects") or [])):
         return None
     violations = []
-    kind = access_violation(rule, item["model"], "antigravity")
+    kind = access_violation(rule, item["model"], surface, item.get("publisher"))
     if kind:
-        violations.append({"type": kind, "model": item["model"], "surface": "antigravity", "requests": 1,
+        violations.append({"type": kind, "model": item["model"], "publisher": item.get("publisher"),
+                           "surface": surface, "projects": [project] if project else [], "requests": 1,
                            "observed": 1, "event_key": item.get("key")})
     if any(m in lim for lim in rule.get("limits") or [] for m in REALTIME_METRICS):
         floor = item["ts"] - dt.timedelta(seconds=60)
@@ -513,14 +563,15 @@ def check_event(ctx, item: dict, recent_items: list[dict]) -> dict | None:
             s = stats.setdefault(it["model"], {"minute_requests": 0, "minute_tokens": 0})
             s["minute_requests"] += 1
             s["minute_tokens"] += int(it.get("total_tokens") or 0)
-        violations += [dict(v, surface="antigravity") for v in limit_violations(rule, stats, metrics=REALTIME_METRICS)]
+        violations += [dict(v, surface=surface, projects=[project] if project else [])
+                       for v in limit_violations(rule, stats, metrics=REALTIME_METRICS)]
     if not violations:
         return None
     _, day_id = _day_window(ctx, now)
     window_id = day_id if not any(v.get("metric") in REALTIME_METRICS for v in violations) else \
         now.strftime("%Y-%m-%dT%H:%M")
     found = [{"email": email, "rule": rule, "rule_source": source, "violations": violations,
-              "surface_hits": {"antigravity"}, "window_id": window_id}]
+              "surface_hits": {surface}, "window_id": window_id}]
     if kind:
         # Count-based dedupe: every new disallowed request after an admin unblock is a new violation.
         state_led = state["actioned"].get(_violation_key(email, violations[0], window_id)) or {}

@@ -34,6 +34,8 @@ SUPPORTED_EVENTS = (
     "project_cap.lifted",
     "model.access_changed",
     "model.lifecycle_notice",
+    "model.first_seen",
+    "model.catalog_changed",
     "user.model_violation",
     "rate_limit.threshold_reached",
     "quota_request.created",
@@ -187,9 +189,12 @@ def dispatch_event(ctx, event_type: str, payload: dict, *, sender=None) -> list[
 
 
 def notify_threshold_once(ctx, *, email: str, period_start: str, threshold_pct: int,
-                          utilization_pct: float, usage: dict, limit: dict) -> bool:
-    """Emits `cap.threshold_reached` (or `cap.exceeded` at >=100%) at most once per (user, period, threshold)."""
+                          utilization_pct: float, usage: dict, limit: dict, project: str | None = None) -> bool:
+    """Emits `cap.threshold_reached` (or `cap.exceeded` at >=100%) at most once per (user, [project,] period,
+    threshold). `project` is set for per-project caps (user assigned to several projects)."""
     dedupe_key = "%s|%s|%d" % (email.lower(), period_start or "all", int(threshold_pct))
+    if project:
+        dedupe_key += "|" + project
     already = {"sent": False}
 
     def mark(doc):
@@ -217,6 +222,8 @@ def notify_threshold_once(ctx, *, email: str, period_start: str, threshold_pct: 
         "period_start": period_start,
         "threshold_pct": int(threshold_pct),
         "utilization_pct": round(utilization_pct, 2),
+        "scope": "project" if project else "total",
+        "project": project,
         "usage": usage,
         "limit": limit,
     })

@@ -274,7 +274,8 @@ def env_lines(report: dict) -> list[str]:
         "PREFLIGHT_MANAGED_PROJECTS": ",".join(p["project_id"] for p in report.get("projects") or []
                                                if p.get("role") == "managed"),
     }
-    adopt_ds, adopt_sinks, billing = "", [], {}
+    adopt_ds, adopt_sinks = "", []
+    vertex = {"on": [], "off": [], "unknown": [], "na": []}
     for proj in report.get("projects") or []:
         for c in proj.get("checks") or []:
             data = c.get("data") or {}
@@ -284,13 +285,22 @@ def env_lines(report: dict) -> list[str]:
                 for a in data.get("adopt") or []:
                     if str(a.get("scope", "")).startswith("projects/"):
                         adopt_sinks.append("%s:%s" % (proj["project_id"], a.get("sink")))
-            if c["id"] == "bq.billing_export" and (data.get("adopt") or {}).get("env"):
-                billing = data["adopt"]["env"]
+            if c["id"] == "logging.vertex_inference_logging":
+                # Disabled -> prepare.sh enables it; unreadable (skip) -> prepare.sh tries and tolerates errors.
+                if data.get("applicable") is False:
+                    vertex["na"].append(proj["project_id"])
+                elif data.get("enabled") is True:
+                    vertex["on"].append(proj["project_id"])
+                elif data.get("enabled") is False:
+                    vertex["off"].append(proj["project_id"])
+                else:
+                    vertex["unknown"].append(proj["project_id"])
     values["PREFLIGHT_ADOPT_DATASET"] = adopt_ds
     values["PREFLIGHT_ADOPT_SINKS"] = ",".join(dict.fromkeys(adopt_sinks))
-    values["PREFLIGHT_BILLING_PROJECT_ID"] = billing.get("BILLING_PROJECT_ID", "")
-    values["PREFLIGHT_BILLING_DATASET_ID"] = billing.get("BILLING_DATASET_ID", "")
-    values["PREFLIGHT_BILLING_TABLE_ID"] = billing.get("BILLING_TABLE_ID", "")
+    values["PREFLIGHT_VERTEX_LOGGING_DISABLED"] = ",".join(dict.fromkeys(vertex["off"]))
+    values["PREFLIGHT_VERTEX_LOGGING_ENABLED"] = ",".join(dict.fromkeys(vertex["on"]))
+    values["PREFLIGHT_VERTEX_LOGGING_UNKNOWN"] = ",".join(dict.fromkeys(vertex["unknown"]))
+    values["PREFLIGHT_VERTEX_LOGGING_NA"] = ",".join(dict.fromkeys(vertex["na"]))
     return ["%s=%s" % (k, _SAFE_ENV_RE.sub("", str(v))) for k, v in values.items()]
 
 

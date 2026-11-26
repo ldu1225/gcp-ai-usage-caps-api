@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: GCP AI Usage & Spend Caps API
-  version: 1.1.0
+  version: 1.2.0
   description: |
     Headless M2M REST API for enterprise AI management portals to query per-user Google Cloud AI
     usage & estimated costs (Antigravity, Vertex AI / Agent Platform, Gemini Enterprise) and
@@ -17,9 +17,19 @@ info:
     ### Operational Notes vs OpenAI / Anthropic Admin APIs
     - **IAM Deny v2 Propagation**: Block/unblock changes are eventually consistent and typically
       take **1-2 minutes** to propagate across Google Cloud (requests already in flight complete).
-    - **Cost Measurement**: GCP Cloud Billing exports have no per-user dimension; per-user cost is
-      computed from observed per-model tokens (uncached input, cached input, output/thinking) using
-      actual Billing Export effective prices -> Cloud Billing Catalog -> manual overrides.
+    - **Cost Measurement (no Billing Export)**: per-user cost = token counts from logs (Antigravity
+      inference logs, Vertex AI inference request metadata logs, Gemini Enterprise activity) x official
+      Cloud Billing Catalog SKU prices (input / output incl. thinking / cached / cache-write, long-context,
+      Flex / Priority / Batch tiers) or contract overrides. The Cloud Billing export is never read; amounts
+      are list-price estimates (credits, CUDs and taxes excluded). See `GET /v1/pricing`.
+    - **Vertex AI per-user attribution**: Vertex AI inference logs carry only a service-account principal.
+      Portals should send the header `x-goog-agent-platform-observability-label-user: <email|uid>`; otherwise
+      tokens are split across same-minute Data Access audit callers, and anything left is reported as
+      project-level `unattributed` usage (never dropped).
+    - **Dynamic models**: there is no built-in model list. `GET /v1/models` = live Model Garden + every model
+      observed in logs; new models trigger the `model.first_seen` webhook.
+    - **Multi-project users**: usage, caps (`cap_scope`, `project_caps`, `project_defaults`) and blocks
+      (`projects: [...]`) work per (user, project); one hub governs every managed project.
     - **Project Spend Cap Lift**: Lifting an `ENFORCED` Google Cloud Billing Spend Cap takes up to
       **~1 hour** for Google Cloud to resume Agent Platform traffic.
 
@@ -105,6 +115,9 @@ paths:
         - name: email
           in: query
           schema: { type: string, description: "Exact email or Workforce Identity principal" }
+        - name: model
+          in: query
+          schema: { type: string, description: "Only users who used this exact model id" }
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
@@ -132,9 +145,15 @@ paths:
                     type: object
                     properties:
                       active_users: { type: integer }
+                      multi_project_users: { type: integer }
                       total_requests: { type: integer }
                       total_tokens: { type: integer }
                       total_estimated_cost: { type: ["number", "null"] }
+                      unattributed_requests: { type: integer }
+                      unattributed_tokens: { type: integer }
+                      unattributed_estimated_cost: { type: ["number", "null"] }
+                  pricing_source: { $ref: "#/components/schemas/PricingSource" }
+                  telemetry: { $ref: "#/components/schemas/Telemetry" }
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
 
@@ -180,6 +199,7 @@ paths:
                         requests: { type: integer }
                         total_tokens: { type: integer }
                   current_cap: { $ref: "#/components/schemas/UserCap" }
+                  telemetry: { $ref: "#/components/schemas/Telemetry" }
         "400": { $ref: "#/components/responses/Error" }
 
   /v1/billing/users:
@@ -187,8 +207,10 @@ paths:
       tags: [Usage & Billing]
       summary: Monthly user & project chargeback report
       description: |
-        Requires scope `usage:read`. Uses integer-cent exact allocation (largest remainder) so
-        per-user, per-project, and grand totals always agree to the cent.
+        Requires scope `usage:read`. Log token counts x official SKU prices (no Billing Export). One fact per
+        (user, project) - users assigned to several projects are split per project. Uses integer-cent exact
+        allocation (largest remainder) so per-user, per-project, and grand totals always agree to the cent.
+        Vertex AI usage without a person is listed per project under `unattributed`.
       parameters:
         - name: month
           in: query
@@ -222,6 +244,9 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/ProjectBillingRow" }
                   totals: { type: object }
+                  unattributed: { type: array, items: { type: object } }
+                  pricing_source: { $ref: "#/components/schemas/PricingSource" }
+                  telemetry: { $ref: "#/components/schemas/Telemetry" }
                   has_more: { type: boolean }
                   next_cursor: { type: ["string", "null"] }
                   total: { type: integer }
@@ -265,6 +290,12 @@ paths:
         - name: email
           in: query
           schema: { type: string }
+        - name: project
+          in: query
+          schema: { type: string, description: "Only users with usage, caps or blocks in this managed project" }
+        - name: multi_project
+          in: query
+          schema: { type: boolean, description: "Only users active in more than one project" }
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
@@ -332,6 +363,18 @@ paths:
                 cost_cap: { type: number, minimum: 0 }
                 token_cap: { type: integer, minimum: 0 }
                 request_cap: { type: integer, minimum: 0 }
+                scope:
+                  type: string
+                  enum: [total, per_project]
+                  description: "total = one cap across all projects; per_project = the cap applies in each project"
+                project_caps:
+                  type: object
+                  description: "Per-project caps for this user {project_id: {cost_cap, token_cap, request_cap}}"
+                  additionalProperties: { $ref: "#/components/schemas/CapTriplet" }
+                projects:
+                  type: array
+                  items: { type: string }
+                  description: "type=block only - block only in these managed projects (omit = all)"
                 services:
                   type: array
                   items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }
@@ -374,6 +417,10 @@ paths:
                   type: array
                   items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }
                   default: [antigravity, vertex_ai, gemini_enterprise]
+                projects:
+                  type: array
+                  items: { type: string }
+                  description: "Block only in these managed projects (user assigned to several projects). Omit = all."
                 reason: { type: string, maxLength: 200 }
                 until: { type: ["string", "null"], format: date-time }
       responses:
@@ -400,6 +447,10 @@ paths:
                   type: array
                   items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }
                   description: "Omit to unblock across all services"
+                projects:
+                  type: array
+                  items: { type: string }
+                  description: "Unblock only in these managed projects (the block stays in the others)"
                 reason: { type: string, maxLength: 200 }
       responses:
         "200":
@@ -605,6 +656,8 @@ paths:
                       - project_cap.lifted
                       - model.access_changed
                       - model.lifecycle_notice
+                      - model.first_seen
+                      - model.catalog_changed
                       - user.model_violation
                       - rate_limit.threshold_reached
                       - quota_request.created
@@ -637,9 +690,11 @@ paths:
       tags: [Models]
       summary: List models (OpenAI/Anthropic-style model list)
       description: |
-        Requires `models:read`. Catalog = built-in seed + live Vertex AI Model Garden publisher discovery
-        (google, anthropic, meta, mistralai, ...) + pricing + lifecycle. `include=access` adds the per-surface access
-        decision for `project`; `include=usage` adds observed 30-day usage.
+        Requires `models:read`. No built-in model list: catalog = live Vertex AI Model Garden discovery (configured
+        publishers + every publisher seen in logs; delisted models kept with `delisted_at`) + every model observed in
+        usage logs on any surface (`source=observed`, with first/last seen, surfaces, projects, users) + official SKU
+        pricing + lifecycle. `include=access` adds the per-surface access decision for `project`; `include=usage`
+        adds live 30-day usage.
       parameters:
         - { name: publisher, in: query, schema: { type: string }, example: anthropic }
         - { name: surface, in: query, schema: { type: string, enum: [vertex_ai, gemini_enterprise, antigravity] } }
@@ -647,6 +702,8 @@ paths:
         - { name: q, in: query, schema: { type: string }, description: Substring search on id / display name }
         - { name: include, in: query, schema: { type: string }, example: "access,usage" }
         - { name: project, in: query, schema: { type: string }, description: Project for include=access (default hub) }
+        - { name: source, in: query, schema: { type: string, enum: [model_garden, observed] } }
+        - { name: used, in: query, schema: { type: boolean }, description: Only models observed in usage logs }
         - { name: include_helpers, in: query, schema: { type: boolean } }
         - { name: refresh, in: query, schema: { type: boolean }, description: Force Model Garden re-discovery }
         - $ref: "#/components/parameters/Limit"
@@ -662,7 +719,7 @@ paths:
                   - type: object
                     properties:
                       data: { type: array, items: { $ref: "#/components/schemas/Model" } }
-                      catalog: { type: object, properties: { fetched_at: { type: [string, "null"] }, errors: { type: object } } }
+                      catalog: { type: object, properties: { fetched_at: { type: [string, "null"] }, errors: { type: object }, publishers: { type: array, items: { type: string } }, model_garden_models: { type: integer }, observed_only_models: { type: integer } } }
         default: { $ref: "#/components/responses/Error" }
 
   /v1/models/sync:
@@ -671,7 +728,7 @@ paths:
       summary: Refresh the Model Garden catalog now
       description: Requires `models:write`. Also runs automatically (catalog TTL, hourly reconcile).
       responses:
-        "200": { description: Sync summary, content: { application/json: { schema: { type: object, properties: { discovered: { type: integer }, publishers: { type: array, items: { type: string } }, errors: { type: object }, fetched_at: { type: string } } } } } }
+        "200": { description: Sync summary, content: { application/json: { schema: { type: object, properties: { discovered: { type: integer }, publishers: { type: array, items: { type: string } }, errors: { type: object }, fetched_at: { type: string }, added: { type: array, items: { type: string } }, delisted: { type: array, items: { type: string } } } } } } }
         default: { $ref: "#/components/responses/Error" }
 
   /v1/models/{model_id}:
@@ -679,7 +736,7 @@ paths:
       tags: [Models]
       summary: Retrieve a model with access decisions for every managed project
       description: |
-        Requires `models:read`. `model_id` is a Model Garden id (`gemini-2.5-pro`, `claude-sonnet-4-5`); pass
+        Requires `models:read`. `model_id` is a Model Garden / log model id (see `GET /v1/models`); pass
         `?publisher=` when ambiguous. `access_by_project` shows Vertex AI (Org Policy), Gemini Enterprise (per app)
         and Antigravity (per location, read-only) decisions.
       parameters:
@@ -705,14 +762,18 @@ paths:
     get:
       tags: [Models, Usage & Billing]
       summary: Usage and estimated cost per model
-      description: Requires `usage:read` or `models:read`. Optional `group_by=user|project|surface` breakdown.
+      description: |
+        Requires `usage:read` or `models:read`. Every model seen in any log is listed (including models not in Model
+        Garden, `catalog_status=observed_only`). Optional `group_by=user|project|surface|traffic` breakdown;
+        unattributed Vertex AI usage is included per model.
       parameters:
         - $ref: "#/components/parameters/Start"
         - $ref: "#/components/parameters/End"
         - { name: granularity, in: query, schema: { type: string, enum: [day, week] } }
         - { name: surface, in: query, schema: { type: string, enum: [all, antigravity, vertex_ai, gemini_enterprise] } }
         - { name: project, in: query, schema: { type: string } }
-        - { name: group_by, in: query, schema: { type: string, enum: [user, project, surface] } }
+        - { name: group_by, in: query, schema: { type: string, enum: [user, project, surface, traffic] } }
+        - { name: model, in: query, schema: { type: string }, description: Model id or pattern }
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Cursor"
       responses:
@@ -780,7 +841,7 @@ paths:
       tags: [Model Access]
       summary: Set the model access policy (allow_list / deny_list / unrestricted / deny_all / inherit)
       description: |
-        Requires `models:write`. Patterns (`gemini-2.5-*`, `anthropic/*`) are expanded against the catalog
+        Requires `models:write`. Patterns (`<family>-*`, `anthropic/*`) are expanded against the catalog
         (Org Policy has no wildcards, max 500 values). Safety: `dryRun`, impact preview, lockout prevention
         (`force` required for empty allow lists / deny_all), optimistic concurrency with `If-Match: <etag>`.
         Returns an `operation` (Org Policy changes usually take effect within minutes, up to ~15).
@@ -1217,6 +1278,132 @@ paths:
   # ===========================================================================
   # Operations
   # ===========================================================================
+  /v1/users/{email}/projects:
+    get:
+      tags: [Usage & Billing, Spend Caps]
+      summary: Every managed project a user works in (usage, cost, models, cap status, optional IAM bindings)
+      description: |
+        Requires `usage:read`. A user may be assigned to several projects (usually 1:1). Returns one row per project
+        the user used in the range, has per-project caps / blocks in, or (with `include=iam`) is directly bound to
+        via a `user:` IAM binding (group / inherited grants are not expanded).
+      parameters:
+        - { name: email, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/Start"
+        - $ref: "#/components/parameters/End"
+        - { name: include, in: query, schema: { type: string, enum: [iam] } }
+      responses:
+        "200":
+          description: User projects
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [user_projects] }
+                  email: { type: string }
+                  uid: { type: string }
+                  multi_project: { type: boolean }
+                  currency: { type: string }
+                  range: { $ref: "#/components/schemas/DateRangeMeta" }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        project: { type: string }
+                        managed: { type: boolean }
+                        used: { type: boolean }
+                        requests: { type: integer }
+                        total_tokens: { type: integer }
+                        estimated_cost: { type: ["number", "null"] }
+                        models: { type: array, items: { type: object } }
+                        cap: { type: object }
+                        iam: { type: object, properties: { readable: { type: boolean }, roles: { type: array, items: { type: string } } } }
+                  telemetry: { $ref: "#/components/schemas/Telemetry" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /v1/pricing:
+    get:
+      tags: [Usage & Billing]
+      summary: Official SKU price table used for cost estimates (no Billing Export)
+      description: |
+        Requires `usage:read` or `models:read`. Per model key: input / output / cached / cache_write prices per 1M tokens,
+        long-context / flex / priority / batch tiers and the Cloud Billing Catalog SKU names they come from, plus
+        contract overrides. Refreshed daily by `POST /v1/internal/pricing/sync`.
+      parameters:
+        - { name: model, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Price table
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [pricing_table] }
+                  currency: { type: string }
+                  unit: { type: string, enum: [per_1m_tokens] }
+                  pricing_source: { $ref: "#/components/schemas/PricingSource" }
+                  fx: { type: ["object", "null"] }
+                  data: { type: array, items: { type: object } }
+
+  /v1/projects/{project_id}/vertex-logging:
+    get:
+      tags: [Readiness]
+      summary: Vertex AI inference request metadata logging status for one managed project
+      description: |
+        Requires `usage:read` or `admin`. Reads v1beta1 `fetchPublisherModelConfig`. This log
+        (`aiplatform.googleapis.com/inference_request`) is the only log-based source of Vertex AI token counts.
+      parameters:
+        - { name: project_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Status, content: { application/json: { schema: { $ref: "#/components/schemas/VertexLoggingStatus" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/projects/{project_id}/vertex-logging/enable:
+    post:
+      tags: [Readiness]
+      summary: Enable Vertex AI inference request metadata logging (project-wide)
+      description: |
+        Requires `admin`. Calls v1beta1 `setPublisherModelConfig` with `inferenceEventLoggingConfig.state=ENABLED`.
+        Needs `aiplatform.endpoints.setPublisherModelConfig` on the project. Cloud Logging ingestion charges apply.
+      parameters:
+        - { name: project_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { dryRun: { type: boolean, default: false } } }
+      responses:
+        "200": { description: Result, content: { application/json: { schema: { $ref: "#/components/schemas/VertexLoggingStatus" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/vertex-logging/enable:
+    post:
+      tags: [Readiness]
+      summary: Enable Vertex AI inference request metadata logging on many managed projects
+      description: Requires `admin`. `dryRun` defaults to true.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                projects: { type: array, items: { type: string }, default: ["*"] }
+                dryRun: { type: boolean, default: true }
+      responses:
+        "200":
+          description: Per-project results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [vertex_inference_logging_bulk] }
+                  dry_run: { type: boolean }
+                  data: { type: array, items: { $ref: "#/components/schemas/VertexLoggingStatus" } }
+                  skipped_over_limit: { type: array, items: { type: string } }
+                  unknown_projects: { type: array, items: { type: string } }
+
   /v1/operations:
     get:
       tags: [Operations]
@@ -1247,7 +1434,7 @@ components:
     Cursor: { name: cursor, in: query, schema: { type: string }, description: Opaque cursor from `next_cursor` }
     Start: { name: start, in: query, schema: { type: string, format: date } }
     End: { name: end, in: query, schema: { type: string, format: date } }
-    ModelId: { name: model_id, in: path, required: true, schema: { type: string }, example: gemini-2.5-pro }
+    ModelId: { name: model_id, in: path, required: true, schema: { type: string }, example: "<model-id>" }
     ScopeType: { name: scope_type, in: path, required: true, schema: { type: string, enum: [projects, folders, organizations] } }
     ScopeId: { name: scope_id, in: path, required: true, schema: { type: string }, example: team-a-prod }
     AppId: { name: app_id, in: path, required: true, schema: { type: string }, example: "my-project~global~corp-assistant" }
@@ -1311,7 +1498,10 @@ components:
             type: object
             properties:
               model: { type: string }
+              publisher: { type: ["string", "null"] }
               surface: { type: string }
+              cost_basis: { type: string }
+              by_traffic: { type: object }
               requests: { type: integer }
               input_tokens: { type: integer }
               output_tokens: { type: integer }
@@ -1320,10 +1510,61 @@ components:
               estimated_cost: { type: ["number", "null"] }
               cost_partial: { type: boolean }
         by_surface: { type: object }
+        projects: { type: array, items: { type: string } }
+        multi_project: { type: boolean }
+        cache_write_tokens: { type: integer }
+        thoughts_tokens: { type: integer }
         by_project:
           type: array
           items: { type: object }
         last_active: { type: ["string", "null"], format: date-time }
+
+    CapTriplet:
+      type: object
+      properties:
+        cost_cap: { type: ["number", "null"], minimum: 0 }
+        token_cap: { type: ["integer", "null"], minimum: 0 }
+        request_cap: { type: ["integer", "null"], minimum: 0 }
+
+    ProjectCapStatus:
+      type: object
+      properties:
+        project: { type: string }
+        status: { type: string, enum: [active, over_cap, suspended, blocked] }
+        over_cap: { type: ["boolean", "null"] }
+        over_cap_reasons: { type: array, items: { type: string } }
+        utilization_pct: { type: ["number", "null"] }
+        limit: { type: ["object", "null"], description: "source = user_project_cap | project_default | per_project_scope" }
+        usage: { type: object }
+        remaining: { type: ["object", "null"] }
+        blocked_services: { type: array, items: { type: string } }
+
+    PricingSource:
+      type: object
+      properties:
+        method: { type: string, enum: [log_token_counts_x_official_sku_prices] }
+        billing_export: { type: string, enum: [not_used] }
+        source: { type: ["string", "null"] }
+        catalog_synced_at: { type: ["string", "null"] }
+        official_sku_models: { type: integer }
+        override_models: { type: integer }
+        provisioned_throughput: { type: ["string", "null"], enum: [on_demand, zero, null] }
+        currency: { type: ["string", "null"] }
+
+    Telemetry:
+      type: object
+      properties:
+        attribution:
+          type: object
+          description: "Requests by attribution method: log_identity, header_label, audit_correlated, unattributed"
+          additionalProperties: { type: integer }
+        token_sources:
+          type: object
+          description: "Per surface: logs | requests_only | unavailable"
+          additionalProperties: { type: string }
+        unattributed_projects: { type: array, items: { type: string } }
+        telemetry_ok: { type: boolean }
+        truncated: { type: boolean }
 
     UserBillingRow:
       type: object
@@ -1375,6 +1616,9 @@ components:
         webhook_thresholds:
           type: array
           items: { type: integer }
+        cap_scope: { type: string, enum: [total, per_project] }
+        project_defaults: { type: object, additionalProperties: { $ref: "#/components/schemas/CapTriplet" } }
+        metered_surfaces: { type: array, items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] } }
         current_window: { type: object }
 
     CapPolicyUpdate:
@@ -1398,6 +1642,17 @@ components:
         webhook_thresholds:
           type: array
           items: { type: integer, minimum: 1, maximum: 100 }
+        cap_scope:
+          type: string
+          enum: [total, per_project]
+          description: "total = one cap per user across all managed projects; per_project = the default cap applies separately in each project"
+        project_defaults:
+          type: object
+          description: "Default per-user cap inside a given project {project_id: {cost_cap, token_cap, request_cap}}"
+          additionalProperties: { $ref: "#/components/schemas/CapTriplet" }
+        metered_surfaces:
+          type: array
+          items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }
 
     UserCap:
       type: object
@@ -1405,10 +1660,29 @@ components:
         email: { type: string }
         uid: { type: string }
         status: { type: string, enum: [active, over_cap, suspended, blocked] }
+        status_scope:
+          type: ["string", "null"]
+          enum: [all, projects, null]
+          description: "all = every managed project; projects = only some projects (see projects[] / blocked_projects)"
         blocked_services:
           type: array
           items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }
+        blocked_projects:
+          type: object
+          description: "Project-scoped IAM Deny entries {project_id: [services]}"
+          additionalProperties: { type: array, items: { type: string } }
         over_cap: { type: ["boolean", "null"] }
+        over_scope:
+          description: "all (total cap) or the list of projects whose cap is exceeded"
+          oneOf:
+            - { type: string, enum: [all] }
+            - { type: array, items: { type: string } }
+            - { type: "null" }
+        cap_scope: { type: string, enum: [total, per_project] }
+        multi_project: { type: boolean }
+        projects:
+          type: array
+          items: { $ref: "#/components/schemas/ProjectCapStatus" }
         over_cap_reasons:
           type: array
           items: { type: string, enum: [cost, tokens, requests] }
@@ -1432,14 +1706,25 @@ components:
       description: OpenAI/Anthropic-compatible model object extended with GCP surfaces, lifecycle, pricing and access.
       properties:
         object: { type: string, enum: [model] }
-        id: { type: string, example: gemini-2.5-pro }
+        id: { type: string, example: "<model-id-from-model-garden-or-logs>" }
         owned_by: { type: string, example: google }
         publisher: { type: string }
         display_name: { type: string }
         family: { type: string }
-        resource_name: { type: string, example: publishers/google/models/gemini-2.5-pro }
-        policy_values: { type: array, items: { type: string }, example: ["publishers/google/models/gemini-2.5-pro:predict"] }
-        surfaces: { type: array, items: { type: string, enum: [vertex_ai, gemini_enterprise, antigravity] } }
+        resource_name: { type: [string, "null"], example: "publishers/<publisher>/models/<model-id>" }
+        policy_values: { type: array, items: { type: string }, example: ["publishers/<publisher>/models/<model-id>:predict"] }
+        surfaces: { type: array, items: { type: string, enum: [vertex_ai, gemini_enterprise, antigravity] }, description: available_surfaces + surfaces observed in logs }
+        available_surfaces: { type: array, items: { type: string } }
+        observed:
+          type: [object, "null"]
+          description: Present when the model was seen in usage logs
+          properties:
+            surfaces: { type: array, items: { type: string } }
+            projects: { type: integer }
+            users_seen: { type: [integer, "null"] }
+            first_seen: { type: [string, "null"], format: date-time }
+            last_seen: { type: [string, "null"], format: date-time }
+        helper: { type: boolean }
         lifecycle:
           type: object
           properties:
@@ -1449,6 +1734,8 @@ components:
             deprecation_date: { type: [string, "null"], format: date }
             shutdown_date: { type: [string, "null"], format: date }
             replacement: { type: [string, "null"] }
+            first_listed: { type: [string, "null"] }
+            delisted_at: { type: [string, "null"] }
         pricing:
           type: [object, "null"]
           properties:
@@ -1456,11 +1743,14 @@ components:
             input_per_1m_tokens: { type: [number, "null"] }
             output_per_1m_tokens: { type: [number, "null"] }
             cached_input_per_1m_tokens: { type: [number, "null"] }
-            source: { type: string }
+            cache_write_per_1m_tokens: { type: [number, "null"] }
+            tiers: { type: object, description: "long_context / flex / priority / batch official SKU prices" }
+            skus: { type: object, description: "Official Cloud Billing Catalog SKU names used" }
+            source: { type: string, enum: [official_sku, override, manual, auto] }
         access: { $ref: "#/components/schemas/ModelAccessDecision" }
         access_by_project: { type: object, additionalProperties: { $ref: "#/components/schemas/ModelAccessDecision" } }
         usage: { type: [object, "null"], properties: { requests: { type: integer }, total_tokens: { type: integer }, users: { type: integer }, window_days: { type: integer } } }
-        source: { type: string, enum: [seed, model_garden] }
+        source: { type: string, enum: [model_garden, observed] }
 
     ModelAccessDecision:
       type: object
@@ -1475,7 +1765,20 @@ components:
       properties:
         object: { type: string, enum: [model_usage] }
         model: { type: string }
+        publisher: { type: [string, "null"] }
         surface: { type: string }
+        surfaces: { type: array, items: { type: string } }
+        projects: { type: array, items: { type: string } }
+        cache_write_tokens: { type: integer }
+        thoughts_tokens: { type: integer }
+        by_traffic: { type: object }
+        unattributed_requests: { type: integer }
+        unattributed_tokens: { type: integer }
+        cost_basis: { type: string, enum: [official_sku, override, default_rate, license, not_token_priced, unpriced, no_tokens] }
+        catalog_status: { type: string, enum: [model_garden, observed_only] }
+        first_seen_in_range: { type: [string, "null"] }
+        last_seen: { type: [string, "null"] }
+        lifecycle_stage: { type: [string, "null"] }
         requests: { type: integer }
         input_tokens: { type: integer }
         output_tokens: { type: integer }
@@ -1488,12 +1791,24 @@ components:
         group_by: { type: string }
         groups: { type: array, items: { type: object } }
 
+    VertexLoggingStatus:
+      type: object
+      properties:
+        object: { type: string }
+        project: { type: string }
+        enabled: { type: ["boolean", "null"] }
+        state: { type: ["string", "null"], description: "ENABLED | DISABLED | STATE_UNSPECIFIED" }
+        readable: { type: boolean }
+        action: { type: string, enum: [none, would_enable, enabled, failed] }
+        error: { type: ["string", "null"] }
+        note: { type: string }
+
     ModelAccessPolicyInput:
       type: object
       required: [mode]
       properties:
         mode: { type: string, enum: [allow_list, deny_list, unrestricted, deny_all, inherit] }
-        models: { type: array, items: { type: string }, example: ["gemini-2.5-*", "anthropic/claude-haiku-4-5"] }
+        models: { type: array, items: { type: string }, example: ["<family>-*", "<publisher>/<model-id>"] }
         actions: { type: array, items: { type: string, enum: [predict, deploy, tune] }, default: [predict] }
         inherit_from_parent: { type: boolean, default: false }
         force: { type: boolean, default: false, description: Confirm lockout-risk changes (empty allow list, deny_all) }
@@ -1554,7 +1869,7 @@ components:
     GeModelStates:
       type: object
       additionalProperties: { type: string, enum: ["on", "off", default] }
-      example: { "gemini-2.5-pro": "on", "claude-sonnet-4-5": "off" }
+      example: { "<model-id-a>": "on", "<model-id-b>": "off" }
 
     GeminiEnterpriseApp:
       type: object

@@ -1,7 +1,12 @@
-"""Monthly user & project chargeback report with exact integer-cent allocation.
+"""Monthly user x project chargeback report with exact integer-cent allocation (logs x official SKU prices).
 
-All user, project, and grand totals are summed from the exact same integer-cent (person, project)
-facts, guaranteeing zero rounding drift across rollups.
+- Usage: log token counts on every surface (Antigravity, Vertex AI incl. audit-correlated attribution, Gemini
+  Enterprise requests) - the Cloud Billing export is never read.
+- Price: official Cloud Billing Catalog SKU prices (or contract overrides), see services/pricing.py.
+- A user assigned to several projects gets one fact per (user, project); all user, project and grand totals are summed
+  from the exact same integer-cent facts, guaranteeing zero rounding drift across rollups.
+- Vertex AI usage that could not be attributed to a person is reported per project under `unattributed` so project
+  totals stay complete.
 """
 
 from __future__ import annotations
@@ -94,7 +99,7 @@ def billing_users_report(ctx) -> dict:
     complete = now >= end_utc
 
     pricing = pricing_svc.resolve_pricing(ctx, policy)
-    usage = usage_svc.antigravity_usage(ctx, start_utc, query_end)
+    usage = usage_svc.collect_usage(ctx.child(params={}), start_utc, query_end)
     mode = (ctx.config.get("caps") or {}).get("chargeback_allocation_mode") or "credit_share"
     credit_per_user = float((ctx.config.get("caps") or {}).get("credit_per_user_month") or 0.0)
     prefixes = tuple((ctx.config.get("caps") or {}).get("credit_model_prefixes") or pricing_svc.CREDIT_MODEL_PREFIXES)
@@ -194,7 +199,9 @@ def billing_users_report(ctx) -> dict:
     user_rows = []
     for email, a in users_acc.items():
         unk = email in unknown_users
+        urec = usage.users.get(email) or {}
         user_rows.append({
+            "by_model": usage_svc.model_rows(urec.get("by_model"), pricing),
             "email": email,
             "uid": identity.uid_for(email),
             "requests": a["requests"],
@@ -223,7 +230,18 @@ def billing_users_report(ctx) -> dict:
     ]
     project_rows.sort(key=lambda r: (-(r["chargeable"] or 0), r["project"]))
 
+    unattributed = []
+    for proj, prec in sorted(usage.unattributed.items()):
+        cost, partial = pricing_svc.estimate_cost(prec, pricing)
+        unattributed.append({"project": proj, "requests": int(prec.get("requests") or 0),
+                             "total_tokens": int(prec.get("total_tokens") or 0),
+                             "estimated_cost": money(to_cents(cost)) if cost is not None else None,
+                             "cost_partial": partial, "reasons": dict(prec.get("reasons") or {}),
+                             "by_model": usage_svc.model_rows(prec.get("by_model"), pricing)})
     page = paginate_list(user_rows, ctx.params, default_limit=100, max_limit=500)
+    page["unattributed"] = unattributed
+    page["pricing_source"] = pricing_svc.source_summary(pricing)
+    page["telemetry"] = usage_svc.usage_meta(usage)
     page["month"] = month
     page["currency"] = pricing.currency
     page["allocation_mode"] = mode

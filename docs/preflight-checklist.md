@@ -170,7 +170,11 @@ scripts/preflight.sh --project hub-prj --categories orgpolicy,vpcsc,iam
 | `PREFLIGHT_MANAGED_PROJECTS` | 보고서의 managed 프로젝트(스코프 탐색 결과 포함) |
 | `PREFLIGHT_ADOPT_DATASET` | `bq.ai_tables.discovered`의 채택 후보 `PROJECT:DATASET` |
 | `PREFLIGHT_ADOPT_SINKS` | `logging.sink.bigquery`의 프로젝트 수준 채택 후보 `project:sink` 목록 |
-| `PREFLIGHT_BILLING_PROJECT_ID`, `PREFLIGHT_BILLING_DATASET_ID`, `PREFLIGHT_BILLING_TABLE_ID` | `bq.billing_export` 자동 탐지 결과 |
+| `PREFLIGHT_VERTEX_LOGGING_DISABLED` | `logging.vertex_inference_logging`이 `warn`(추론 요청 로그 꺼짐)인 프로젝트 목록 — `prepare.sh` 5단계가 활성화 |
+| `PREFLIGHT_VERTEX_LOGGING_ENABLED`, `PREFLIGHT_VERTEX_LOGGING_UNKNOWN`, `PREFLIGHT_VERTEX_LOGGING_NA` | 이미 활성 / 읽기 불가(`skip`, prepare.sh가 시도 후 오류 허용) / aiplatform 미활성(해당 없음) 프로젝트 목록 |
+
+> [!NOTE]
+> 1.2.0부터 `PREFLIGHT_BILLING_PROJECT_ID` / `PREFLIGHT_BILLING_DATASET_ID` / `PREFLIGHT_BILLING_TABLE_ID`와 `bq.billing_export` 점검은 **제거**되었습니다. 비용은 로그 토큰 수 × 공식 Cloud Billing Catalog SKU 단가로 계산하며 Cloud Billing Export가 필요 없습니다([cost-methodology.md](cost-methodology.md)).
 
 #### 종료 코드
 
@@ -301,8 +305,8 @@ curl -s -H "Authorization: Bearer $KEY" "$API/v1/projects/team-a/capabilities" \
 | `api.cloudresourcemanager.enabled` | cloudresourcemanager.googleapis.com | required | scope, iam | 프로젝트/폴더/조직 탐색, IAM |
 | `api.serviceusage.enabled` | serviceusage.googleapis.com | required | readiness | API 상태, quota 프로젝트 |
 | `api.logging.enabled` | logging.googleapis.com | required | usage, audit | 추론 로그·감사 로그 |
-| `api.bigquery.enabled` | bigquery.googleapis.com | required | usage, chargeback | Log Router 데이터세트, 결제 내보내기 쿼리 |
-| `api.cloudbilling.enabled` | cloudbilling.googleapis.com | optional | pricing, spend_caps | 결제 정보·공식 SKU 가격 |
+| `api.bigquery.enabled` | bigquery.googleapis.com | required | usage, chargeback | Log Router 데이터세트(사용량 로그 쿼리) |
+| `api.cloudbilling.enabled` | cloudbilling.googleapis.com | optional | pricing, spend_caps | **공개 Cloud Billing Catalog SKU 단가**(비용 산정)·결제 계정 연결 확인 — 결제 내보내기와 무관 |
 | `api.billingbudgets.enabled` | billingbudgets.googleapis.com | optional | spend_caps | 프로젝트 하드 지출 캡 |
 | `api.orgpolicy.enabled` | orgpolicy.googleapis.com | required | model_governance, readiness | `constraints/vertexai.allowedModels`, 조직정책 점검 |
 | `api.cloudquotas.enabled` | cloudquotas.googleapis.com | required | quota_management | QuotaInfo/QuotaPreference |
@@ -388,39 +392,41 @@ curl -s -H "Authorization: Bearer $KEY" "$API/v1/projects/team-a/capabilities" \
 | `network.nat` | H (VPC 설정 시) | 해당 네트워크·리전의 Cloud Router에 Cloud NAT 존재 | `pass` / `warn` / `skip` | — | webhooks, pricing (외부 웹훅·환율 조회 실패; Google API는 PGA로 동작) | `gcloud compute routers create caps-nat-router ...` + `gcloud compute routers nats create caps-nat ...` (조치 스크립트에 포함) |
 | `network.private_dns` | H (VPC 설정 + 허브가 경계 안일 때) | `googleapis.com.` 비공개 영역이 VPC에 연결됐는지 | `pass` / `warn` / `skip` | — | usage | `*.googleapis.com` → `restricted.googleapis.com`(199.36.153.4/30) 비공개 DNS 영역 |
 
-### 3.6 `bigquery` — 데이터세트·기존 테이블·결제 내보내기
+### 3.6 `bigquery` — 데이터세트·기존 테이블
 
-사용 API: BigQuery v2 `datasets.get/list`, `tables.list/get`. 프로젝트당 최대 50개 데이터세트 스캔.
+사용 API: BigQuery v2 `datasets.get/list`, `tables.list/get`. 프로젝트당 최대 50개 데이터세트 스캔. (결제 내보내기 테이블은 점검·사용하지 않습니다.)
 
 | ID | 범위 | 점검 내용 | 결과 | 차단 | 영향 | 조치 | 자동 |
 |---|---|---|---|---|---|---|---|
 | `bq.dataset.exists` | 데이터세트 호스트 프로젝트(중앙: 감사 프로젝트, 프로젝트별: 모든 프로젝트) | 설정된 감사 데이터세트 존재·위치·CMEK | `pass` / `warn`(없음) / `skip` | — | usage | `bq --project_id=P mk --dataset --location=R P:D` 또는 `--reuse-dataset P:D` | 예 |
-| `bq.ai_tables.discovered` | H, M | 기존 AI 로그 테이블(`businessaicode_googleapis_com_inference_response*`, `cloudaudit_googleapis_com_data_access*`, `discoveryengine_googleapis_com_gen_ai_user_message*`, `discoveryengine_googleapis_com_gemini_enterprise_user_activity*`) | `pass`(설정 데이터세트에 존재) / `warn`(다른 데이터세트에 존재, 이 프로젝트가 데이터세트 호스트) / `info` / `skip` | — | usage. 채택 후보를 `data.adopt`(`install_flag`, `config`, `env`)로 제공 | `--reuse-dataset P:D` | 아니오 |
+| `bq.ai_tables.discovered` | H, M | 기존 AI 로그 테이블(`businessaicode_googleapis_com_inference_response*`, `aiplatform_googleapis_com_inference_request*`, `cloudaudit_googleapis_com_data_access*`, `discoveryengine_googleapis_com_gen_ai_user_message*`, `discoveryengine_googleapis_com_gemini_enterprise_user_activity*`) | `pass`(설정 데이터세트에 존재) / `warn`(다른 데이터세트에 존재, 이 프로젝트가 데이터세트 호스트) / `info` / `skip` | — | usage. 채택 후보를 `data.adopt`(`install_flag`, `config`, `env`)로 제공 | `--reuse-dataset P:D` | 아니오 |
 | `bq.freshness.antigravity` | 데이터세트 호스트 | 최신 테이블이 7일 이내 갱신됐는지 | `pass` / `warn` / `info`(테이블 없음) / `skip` | — | antigravity | 싱크 활성·writer 권한·서피스 사용 여부 확인 | 아니오 |
-| `bq.freshness.vertex_ai` | 데이터세트 호스트 | 위와 동일 (`cloudaudit_googleapis_com_data_access`) | 위와 동일 | — | vertex_ai | Data Access 감사 로그 활성화 | 아니오 |
+| `bq.freshness.vertex_ai` | 데이터세트 호스트 | 위와 동일 (`cloudaudit_googleapis_com_data_access`, 추론 요청 로그 테이블) | 위와 동일 | — | vertex_ai | Data Access 감사 로그 + 추론 요청 로그 활성화 | 아니오 |
 | `bq.freshness.gemini_enterprise` | 데이터세트 호스트 | 위와 동일 (discoveryengine 테이블) | 위와 동일 | — | gemini_enterprise | — | 아니오 |
-| `bq.billing_export` | H | 설정된 결제 내보내기 테이블 읽기, 미설정 시 `gcp_billing_export_resource_v1_*`(상세) → `gcp_billing_export_v1_*`(표준) 자동 탐지 | `pass` / `info`(탐지 → 설정값 제안) / `warn`(설정했으나 읽기 불가, 또는 없음) / `skip` | — | chargeback, pricing (목록가로 추정, 크레딧·할인·GE 좌석 SKU 미반영) | `BILLING_PROJECT_ID`, `BILLING_DATASET_ID`, `BILLING_TABLE_ID` 설정 | 아니오 |
-| `bq.dataset.location_consistency` | X | 감사 데이터세트들의 위치 일치, 결제 내보내기 위치와 비교 | `pass` / `warn`(데이터세트 위치 상이) / `info`(결제 내보내기와 위치 상이) | — | usage (교차 위치 조인 불가) | 중앙 데이터세트(`--central-dataset`) 또는 단일 위치 | 아니오 |
+| `bq.dataset.location_consistency` | X | 감사 데이터세트들의 위치 일치 | `pass` / `warn`(데이터세트 위치 상이) | — | usage (교차 위치 조인 불가) | 중앙 데이터세트(`--central-dataset`) 또는 단일 위치 | 아니오 |
 
 ### 3.7 `logging` — Log Router 싱크·감사 로그
 
 사용 API: Cloud Logging v2 `sinks.list`(프로젝트 + `includeChildren`인 상위 폴더/조직 싱크), `exclusions.list`,
 CRM `getIamPolicy`(프로젝트/폴더/조직의 `auditConfigs`), BigQuery `datasets.get`(접근 목록), Pub/Sub
-`topics.getIamPolicy`.
+`topics.getIamPolicy`, Vertex AI v1beta1 `projects/P:fetchPublisherModelConfig`.
 
 필요 로그(`NEEDED_LOGS`): `businessaicode.googleapis.com/inference_response`,
-`cloudaudit.googleapis.com/data_access`, `discoveryengine.googleapis.com/gen_ai_user_message`,
-`discoveryengine.googleapis.com/gemini_enterprise_user_activity`.
+**`aiplatform.googleapis.com/inference_request`**(Vertex AI 토큰 출처), `cloudaudit.googleapis.com/data_access`,
+`discoveryengine.googleapis.com/gen_ai_user_message`, `discoveryengine.googleapis.com/gemini_enterprise_user_activity`.
+기존 싱크를 채택할 때는 싱크 필터에 `log_id("aiplatform.googleapis.com/inference_request")`가 포함되어 있는지 반드시
+확인하세요(없으면 `logging.sink.bigquery`의 `data.missing`에 표시).
 
 | ID | 범위 | 점검 내용 | 결과 | 차단 | 영향 | 조치 | 자동 |
 |---|---|---|---|---|---|---|---|
 | `logging.sinks` | H, M | 싱크 목록 읽기 | `skip` | — | — | `logging.sinks.list` 권한 | — |
-| `logging.sink.bigquery` | H, M | 필요 로그가 기대 목적지(`bigquery.googleapis.com/projects/<데이터세트 프로젝트>/datasets/<D>`)로 라우팅되는지 (제외 필터 반영) | `pass` / `info`(다른 목적지로 이미 라우팅 → 채택 권장) / `warn`(누락) | — | usage + 누락 서피스 | `prepare.sh`가 `<service>-ai-logs` 싱크 생성. 채택은 `--reuse-sinks` | 예 |
-| `logging.sink.pubsub` | H, M | Antigravity 추론 로그 Pub/Sub 싱크 존재 | `pass` / `info` | — | realtime (없으면 5분 스케줄러 폴백) | `deploy.sh`가 `<service>-usage-events` 싱크 → 허브 토픽 생성 | 예 |
+| `logging.sink.bigquery` | H, M | 필요 로그(`inference_request` 포함)가 기대 목적지(`bigquery.googleapis.com/projects/<데이터세트 프로젝트>/datasets/<D>`)로 라우팅되는지 (제외 필터 반영) | `pass` / `info`(다른 목적지로 이미 라우팅 → 채택 권장) / `warn`(누락) | — | usage + 누락 서피스 | `prepare.sh`가 `<service>-ai-logs` 싱크 생성. 채택은 `--reuse-sinks` | 예 |
+| `logging.sink.pubsub` | H, M | 추론 로그(Antigravity `inference_response`, Vertex AI `inference_request`) Pub/Sub 싱크 존재 | `pass` / `info` | — | realtime (없으면 5분 스케줄러 폴백) | `deploy.sh`가 `<service>-usage-events` 싱크 → 허브 토픽 생성 | 예 |
 | `logging.sink.disabled` | H, M | AI 로그를 라우팅할 싱크가 비활성화됨 | `warn` | — | usage | `gcloud logging sinks update S --no-disabled --project=P` | 아니오 |
 | `logging.sink.writer_access` | H, M | 싱크 writer identity가 목적지에 쓰기 권한 보유(BQ: 데이터세트 WRITER/OWNER/dataEditor/dataOwner/admin 또는 프로젝트 역할, Pub/Sub: publisher/editor/admin), 최대 10개 | `pass` / `warn` / `skip`(전부 읽기 불가) | — | usage, realtime (로그가 조용히 유실) | `bq add-iam-policy-binding --member=W --role=roles/bigquery.dataEditor P:D` / `gcloud pubsub topics add-iam-policy-binding ...` | 예 |
 | `logging.default_sink` | H, M | `_Default` 싱크 존재·활성, 제외 필터·프로젝트 제외가 AI 로그를 버리지 않는지 | `pass` / `warn`(`usage_source`=auto/logging) / `info`(bigquery) | — | usage (Cloud Logging 읽기 누락, BigQuery 싱크는 무관) | 제외 필터 수정 | 아니오 |
-| `logging.audit_config.aiplatform` | H, M | Vertex AI `DATA_READ`+`DATA_WRITE` 감사 로그(프로젝트 → 폴더/조직 상속까지 확인) | `pass` / `warn` / `info`(aiplatform 미활성) / `skip` | — | vertex_ai, usage (사용자별 Vertex AI 사용량·캡 측정 불가) | `scripts/prepare.sh --project HUB [--managed-projects P] --enable-data-access-logs` (기존 auditConfigs 보존 병합) | 예 |
+| `logging.audit_config.aiplatform` | H, M | Vertex AI `DATA_READ`+`DATA_WRITE` 감사 로그(프로젝트 → 폴더/조직 상속까지 확인) | `pass` / `warn` / `info`(aiplatform 미활성) / `skip` | — | vertex_ai, usage (헤더 라벨 없는 호출의 사용자 귀속·추론 로그 미활성 시 요청 수 집계 불가) | `scripts/prepare.sh --project HUB [--managed-projects P] --enable-data-access-logs` (기존 auditConfigs 보존 병합) | 예 |
+| `logging.vertex_inference_logging` | H, M | Vertex AI **추론 요청 메타데이터 로그**(`inferenceEventLoggingConfig.state`, v1beta1 `fetchPublisherModelConfig`) 활성 여부. 설정이 한 번도 없으면(NOT_FOUND) 꺼짐으로 판정 | `pass`(ENABLED) / `warn`(꺼짐 → `PREFLIGHT_VERTEX_LOGGING_DISABLED`) / `info`(aiplatform 미활성 → 해당 없음) / `skip`(읽기 불가 — 런타임 SA에 1권한 커스텀 역할 `gcpAiCapsVertexLoggingReader` = `aiplatform.endpoints.fetchPublisherModelConfig` 부여 명령 제시) | — (경고만, 실패 아님) | vertex_ai, usage — 꺼져 있으면 Vertex AI 토큰·비용·캡을 측정할 수 없음(요청 수만, `token_sources.vertex_ai=requests_only`). Antigravity·Gemini Enterprise는 영향 없음 | `prepare.sh`가 기본으로 활성화(`ENABLE_VERTEX_INFERENCE_LOGGING=true`, 끄려면 `--no-vertex-inference-logging`). 수동: `setPublisherModelConfig` curl(제시됨) 또는 `POST /v1/projects/P/vertex-logging/enable`(런타임 SA에 `aiplatform.endpoints.setPublisherModelConfig` 필요). Cloud Logging 수집·보관 요금 발생 | 예 |
 
 ### 3.8 `surfaces` — AI 서피스 존재 여부
 
@@ -434,7 +440,7 @@ Vertex AI v1beta1 `publishers/google/models`(글로벌, 실패 시 허브 리전
 | `surface.gemini_enterprise` | H, M | Gemini Enterprise 앱(engine; `appType`이 있으면 `APP_TYPE_INTRANET`만) | `pass` / `info`(API 미활성 또는 앱 없음 → not_applicable) / `skip`(모든 로케이션 읽기 불가 → `roles/discoveryengine.viewer`) | — | gemini_enterprise |
 | `surface.antigravity` | H, M | `devToolsEnabled` 또는 최근 7일 추론 로그 | `pass` / `info`(미사용) / `skip`(읽기 불가) | — | antigravity |
 | `surface.antigravity.metadata_logging` | H, M (Antigravity 사용 중일 때) | 최근 7일 `businessaicode.googleapis.com/inference_response` 로그 없음 | `warn` | — | antigravity, usage — Gemini Enterprise > Settings > AI developer tools > Compliance > **Metadata logging**(기본 꺼짐)을 켜야 함 |
-| `surface.vertex_ai.models` | H (실행당 1회) | Model Garden 게시자 모델 카탈로그 접근 | `pass` / `warn`(리전 엔드포인트만 동작 / 모두 불가 → 정적 목록 폴백) | — | model_governance |
+| `surface.vertex_ai.models` | H (실행당 1회) | Model Garden 게시자 모델 카탈로그 접근 | `pass` / `warn`(리전 엔드포인트만 동작 / 모두 불가 → **내장 목록 없음**: 카탈로그는 로그에서 관측된 모델만으로 구성되고 패턴 확장 범위가 줄어듦) | — | model_governance |
 
 ### 3.9 `iam` — 권한
 
@@ -597,7 +603,7 @@ less fix.sh   # 반드시 검토 후 실행
 flowchart LR
     A["bq.ai_tables.discovered: 기존 테이블 발견"] -->|"data.adopt.install_flag"| B["--reuse-dataset P:D"]
     C["logging.sink.bigquery = info: 다른 목적지로 이미 라우팅"] -->|"PREFLIGHT_ADOPT_SINKS"| D["--reuse-sinks"]
-    E["bq.billing_export = info: 결제 내보내기 탐지"] -->|"PREFLIGHT_BILLING_*"| F["deploy.sh가 BILLING_* 환경변수 자동 설정"]
+    E["logging.vertex_inference_logging = warn: 추론 요청 로그 꺼짐"] -->|"PREFLIGHT_VERTEX_LOGGING_DISABLED"| F["prepare.sh 5단계가 setPublisherModelConfig로 활성화"]
 ```
 
 ### 6.1 데이터세트 채택 — `--reuse-dataset PROJECT:DATASET`
@@ -626,7 +632,8 @@ scripts/install.sh --project hub-prj --managed-projects team-a,team-b \
 ```
 
 > [!WARNING]
-> 채택한 싱크의 필터가 네 가지 필요 로그를 모두 포함하는지 확인하세요(`logging.sink.bigquery`의 `data.missing`).
+> 채택한 싱크의 필터가 다섯 가지 필요 로그(특히 1.2.0에서 추가된 `aiplatform.googleapis.com/inference_request`)를 모두
+> 포함하는지 확인하세요(`logging.sink.bigquery`의 `data.missing`).
 > 누락된 로그가 있으면 상태는 `warn`이며, `--reuse-sinks`를 써도 그 서피스의 사용량은 수집되지 않습니다.
 
 ---

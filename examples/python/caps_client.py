@@ -1,13 +1,24 @@
 """Minimal Python client for the GCP AI Usage & Spend Caps API (stdlib only).
 
+There is NO built-in model list anywhere in the API or in this client. Model IDs are whatever
+`GET /v1/models` (live Model Garden + models observed in usage logs) returns - never hardcode them; use publisher
+wildcards (`google/*`, `anthropic/*`), family patterns (`<family>-*`) or IDs taken from that response.
+
     from caps_client import CapsClient
     c = CapsClient("https://gcp-ai-usage-caps-api-123.asia-northeast3.run.app", api_key="gcpai_...")
-    c.list_models(publisher="anthropic")
-    c.set_model_access("projects", "team-a-prod", mode="allow_list", models=["gemini-2.5-*"], dry_run=True)
-    c.set_default_model_rule(mode="allow_list", models=["gemini-*"])          # block-first by default
+
+    used = c.list_models(used="true")                     # models actually observed in logs
+    model_id = used[0]["id"]                              # always take IDs from the catalog
+    c.set_model_access("projects", "team-a-prod", mode="allow_list", models=["google/*"], dry_run=True)
+    c.set_default_model_rule(mode="allow_list", models=["google/*"])          # block-first by default
     c.request_quota(project_id="team-a-prod", quota_id="GenerateContentRequestsPerMinutePerProjectPerBaseModel",
-                    model="gemini-2.5-pro", location="us-central1", requested_value=5000,
+                    model=model_id, location="us-central1", requested_value=5000,
                     justification="Company-wide coding assistant rollout", contact_email="cloud@company.com")
+
+    c.pricing(model=model_id)                             # official Cloud Billing Catalog SKU prices in use
+    c.user_projects("alice@company.com", include="iam")   # multi-project view (usage + per-project caps)
+    c.block_user("alice@company.com", services=["vertex_ai"], projects=["team-b-prod"])   # project-scoped
+    c.enable_vertex_logging("team-a-prod", dry_run=True)  # Vertex AI token source (inference_request log)
 
 Errors raise CapsApiError(status, type, code, message) mirroring the OpenAI/Anthropic error envelope.
 429 responses are retried with the `Retry-After` header (bounded).
@@ -94,15 +105,39 @@ class CapsClient:
     def set_user_cap(self, email: str, **cap):
         return self.request("PUT", "/v1/caps/users/" + self._email(email), body=cap)
 
-    def block_user(self, email: str, services=None, reason: str = "", until: str | None = None):
-        return self.request("POST", "/v1/users/%s/block" % self._email(email),
-                            body={"services": services, "reason": reason, "until": until})
+    def block_user(self, email: str, services=None, reason: str = "", until: str | None = None, projects=None):
+        """Blocks `services` for a user; `projects=[...]` limits the block to those managed projects (default: all)."""
+        body = {"services": services, "reason": reason, "until": until}
+        if projects is not None:
+            body["projects"] = list(projects)
+        return self.request("POST", "/v1/users/%s/block" % self._email(email), body=body)
 
-    def unblock_user(self, email: str, services=None, reason: str = ""):
+    def unblock_user(self, email: str, services=None, reason: str = "", projects=None):
+        """Unblocks a user everywhere, or only in `projects=[...]` (other project blocks stay in place)."""
         body = {"reason": reason}
         if services is not None:
             body["services"] = services
+        if projects is not None:
+            body["projects"] = list(projects)
         return self.request("POST", "/v1/users/%s/unblock" % self._email(email), body=body)
+
+    def user_projects(self, email: str, **params):
+        """GET /v1/users/{email}/projects - every managed project the user used / is bound to (`include="iam"`)."""
+        return self.request("GET", "/v1/users/%s/projects" % self._email(email), params=params)
+
+    def pricing(self, model: str | None = None):
+        """GET /v1/pricing - official Cloud Billing Catalog SKU prices (and overrides) used for cost estimates."""
+        return self.request("GET", "/v1/pricing", params={"model": model} if model else None)
+
+    # -- Vertex AI inference request logging (token source) ----------------------
+    def vertex_logging_status(self, project_id: str):
+        return self.request("GET", "/v1/projects/%s/vertex-logging" % project_id)
+
+    def enable_vertex_logging(self, project_id: str, dry_run: bool = False):
+        return self.request("POST", "/v1/projects/%s/vertex-logging/enable" % project_id, body={"dryRun": dry_run})
+
+    def enable_vertex_logging_bulk(self, projects=("*",), dry_run: bool = True):
+        return self.request("POST", "/v1/vertex-logging/enable", body={"projects": list(projects), "dryRun": dry_run})
 
     # -- models -------------------------------------------------------------------
     def list_models(self, **params):

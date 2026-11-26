@@ -10,7 +10,7 @@ Mechanism: list constraint `constraints/vertexai.allowedModels` (Organization Po
 
 Values are `publishers/{publisher}/models/{model}:{action}` (action predict | deploy | tune). The constraint does not
 support wildcards and is limited to 500 values, so this API stores the customer's *intent* (patterns such as
-`gemini-2.5-*`) and expands it against the model catalog at write time; `POST /v1/model-access/reconcile` (also run by
+`<family>-*`) and expands it against the model catalog at write time; `POST /v1/model-access/reconcile` (also run by
 the scheduled enforcer) re-expands intents when new model versions appear.
 
 OpenAI analogue: project model permissions (allow_list / deny_list). Differences: GCP enforces per project/folder/org
@@ -426,7 +426,8 @@ def impact_preview(ctx, scope: str, parsed_new: dict, catalog: dict, days: int =
             if proj not in projects:
                 continue
             for model, mrec in (prec.get("by_model") or {}).items():
-                pub = (catalog.get(model) or {}).get("publisher") or reg.guess_publisher(model) or ""
+                pub = mrec.get("publisher") or (catalog.get(model) or {}).get("publisher") or \
+                    reg.guess_publisher(model, catalog) or ""
                 decision, _ = decide(parsed_new, pub, model, "predict")
                 if decision == "denied":
                     m = newly_denied.setdefault(model, {"model": model, "users": set(), "requests": 0,
@@ -577,7 +578,7 @@ def list_policies(ctx) -> dict:
     if stype:
         scopes = [s for s in scopes if s.startswith(stype + "/")]
     page = paginate_list(scopes, ctx.params, default_limit=50, max_limit=200)
-    catalog = reg.load_catalog(ctx, allow_discovery=False)
+    catalog = reg.load_catalog(ctx)
     tasks = {s: (lambda s=s: (parse_policy(read_policy(ctx, s)), _intent(ctx, s))) for s in page["data"]}
     outcomes = ctx.run(tasks) if tasks else {}
     data = []
@@ -595,7 +596,7 @@ def list_policies(ctx) -> dict:
 def get_policy(ctx) -> dict:
     """GET /v1/model-access/{scope_type}/{scope_id}"""
     scope = scope_ref(ctx, ctx.path_params.get("scope_type"), ctx.path_params.get("scope_id"))
-    catalog = reg.load_catalog(ctx, allow_discovery=False)
+    catalog = reg.load_catalog(ctx)
     try:
         parsed = parse_policy(read_policy(ctx, scope))
         eff_raw = read_effective(ctx, scope)
@@ -630,7 +631,7 @@ def preview_policy(ctx) -> dict:
 
 def _model_toggle(ctx, allow: bool) -> dict:
     scope = scope_ref(ctx, ctx.path_params.get("scope_type"), ctx.path_params.get("scope_id"), for_write=True)
-    catalog = reg.load_catalog(ctx, allow_discovery=False)
+    catalog = reg.load_catalog(ctx)
     pub, mid, _ = reg.resolve(catalog, ctx.path_params.get("model_id") or "")
     model_ref = "%s/%s" % (pub, mid)
     body = ctx.body or {}
@@ -733,7 +734,7 @@ def bulk_apply(ctx) -> dict:
     scopes = list(dict.fromkeys(scopes))
     req = parse_request(ctx, body)
     dry_run = _dry_run(ctx)
-    catalog = reg.load_catalog(ctx, allow_discovery=False)
+    catalog = reg.load_catalog(ctx)
     tasks = {s: (lambda s=s: apply_policy(ctx, s, dict(req), dry_run=dry_run, catalog=catalog, preview=False))
              for s in scopes}
     outcomes = ctx.run(tasks) if tasks else {}

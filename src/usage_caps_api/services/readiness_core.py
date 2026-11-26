@@ -72,7 +72,8 @@ DOCS = {
     "deny": "https://cloud.google.com/iam/docs/deny-overview",
     "iam_quotas": "https://cloud.google.com/iam/quotas",
     "quotas": "https://cloud.google.com/docs/quotas/overview",
-    "billing_export": "https://cloud.google.com/billing/docs/how-to/export-data-bigquery-setup",
+    "vertex_inference_logging": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/capabilities/"
+                                "inference-metadata-logging",
     "cmek": "https://cloud.google.com/kms/docs/cmek-org-policy",
     "binauthz": "https://cloud.google.com/binary-authorization/docs/run/requiring-binauthz-cloud-run",
     "vertex_models": "https://cloud.google.com/vertex-ai/generative-ai/docs/control-model-access",

@@ -1,82 +1,110 @@
-"""Three-tier automatic token pricing and per-user cost estimation.
+"""Per-user cost = log token counts x official Cloud Billing Catalog SKU prices (no Cloud Billing export).
 
-Precedence:
-1. Manual overrides (policy/config `model_overrides`)
-2. Billing export effective prices (`SUM(cost)/SUM(usage.amount)` over last 30 days)
-3. Official synced Cloud Billing Catalog prices (`pricing.json`) or live Catalog API lookup
+Precedence (first hit wins per model):
+1. Manual overrides (`policy.model_prices` / `pricing.model_overrides`) - contract / discounted prices.
+2. Official Cloud Billing Catalog SKU prices (`cloudbilling.googleapis.com/v1/services/{id}/skus`), synced daily into
+   the `pricing` document by `POST /v1/internal/pricing/sync` (or fetched live once and cached).
+
+Per-model price entries carry every official SKU dimension the logs can be matched against:
+`input`, `output` (thinking tokens are billed as output), `cached` (context-cache read), `cache_write`
+(Claude prompt-cache write) and `tiers` for long-context (> N tokens), Flex, Priority and Batch prices.
+Usage records carry the matching counters (`long_*`, `by_traffic`) so each token is priced at its SKU.
+
+The Cloud Billing export is never read; the reported amount is an *estimate at list (or override) price* that
+excludes credits, committed-use discounts and taxes - see README "비용 산정 방식".
 """
 
 from __future__ import annotations
 
 import logging
 import re
-import statistics
 from dataclasses import dataclass, field
 
-from .. import timeutil
 from ..gcp import GcpError
-from ..schema import expr
 from . import models_catalog as mc
-from .base import range_params, to_float, to_int
+from .base import to_float, to_int
 
 LOG = logging.getLogger("usage_caps_api.pricing")
 
 CATALOG_V1 = "https://cloudbilling.googleapis.com/v1"
-BILLING_DAYS = 30
 CACHE_SECONDS = 6 * 3600
-MAX_CATALOG_PAGES = 8
-MAX_USD_PER_SINGLE_TOKEN = 0.0005  # $500 / 1M tokens
+MAX_USD_PER_SINGLE_TOKEN = 0.0005  # $500 / 1M tokens sanity bound
+DIRECTIONS = ("input", "output", "cached", "cache_write")
+TIER_VARIANTS = ("flex", "priority", "batch")
 
-VARIANT_WORDS = {
-    "batch", "flex", "priority", "offpeak", "peak", "caching", "cached", "cache", "live",
-    "provisioned", "tuning", "tuned", "audio", "image", "images", "video", "cyber", "bidi",
-    "embedding", "embeddings", "grounding", "search", "contributor", "deferred", "offline",
-    "lyria", "music", "song", "clip", "clips", "track", "tracks", "veo", "imagen", "chirp",
+# SKU words that mean "not a plain text-token SKU" (media, tuning, grounding, storage ...).
+NON_TEXT_WORDS = {
+    "offpeak", "peak", "live", "provisioned", "tuning", "tuned", "audio", "image", "images", "video", "cyber", "bidi",
+    "embedding", "embeddings", "grounding", "search", "contributor", "deferred", "offline", "lyria", "music", "song",
+    "clip", "clips", "track", "tracks", "veo", "imagen", "chirp", "storage", "hour", "hours",
 }
-CACHED_VARIANT_WORDS = VARIANT_WORDS - {"caching", "cached", "cache"} | {"storage", "hour", "hours"}
 LONG_CONTEXT_RE = re.compile(r"(?i)(?:>|\u2265|over|above)\s*\d|long context|long input|long output")
+THRESHOLD_RE = re.compile(r"(?i)(?:>|\u2265|>=|over|above|<=|\u2264|up to)\s*(\d+(?:\.\d+)?)\s*([km])")
 WORD_RE = re.compile(r"[a-z0-9.]+")
 CREDIT_MODEL_PREFIXES = ("gemini",)
-_MODEL_PATH_PREFIXES = ("publishers/google/models/", "models/")
+_MODEL_PATH_RE = re.compile(r"^(?:publishers/[^/]+/models/|models/)")
+TRAFFIC_TO_TIER = {"flex": "flex", "priority": "priority", "batch": "batch"}
 
 
 def credit_eligible(model: str, prefixes=CREDIT_MODEL_PREFIXES) -> bool:
-    key = str(model or "").strip().lower()
-    for p in _MODEL_PATH_PREFIXES:
-        if key.startswith(p):
-            key = key[len(p):]
+    key = _MODEL_PATH_RE.sub("", str(model or "").strip().lower())
     return bool(key) and any(key.startswith(str(pref).lower()) for pref in prefixes if pref)
 
 
-def token_sku(description, service=None, unit=None, pricing_unit=None):
+def parse_threshold(description: str) -> int | None:
+    m = THRESHOLD_RE.search(description or "")
+    if not m:
+        return None
+    mult = 1000 if m.group(2).lower() == "k" else 1_000_000
+    return int(float(m.group(1)) * mult)
+
+
+def classify_sku(description, service=None, unit=None, pricing_unit=None):
+    """Maps one official SKU to (model_key, direction, product, tier, threshold) or None.
+
+    direction: input | output | cached | cache_write; tier: None (standard) | long_context | flex | priority | batch
+    | <variant>_long_context."""
     if not description or not isinstance(description, str):
         return None
     low = description.lower()
-    if set(WORD_RE.findall(low)) & VARIANT_WORDS or LONG_CONTEXT_RE.search(low):
+    words = set(WORD_RE.findall(low))
+    if words & NON_TEXT_WORDS:
         return None
     info = mc.parse_sku(description, service)
     if not info or mc.is_non_token_model(info["key"]):
         return None
-    measure = mc.classify_measure(description, unit, pricing_unit)
-    if measure == "input_tokens":
-        return info["key"], "input", info["product"]
-    if measure == "output_tokens":
-        return info["key"], "output", info["product"]
-    return None
+    if "cach" in low:
+        tokenish = "token" in low or "token" in (pricing_unit or "").lower() or (unit or "").lower() == "count"
+        if not tokenish:
+            return None
+        direction = "cache_write" if ("write" in words or "creation" in words or "writes" in words) else "cached"
+    else:
+        measure = mc.classify_measure(description, unit, pricing_unit)
+        if measure == "input_tokens":
+            direction = "input"
+        elif measure == "output_tokens":
+            direction = "output"
+        else:
+            return None
+    variant = next((v for v in TIER_VARIANTS if v in words), None)
+    is_long = bool(LONG_CONTEXT_RE.search(low))
+    tier = ("%s_long_context" % variant if variant else "long_context") if is_long else variant
+    return info["key"], direction, info["product"], tier, (parse_threshold(description) if is_long else None)
+
+
+# Backwards compatible helpers (standard-tier input/output/cached only).
+def token_sku(description, service=None, unit=None, pricing_unit=None):
+    hit = classify_sku(description, service, unit, pricing_unit)
+    if not hit or hit[3] is not None or hit[1] not in ("input", "output"):
+        return None
+    return hit[0], hit[1], hit[2]
 
 
 def cached_token_sku(description, service=None, unit=None, pricing_unit=None):
-    if not description or not isinstance(description, str):
+    hit = classify_sku(description, service, unit, pricing_unit)
+    if not hit or hit[3] is not None or hit[1] != "cached":
         return None
-    low = description.lower()
-    if "cach" not in low or set(WORD_RE.findall(low)) & CACHED_VARIANT_WORDS or LONG_CONTEXT_RE.search(low):
-        return None
-    info = mc.parse_sku(description, service)
-    if not info or mc.is_non_token_model(info["key"]):
-        return None
-    if mc.classify_measure(description, unit, pricing_unit) != "cached_tokens":
-        return None
-    return info["key"], "cached", info["product"]
+    return hit[0], "cached", hit[2]
 
 
 def money(unit: dict | None) -> float:
@@ -91,65 +119,14 @@ def first_positive_money(tiers) -> float:
     return 0.0
 
 
-def effective_prices(rows):
-    """Computes ({model_key: {"input", "output"}}, currency, usd_rate) from billing rows."""
-    buckets: dict = {}
-    currency, rates = None, []
-    for row in rows or []:
-        hit = token_sku(row.get("sku"), row.get("service"), row.get("unit"), row.get("pricing_unit"))
-        amount = to_float(row.get("amount")) or 0.0
-        cost = to_float(row.get("cost")) or 0.0
-        if not hit or amount <= 0 or cost <= 0:
-            continue
-        key, direction, prod = hit
-        rank = 1 if prod else 0
-        agg = buckets.setdefault((key, direction, rank), [0.0, 0.0])
-        agg[0] += cost
-        agg[1] += amount
-        currency = currency or row.get("currency")
-        rate = to_float(row.get("fx"))
-        if rate:
-            rates.append(rate)
-    best_rank: dict = {}
-    for key, direction, rank in buckets:
-        cur = best_rank.get((key, direction))
-        if cur is None or rank < cur:
-            best_rank[(key, direction)] = rank
-    out: dict = {}
-    for (key, direction), rank in best_rank.items():
-        cost, amount = buckets[(key, direction, rank)]
-        out.setdefault(key, {})[direction] = cost / amount * 1e6
-    return out, currency, (statistics.mean(rates) if rates else None)
-
-
-def billing_price_rows(ctx, src) -> list[dict]:
-    f = mc.billing_fields(src)
-    if not (f["sku"] and f["cost"] and f["amount"]):
-        return []
-    rate = expr("b", src.schema, "currency_conversion_rate", cast="FLOAT64") or "CAST(NULL AS FLOAT64)"
-    null = "CAST(NULL AS STRING)"
-    rng = timeutil.parse_range({}, ctx.tz_name, BILLING_DAYS)
-    sql = (
-        "WITH %s\nSELECT %s AS sku, %s AS service, %s AS unit, %s AS pricing_unit, "
-        "SUM(IFNULL(%s, 0)) AS amount, SUM(IFNULL(%s, 0)) AS cost, "
-        "ANY_VALUE(%s) AS currency, AVG(%s) AS fx\n"
-        "FROM bil b WHERE %s AND %s\nGROUP BY sku, service, unit, pricing_unit"
-        % (src.cte("bil", start="start_ts"), f["sku"], f["service"] or null, f["unit"] or null,
-           f["pricing_unit"] or null, f["amount"], f["cost"], f["currency"] or null, rate,
-           mc.ai_clause(f), mc.excluded_clause(f))
-    )
-    params = range_params(rng)
-    params["excluded"] = ctx.excluded_patterns
-    return ctx.query(sql, params, "pricing")
-
-
 @dataclass
 class PriceTable:
     currency: str
-    prices: dict = field(default_factory=dict)  # key -> {"input", "output", "cached"?, "source"}
+    prices: dict = field(default_factory=dict)  # key -> {"input","output","cached","cache_write","tiers","source"}
     fx: dict | None = None
     counts: dict = field(default_factory=dict)
     aliases: dict = field(default_factory=dict)
+    synced_at: str | None = None
 
     def lookup(self, model: str | None) -> dict | None:
         key = mc.normalize_model_id(str(model or ""))
@@ -177,6 +154,7 @@ class Pricing:
     cached_models: tuple = ()  # ((prefix, cached), ...) longest first
     source: str = "auto"
     table: PriceTable | None = None
+    provisioned: str = "on_demand"   # on_demand (price PT tokens at on-demand SKU) | zero (prepaid commitment)
 
     @property
     def configured(self) -> bool:
@@ -186,11 +164,22 @@ class Pricing:
             return True
         return self.input_per_million > 0 or self.output_per_million > 0
 
-    def price(self, model: str | None) -> tuple[float, float, bool]:
+    def _override(self, model: str | None):
         key = str(model or "").lower()
         for prefix, pin, pout in self.models:
             if key and (key == prefix or key.startswith(prefix)):
-                return pin, pout, True
+                return pin, pout
+        return None
+
+    def entry(self, model: str | None) -> dict | None:
+        if self.source == "auto" and self.table is not None and model:
+            return self.table.lookup(model)
+        return None
+
+    def price(self, model: str | None) -> tuple[float, float, bool]:
+        ov = self._override(model)
+        if ov is not None:
+            return ov[0], ov[1], True
         if self.source == "auto" and self.table is not None and model:
             hit = self.table.lookup(model)
             if hit:
@@ -205,19 +194,78 @@ class Pricing:
         for prefix, pcached in self.cached_models:
             if key and (key == prefix or key.startswith(prefix)):
                 return pcached, True
-        if self.source == "auto" and self.table is not None and model:
-            hit = self.table.lookup(model) or {}
+        if self._override(model) is None:
+            hit = self.entry(model) or {}
             if hit.get("cached") is not None:
                 return float(hit["cached"]), True
         return input_price, False
+
+    def rates(self, model: str | None, tier: str | None = None) -> dict:
+        """{input, output, cached, cache_write, priced, tier_used} for one model and optional SKU tier."""
+        pin, pout, priced = self.price(model)
+        pcached, _ = self.cached_price(model, pin)
+        hit = self.entry(model) if self._override(model) is None else None
+        pcw = float(hit["cache_write"]) if (hit and hit.get("cache_write") is not None) else pin
+        out = {"input": pin, "output": pout, "cached": pcached, "cache_write": pcw, "priced": priced, "tier_used": None}
+        if tier and hit:
+            t = (hit.get("tiers") or {}).get(tier)
+            if t:
+                out["input"] = float(t.get("input", out["input"]) or out["input"])
+                out["output"] = float(t.get("output", out["output"]) or out["output"])
+                out["cached"] = float(t.get("cached", out["cached"]) or out["cached"])
+                out["cache_write"] = float(t.get("cache_write", out["cache_write"]) or out["cache_write"])
+                out["tier_used"] = tier
+        return out
+
+
+def _bucket_cost(c: dict, r: dict) -> float:
+    inp = max(0, to_int(c.get("input_tokens")))
+    cached = min(max(0, to_int(c.get("cached_tokens"))), inp)
+    cw = min(max(0, to_int(c.get("cache_write_tokens"))), inp - cached)
+    out = max(0, to_int(c.get("output_tokens")))
+    return ((inp - cached - cw) * r["input"] + cached * r["cached"] + cw * r["cache_write"] + out * r["output"]) / 1e6
+
+
+def model_cost(model: str | None, agg: dict, pricing: Pricing) -> tuple[float, bool, int]:
+    """(cost, priced, tokens) for one model aggregate, honouring traffic-type tiers and long-context tiers."""
+    tokens = to_int(agg.get("total_tokens") if "total_tokens" in agg else agg.get("tokens"))
+    if "input_tokens" not in agg and ("promptTokens" in agg or "candidateTokens" in agg):
+        agg = {"input_tokens": agg.get("promptTokens"), "output_tokens": agg.get("candidateTokens"),
+               "cached_tokens": agg.get("cachedTokens"), "total_tokens": tokens}
+    base = pricing.rates(model)
+    if "output_tokens" in agg:
+        agg = dict(agg)
+        agg["output_tokens"] = max(to_int(agg.get("output_tokens")), tokens - to_int(agg.get("input_tokens")), 0)
+    traffic = agg.get("by_traffic") or {}
+    buckets = {t: dict(v) for t, v in traffic.items()} if traffic else {"on_demand": {
+        k: agg.get(k) for k in ("input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens")}}
+    total = 0.0
+    long_c = {k: to_int(agg.get("long_" + k)) for k in ("input_tokens", "output_tokens", "cached_tokens")}
+    if any(long_c.values()):
+        std = buckets.get("on_demand") or next(iter(buckets.values()))
+        for k, v in long_c.items():
+            take = min(v, to_int(std.get(k)))
+            std[k] = to_int(std.get(k)) - take
+            long_c[k] = take
+        lr = pricing.rates(model, "long_context")
+        total += _bucket_cost(long_c, lr)
+    for t, c in buckets.items():
+        if t == "provisioned" and pricing.provisioned == "zero":
+            continue
+        tier = TRAFFIC_TO_TIER.get(t)
+        r = pricing.rates(model, tier) if tier else base
+        total += _bucket_cost(c, r)
+    return total, base["priced"], tokens
 
 
 def estimate_cost(rec: dict, pricing: Pricing | None) -> tuple[float | None, bool]:
     """Returns (estimated_cost, partial) for a usage record with per-model token counts.
 
-    - Uncached input tokens (prompt - cached) are priced at input rate.
-    - Prompt cache hit tokens (cached) are priced at cached rate (falling back to input rate).
-    - Output & thinking tokens (`max(total - prompt, candidate, 0)`) are priced at output rate.
+    - Uncached input tokens are priced at the input SKU; context-cache reads at the cached SKU; Claude cache writes at
+      the cache-write SKU (falling back to input).
+    - Output & thinking tokens (`max(total - prompt, candidates + thoughts)`) are priced at the output SKU.
+    - Flex / Priority / Batch traffic uses the matching SKU tier; prompts above the long-context threshold use the
+      long-context SKU tier; Provisioned Throughput traffic follows `pricing.provisioned_throughput_cost`.
     """
     if pricing is None or not pricing.configured:
         return None, False
@@ -227,33 +275,57 @@ def estimate_cost(rec: dict, pricing: Pricing | None) -> tuple[float | None, boo
     priced_tokens = 0
     used_tokens = 0
     for model, agg in parts:
-        tokens = to_int(agg.get("total_tokens") if "total_tokens" in agg else agg.get("tokens"))
         if model and mc.is_non_token_model(model):
             continue
-        prompt = max(0, to_int(agg.get("input_tokens") if "input_tokens" in agg else agg.get("promptTokens")))
-        cached = min(max(0, to_int(agg.get("cached_tokens") if "cached_tokens" in agg else agg.get("cachedTokens"))), prompt)
-        cand = max(0, to_int(agg.get("output_tokens") if "output_tokens" in agg else agg.get("candidateTokens")))
-        output = max(tokens - prompt, cand, 0)
-        pin, pout, priced = pricing.price(model)
-        pcached, _ = pricing.cached_price(model, pin)
+        cost, priced, tokens = model_cost(model, agg, pricing)
         used_tokens += tokens
-        if pin or pout:
+        if cost > 0 or priced:
             priced_tokens += tokens
         if not priced and tokens > 0:
             partial = True
-        total += (prompt - cached) * pin / 1e6 + cached * pcached / 1e6 + output * pout / 1e6
+        total += cost
     if used_tokens > 0 and priced_tokens == 0:
         return None, True
     return round(total, 6), partial
 
 
+def cost_basis(model: str | None, agg: dict, pricing: Pricing | None) -> str:
+    if (agg or {}).get("surface") == "gemini_enterprise":
+        return "license"
+    if model and mc.is_non_token_model(model):
+        return "not_token_priced"
+    if pricing is None:
+        return "unpriced"
+    if pricing._override(model) is not None:  # pylint: disable=protected-access
+        return "override"
+    if pricing.entry(model):
+        return "official_sku"
+    if pricing.source != "auto" and (pricing.input_per_million or pricing.output_per_million):
+        return "default_rate"
+    return "unpriced" if to_int((agg or {}).get("total_tokens")) > 0 else "no_tokens"
+
+
+def source_summary(pricing: Pricing | None) -> dict:
+    table = pricing.table if pricing else None
+    return {
+        "method": "log_token_counts_x_official_sku_prices",
+        "billing_export": "not_used",
+        "source": pricing.source if pricing else None,
+        "catalog_synced_at": table.synced_at if table else None,
+        "official_sku_models": (table.counts or {}).get("catalog", 0) if table else 0,
+        "override_models": len(pricing.models) if pricing else 0,
+        "provisioned_throughput": pricing.provisioned if pricing else None,
+        "currency": pricing.currency if pricing else None,
+    }
+
+
 def split_cost(rec: dict, pricing: Pricing | None, prefixes=CREDIT_MODEL_PREFIXES):
-    """Splits cost into (credit_eligible_gemini_cost, paid_other_cost, known, partial)."""
-    gemini, other = {}, {}
+    """Splits cost into (credit_eligible_cost, paid_other_cost, known, partial)."""
+    eligible, other = {}, {}
     for model, agg in (rec.get("by_model") or {}).items():
-        (gemini if credit_eligible(model, prefixes) else other)[model] = agg
+        (eligible if credit_eligible(model, prefixes) else other)[model] = agg
     costs, known, partial = [], True, False
-    for part in (gemini, other):
+    for part in (eligible, other):
         if not part:
             costs.append(0.0)
             continue
@@ -266,33 +338,21 @@ def split_cost(rec: dict, pricing: Pricing | None, prefixes=CREDIT_MODEL_PREFIXE
     return costs[0], costs[1], known, partial
 
 
-def combine(currency: str, billing: dict, billing_currency: str | None, billing_usd_rate: float | None,
-            catalog: dict, usd_rate: float | None, effective: str | None) -> tuple[PriceTable, str | None]:
-    warning = None
-    factor = None
-    if billing:
-        if not billing_currency or billing_currency == currency:
-            factor = 1.0
-        elif usd_rate:
-            if billing_currency == "USD":
-                factor = usd_rate
-            elif billing_usd_rate:
-                factor = usd_rate / billing_usd_rate
-        if factor is None:
-            warning = ("Billing export prices in %s could not be converted to %s; using catalog prices."
-                       % (billing_currency, currency))
-    prices = {k: dict(v, source="catalog") for k, v in (catalog or {}).items()}
-    billed = 0
-    if factor:
-        for k, entry in billing.items():
-            merged = dict(prices.get(k) or {})
-            merged.update({d: v * factor for d, v in entry.items()})
-            merged["source"] = "billing"
-            prices[k] = merged
-            billed += 1
-    fx = {"from": "USD", "to": currency, "rate": round(usd_rate, 6), "as_of": effective} if (usd_rate and currency != "USD") else None
-    counts = {"billing": billed, "catalog": sum(1 for e in prices.values() if e.get("source") == "catalog")}
-    return PriceTable(currency=currency, prices=prices, fx=fx, counts=counts), warning
+def _scale(entry: dict, rate: float) -> dict:
+    out = {d: float(entry[d]) * rate for d in DIRECTIONS if to_float(entry.get(d)) is not None}
+    tiers = {}
+    for t, te in (entry.get("tiers") or {}).items():
+        if isinstance(te, dict):
+            st = {d: float(te[d]) * rate for d in DIRECTIONS if to_float(te.get(d)) is not None}
+            if te.get("threshold_tokens"):
+                st["threshold_tokens"] = int(te["threshold_tokens"])
+            if st:
+                tiers[t] = st
+    if tiers:
+        out["tiers"] = tiers
+    if entry.get("skus"):
+        out["skus"] = entry["skus"]
+    return out
 
 
 def synced_prices(ctx, currency: str):
@@ -308,38 +368,33 @@ def synced_prices(ctx, currency: str):
             return None
     out = {}
     for key, item in (doc.get("models") or {}).items():
-        if not isinstance(item, dict):
-            continue
-        entry = {d: float(item[d]) * rate for d in ("input", "output", "cached") if to_float(item.get(d)) is not None}
-        if entry:
-            out[key] = entry
-    return out, rate, as_of
+        if isinstance(item, dict):
+            entry = _scale(item, rate)
+            if entry:
+                out[key] = entry
+    return out, rate, as_of, doc.get("synced_at")
 
 
 def build_price_table(ctx, currency: str | None = None) -> PriceTable:
     from . import pricing_sync
     p_cfg = ctx.config.get("pricing") or {}
-    billing, billing_currency, billing_rate = {}, None, None
-    src = ctx.billing_source()
-    if src is not None:
-        try:
-            billing, billing_currency, billing_rate = effective_prices(billing_price_rows(ctx, src))
-            ctx.add_source(src.label)
-        except GcpError as err:
-            ctx.warn_error(src.label, err, "Billing export token prices")
-    cap_currency = (currency or p_cfg.get("currency") or billing_currency or "USD").upper()
-    catalog, usd_rate, effective = {}, None, None
+    cap_currency = (currency or p_cfg.get("currency") or "USD").upper()
+    catalog, usd_rate, effective, synced_at = {}, None, None, None
     synced = synced_prices(ctx, cap_currency)
     if synced is not None:
-        catalog, usd_rate, effective = synced
-        ctx.add_source("pricing:synced_catalog")
+        catalog, usd_rate, effective, synced_at = synced
+        ctx.add_source("pricing:cloud_billing_catalog(synced)")
     elif getattr(ctx.app, "gcp", None) is not None and type(ctx.app.gcp).__name__ == "Gcp":
         try:
             catalog, usd_rate, effective = pricing_sync.live_catalog_prices(ctx, cap_currency)
             ctx.add_source("api:cloudbilling.services.skus")
         except GcpError as err:
             ctx.warn_error("api:cloudbilling.services.skus", err, "Cloud Billing Catalog prices")
-    table, warning = combine(cap_currency, billing, billing_currency, billing_rate, catalog, usd_rate, effective)
+    prices = {k: dict(v, source="official_sku") for k, v in (catalog or {}).items()}
+    fx = ({"from": "USD", "to": cap_currency, "rate": round(usd_rate, 6), "as_of": effective}
+          if (usd_rate and cap_currency != "USD") else None)
+    table = PriceTable(currency=cap_currency, prices=prices, fx=fx, synced_at=synced_at,
+                       counts={"catalog": len(prices)})
     aliases = {}
     for item in p_cfg.get("model_aliases") or []:
         left, _, right = str(item).partition("=")
@@ -352,12 +407,9 @@ def build_price_table(ctx, currency: str | None = None) -> PriceTable:
             if not isinstance(item, dict) or not item.get("model"):
                 continue
             mkey = mc.normalize_model_id(item["model"])
-            entry = {d: float(item[d]) * ovr_factor for d in ("input", "output", "cached")
-                     if to_float(item.get(d)) is not None}
+            entry = {d: float(item[d]) * ovr_factor for d in DIRECTIONS if to_float(item.get(d)) is not None}
             if mkey and entry:
                 table.prices[mkey] = dict(entry, source="override")
-    if warning:
-        ctx.warn("pricing:fx", "fx_unavailable", warning)
     return table
 
 
@@ -389,6 +441,7 @@ def resolve_pricing(ctx, policy: dict | None = None) -> Pricing:
                 currency = table.currency
         except GcpError:
             table = None
+    prov = str(p_cfg.get("provisioned_throughput_cost") or "on_demand").lower()
     return Pricing(
         currency=currency,
         input_per_million=float(p_cfg.get("input_price_per_million") or 0),
@@ -397,4 +450,5 @@ def resolve_pricing(ctx, policy: dict | None = None) -> Pricing:
         cached_models=tuple(cached_models),
         source=source,
         table=table,
+        provisioned=prov if prov in ("on_demand", "zero") else "on_demand",
     )

@@ -23,8 +23,8 @@ class HttpEndpointsE2ETests(unittest.TestCase):
         app, fake_gcp = build_test_app(webhook_sender=fake_sender)
         now = dt.datetime.now(dt.timezone.utc)
         fake_gcp.log_entries = [
-            make_inference_entry("alice@company.com", model="gemini-2.5-pro", prompt=1_000_000, cand=500_000, ts=now),
-            make_inference_entry("bob@company.com", model="claude-sonnet-4.5", prompt=2_000_000, cand=1_000_000, ts=now),
+            make_inference_entry("alice@company.com", model="gemini-test-pro", prompt=1_000_000, cand=500_000, ts=now),
+            make_inference_entry("bob@company.com", model="claude-test-sonnet", prompt=2_000_000, cand=1_000_000, ts=now),
         ]
         admin_token = "gcpai_boot_secret_1234567890"
 

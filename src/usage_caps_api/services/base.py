@@ -1,4 +1,7 @@
-"""Request context, multi-project audit/billing source resolution, and SQL helpers."""
+"""Request context, multi-project Log Router (BigQuery sink) source resolution, and SQL helpers.
+
+Costs are always computed from log token counts x official Cloud Billing Catalog SKU prices; the Cloud Billing
+export is intentionally never read (many enterprises cannot grant access to it)."""
 
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ AUDIT_DATA_ACCESS = "cloudaudit_googleapis_com_data_access"
 GE_MESSAGE = "discoveryengine_googleapis_com_gen_ai_user_message"
 GE_ACTIVITY = "discoveryengine_googleapis_com_gemini_enterprise_user_activity"
 AGY_SINK = "businessaicode_googleapis_com_inference_response"
+VERTEX_INFERENCE_SINK = "aiplatform_googleapis_com_inference_request"
 
 
 def num(value, default=0):
@@ -261,7 +265,7 @@ class Ctx:
         val, _ = cache.get_or_compute(full_key, ttl_s, lambda: fn(self))
         return val
 
-    # -- Audit & Billing BigQuery table resolution -------------------------------
+    # -- Log Router BigQuery table resolution --------------------------------------
     def audit_source(self, prefix: str, *, optional: bool = False):
         """Resolves a Log Router BigQuery table across central or per-project audit datasets."""
         dataset = self.audit_dataset
@@ -297,20 +301,6 @@ class Ctx:
         if not found:
             return None
         return found[0] if len(found) == 1 else MultiTableSource(found)
-
-    def billing_source(self):
-        bil = self.ws.get("billing") or {}
-        project = (bil.get("project_id") or self.project or "").strip().lower()
-        dataset = (bil.get("dataset") or "").strip()
-        table = (bil.get("table") or "").strip()
-        if not (config.valid_project(project) and config.valid_dataset(dataset) and config.valid_table(table)):
-            return None
-        try:
-            return self.registry.resolve(project, dataset, table, quota_project=self.quota_project,
-                                         max_bytes=self.max_bytes)
-        except GcpError as err:
-            self.warn_error("bigquery:%s.%s" % (project, dataset), err, "Billing export")
-            return None
 
 
 def parse_rfc3339_safe(value):

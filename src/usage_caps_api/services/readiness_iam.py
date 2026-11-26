@@ -23,6 +23,13 @@ from .readiness_core import (CRM_V1, CRM_V3, DOCS, IAM_V2, PUBSUB_V1, QUOTAS_V1,
                              cmd_bind_folder, cmd_bind_org, cmd_bind_project, cmd_enable, disabled_service,
                              sa_member, skipped)
 
+# Project-level custom role holding only aiplatform.endpoints.fetchPublisherModelConfig (created by deploy.sh /
+# Terraform in every project); `{project}` is replaced by the project id in grant commands.
+VERTEX_LOGGING_READER_ID = "gcpAiCapsVertexLoggingReader"
+VERTEX_LOGGING_READER = "projects/{project}/roles/" + VERTEX_LOGGING_READER_ID
+VERTEX_FETCH = "aiplatform.endpoints.fetchPublisherModelConfig"
+VERTEX_SET = "aiplatform.endpoints.setPublisherModelConfig"
+
 # (permission, least-privilege role, level, feature, where) — where: all | hub | dataset
 RUNTIME_PERMISSIONS = (
     ("resourcemanager.projects.get", "roles/browser", "required", "scope", "all"),
@@ -42,6 +49,10 @@ RUNTIME_PERMISSIONS = (
     ("monitoring.timeSeries.list", "roles/monitoring.viewer", "optional", "quota_management", "all"),
     ("discoveryengine.engines.get", "roles/discoveryengine.viewer", "optional", "gemini_enterprise", "all"),
     ("discoveryengine.engines.update", "roles/discoveryengine.editor", "optional", "gemini_enterprise", "all"),
+    # Vertex AI inference request metadata logging state (readiness + GET /v1/projects/{p}/vertex-logging). No
+    # read-only predefined role is documented to hold it, so the installer creates a one-permission custom role.
+    ("aiplatform.endpoints.fetchPublisherModelConfig", VERTEX_LOGGING_READER, "optional", "vertex_inference_logging",
+     "all"),
 )
 ENFORCER_PERMISSIONS = (
     ("iam.denypolicies.get", "roles/iam.denyAdmin", "required", "caps_enforcement", "all"),
@@ -76,6 +87,14 @@ DEPLOYER_MANAGED = (
     ("logging.sinks.create", "roles/logging.configWriter"),
     ("logging.sinks.get", "roles/logging.configWriter"),
 )
+# Optional installer permissions on every project: enabling Vertex AI inference request metadata logging
+# (prepare.sh) and creating the gcpAiCapsVertexLoggingReader custom role (deploy.sh). Missing ones only warn: the
+# installer skips those steps and prints the commands.
+DEPLOYER_OPTIONAL = (
+    ("aiplatform.endpoints.setPublisherModelConfig", "roles/aiplatform.admin"),
+    ("aiplatform.endpoints.fetchPublisherModelConfig", "roles/aiplatform.admin"),
+    ("iam.roles.create", "roles/iam.roleAdmin"),
+)
 SCOPE_PERMISSIONS = ("iam.denypolicies.get", "iam.denypolicies.create", "iam.denypolicies.update",
                      "iam.denypolicies.delete")
 
@@ -92,7 +111,7 @@ ROLE_COVERS = {
 _ALL_PROJECT = {"resourcemanager.projects.get", "resourcemanager.projects.getIamPolicy", "serviceusage.services.get", "logging.logEntries.list",
                 "logging.privateLogEntries.list", "bigquery.jobs.create", "bigquery.tables.getData",
                 "monitoring.timeSeries.list", "discoveryengine.engines.get", "discoveryengine.engines.update",
-                "cloudquotas.quotas.get", "cloudquotas.quotas.update", "orgpolicy.policy.get"}
+                "cloudquotas.quotas.get", "cloudquotas.quotas.update", "orgpolicy.policy.get", VERTEX_FETCH, VERTEX_SET}
 ROLE_PERMISSIONS = {
     "roles/owner": _ALL_PROJECT,
     "roles/editor": _ALL_PROJECT - {"logging.privateLogEntries.list"},
@@ -126,7 +145,18 @@ ROLE_PERMISSIONS = {
     "roles/discoveryengine.viewer": {"discoveryengine.engines.get"},
     "roles/discoveryengine.editor": {"discoveryengine.engines.get", "discoveryengine.engines.update"},
     "roles/discoveryengine.admin": {"discoveryengine.engines.get", "discoveryengine.engines.update"},
+    # Vertex AI Administrator / User hold the publisher model config permissions (User: per Google's
+    # request-response logging guidance; not exhaustively verified for fetch).
+    "roles/aiplatform.admin": {VERTEX_FETCH, VERTEX_SET},
+    "roles/aiplatform.user": {VERTEX_FETCH, VERTEX_SET},
 }
+
+
+def _role_permissions(role: str) -> set:
+    """Permissions of a role for `bindings` mode, including the installer's project/org custom role."""
+    if role.endswith("/roles/" + VERTEX_LOGGING_READER_ID):
+        return {VERTEX_FETCH}
+    return ROLE_PERMISSIONS.get(role, set())
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +221,7 @@ def _bindings_granted(run, pid: str, member: str):
     roles = _member_roles(policies, member)
     granted = set()
     for role in roles:
-        granted |= ROLE_PERMISSIONS.get(role, set())
+        granted |= _role_permissions(role)
     return granted, roles, None
 
 
@@ -216,11 +246,19 @@ def _minimal_roles(roles: list[str]) -> list[str]:
     return out
 
 
+def cmd_create_vertex_reader(pid: str) -> str:
+    return ("gcloud iam roles create %s --project=%s --title=\"GCP AI Caps Vertex logging reader\" "
+            "--permissions=%s --stage=GA" % (VERTEX_LOGGING_READER_ID, pid, VERTEX_FETCH))
+
+
 def _grant_commands(run, pid: str, member: str, roles: list[str]) -> list[str]:
     cmds = []
     for role in roles:
         if role in ORG_ONLY_ROLES:
             cmds.append(cmd_bind_org(run.org_of(pid) or "ORGANIZATION_ID", member, role))
+        elif role.endswith("/roles/" + VERTEX_LOGGING_READER_ID):
+            cmds.append(cmd_create_vertex_reader(pid))
+            cmds.append(cmd_bind_project(pid, member, role))
         else:
             cmds.append(cmd_bind_project(pid, member, role))
     return list(dict.fromkeys(cmds))
@@ -235,7 +273,7 @@ def _verdict(run, pid: str, cid: str, title: tuple, who: str, member: str, neede
     if not missing:
         return check(cid, "iam", "pass", *title, "%s has every permission needed on %s (%s)." % (who, pid, mode),
                      data=data)
-    roles = _minimal_roles([m[1] for m in missing])
+    roles = [r.replace("{project}", pid) for r in _minimal_roles([m[1] for m in missing])]
     data["missing_roles"] = roles
     cmds = _grant_commands(run, pid, member, roles)
     features = sorted({m[3] for m in missing})
@@ -312,24 +350,38 @@ def deployer_permission_check(run, pid: str) -> dict | None:
     title = ("설치 실행 계정 권한", "Deployer (caller) permissions")
     cid = "iam.deployer.permissions"
     table = DEPLOYER_HUB if run.is_hub(pid) else DEPLOYER_MANAGED
+    asked = list(dict.fromkeys([p for p, _ in table] + [p for p, _ in DEPLOYER_OPTIONAL]))
     try:
         granted, valid = test_permissions(run, "%s/projects/%s:testIamPermissions" % (
-            CRM_V1, urllib.parse.quote(pid, safe="")), [p for p, _ in table], hint=pid)
+            CRM_V1, urllib.parse.quote(pid, safe="")), asked, hint=pid)
     except GcpError as err:
         return skipped(cid, "iam", *title, err, what="projects.testIamPermissions on %s" % pid)
     missing = [(p, r) for p, r in table if p in valid and p not in granted]
-    if not missing:
+    missing_opt = [(p, r) for p, r in DEPLOYER_OPTIONAL if p in valid and p not in granted]
+    if not missing and not missing_opt:
         return check(cid, "iam", "pass", *title, "The caller can run the installer on %s." % pid)
-    roles = list(dict.fromkeys(r for _, r in missing))
+    if not missing:
+        roles = list(dict.fromkeys(r for _, r in missing_opt))
+        return check(cid, "iam", "warn", *title,
+                     "The caller lacks optional permissions on %s: %s. The installer cannot enable Vertex AI inference "
+                     "request metadata logging and/or create the %s custom role there (it warns and continues). "
+                     "Grant: %s." % (pid, ", ".join(p for p, _ in missing_opt), VERTEX_LOGGING_READER_ID,
+                                      ", ".join(roles)),
+                     impact=["vertex_inference_logging"],
+                     commands=[cmd_bind_project(pid, "user:YOUR_ACCOUNT", r) for r in roles],
+                     data={"missing": [], "missing_optional": [p for p, _ in missing_opt], "missing_roles": roles,
+                           "self_grant": "resourcemanager.projects.setIamPolicy" in granted})
+    roles = list(dict.fromkeys(r for _, r in missing + missing_opt))
     can_self_grant = "resourcemanager.projects.setIamPolicy" in granted
     detail = "The caller lacks on %s: %s. %s" % (
-        pid, ", ".join(p for p, _ in missing),
+        pid, ", ".join(p for p, _ in missing + missing_opt),
         "It holds Project IAM Admin, so it can grant itself: %s." % ", ".join(roles) if can_self_grant else
         "Ask a project owner for roles/owner (or roles/editor + roles/resourcemanager.projectIamAdmin), or: %s."
         % ", ".join(roles))
     return check(cid, "iam", "warn" if can_self_grant else "fail", *title, detail, impact=["deployment"],
                  commands=[cmd_bind_project(pid, "user:YOUR_ACCOUNT", r) for r in roles],
-                 data={"missing": [p for p, _ in missing], "missing_roles": roles, "self_grant": can_self_grant})
+                 data={"missing": [p for p, _ in missing], "missing_optional": [p for p, _ in missing_opt],
+                       "missing_roles": roles, "self_grant": can_self_grant})
 
 
 def scope_permission_checks(run) -> list[dict]:
@@ -370,7 +422,7 @@ def scope_permission_checks(run) -> list[dict]:
                     if oerr is None and opol:
                         policies.append(opol)
             for role in _member_roles(policies, member):
-                granted |= ROLE_PERMISSIONS.get(role, set())
+                granted |= _role_permissions(role)
             missing = [p for p in SCOPE_PERMISSIONS if p not in granted]
         cmd = (cmd_bind_folder(sid, member, "roles/iam.denyAdmin") if coll == "folders"
                else cmd_bind_org(sid, member, "roles/iam.denyAdmin"))
