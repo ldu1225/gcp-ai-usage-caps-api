@@ -95,8 +95,10 @@ def discovery_locations(ctx) -> list[str]:
 class Ctx:
     """Per-request execution context."""
 
-    def __init__(self, app, cfg: dict, caller, *, params=None, path_params=None, body=None, rng=None, version: int = 1):
+    def __init__(self, app, cfg: dict, caller, *, params=None, path_params=None, body=None, rng=None, version: int = 1,
+                 headers=None):
         self.app = app
+        self.headers = {str(k).lower(): str(v) for k, v in (headers or {}).items() if v is not None}
         self.config = cfg
         self.caller = caller
         self.params = dict(params or {})
@@ -118,6 +120,7 @@ class Ctx:
             body=self.body if body is None else body,
             rng=self.range if rng is None else rng,
             version=self.version,
+            headers=self.headers,
         )
 
     def absorb(self, other: "Ctx"):

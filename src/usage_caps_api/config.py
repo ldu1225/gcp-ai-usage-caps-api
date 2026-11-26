@@ -38,6 +38,8 @@ CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 VALID_SERVICES = ("antigravity", "vertex_ai", "gemini_enterprise")
 ENFORCEMENT_MODES = ("manual", "auto")
 ENFORCEMENT_BACKENDS = ("iam_deny", "notify_only")
+MODEL_VIOLATION_ACTIONS = ("block_service", "notify")
+MODEL_POLICY_SCOPE_TYPES = ("projects", "folders", "organizations")
 MANDATORY_EXCLUDED_SKU_PATTERNS = ("code assist", "duet ai")
 PLACEHOLDER_PROJECTS = ("your-gcp-project-id", "demo-project", "my-project")
 
@@ -81,6 +83,7 @@ DEFAULTS = {
         "public_base_url": "",
         "oidc_allowed_service_accounts": [],
         "oidc_default_scopes": ["usage:read", "caps:read", "caps:write"],
+        "oidc_internal_service_accounts": [],
         "allow_local_insecure": False,
     },
     "caps": {
@@ -128,6 +131,46 @@ DEFAULTS = {
         "include_partner_models": True,
         "excluded_sku_patterns": list(MANDATORY_EXCLUDED_SKU_PATTERNS),
         "fx_sources": ["https://open.er-api.com/v6/latest/USD"],
+    },
+    # Facts about the central (hub) deployment that governs every managed project.
+    "hub": {
+        "region": "asia-northeast3",
+        "service_name": "gcp-ai-usage-caps-api",
+        "runtime_service_account": "",
+        "enforcer_service_account": "",
+        "org_id": "",
+        "vpc_network": "",
+        "vpc_subnet": "",
+        "vpc_egress": "",
+        "usage_events_topic": "",
+        "state_bucket": "",
+    },
+    # Model governance (catalog, access policies, per-user model rules).
+    "models": {
+        "violation_action": "block_service",
+        "violation_block_minutes": 0,
+        "violation_notify": True,
+        "policy_scopes": ["projects"],
+        "allow_org_policy_writes": True,
+        "default_actions": ["predict"],
+        "always_allow": ["publishers/anthropic/models/count-tokens"],
+        "publishers": ["google", "anthropic", "meta", "mistralai", "ai21", "deepseek-ai", "qwen", "openai"],
+        "catalog_location": "global",
+        "catalog_ttl_seconds": 3600,
+        "max_policy_values": 500,
+        "protected_principals": [],
+    },
+    # Quota / rate-limit management through the Cloud Quotas API.
+    "quotas": {
+        "service": "aiplatform.googleapis.com",
+        "contact_email": "",
+        "headroom_warn_pct": 80,
+        "max_projects_per_call": 50,
+    },
+    # Environment readiness diagnostics (preflight).
+    "readiness": {
+        "cache_ttl_seconds": 900,
+        "strict": True,
     },
 }
 
@@ -333,6 +376,36 @@ def _apply_env(cfg: dict, env: dict) -> dict:
     if get("CAP_CURRENCY") and CURRENCY_RE.match(get("CAP_CURRENCY").upper()):
         caps["currency"] = get("CAP_CURRENCY").upper()
         out["pricing"]["currency"] = get("CAP_CURRENCY").upper()
+
+    hub = out["hub"]
+    for env_name, key in (("HUB_REGION", "region"), ("SERVICE_NAME", "service_name"),
+                          ("RUNTIME_SERVICE_ACCOUNT", "runtime_service_account"),
+                          ("ENFORCER_SERVICE_ACCOUNT", "enforcer_service_account"),
+                          ("VPC_NETWORK", "vpc_network"), ("VPC_SUBNET", "vpc_subnet"),
+                          ("VPC_EGRESS", "vpc_egress"), ("USAGE_EVENTS_TOPIC", "usage_events_topic"),
+                          ("SETTINGS_BUCKET", "state_bucket")):
+        if get(env_name):
+            hub[key] = get(env_name)
+    if get("ORG_ID") and SCOPE_ID_RE.match(get("ORG_ID")):
+        hub["org_id"] = get("ORG_ID")
+
+    models = out["models"]
+    if get("MODEL_VIOLATION_ACTION") in MODEL_VIOLATION_ACTIONS:
+        models["violation_action"] = get("MODEL_VIOLATION_ACTION")
+    if get("MODEL_VIOLATION_BLOCK_MINUTES"):
+        models["violation_block_minutes"] = max(0, min(525600, int(get("MODEL_VIOLATION_BLOCK_MINUTES"))))
+    if get("MODEL_POLICY_SCOPES"):
+        scopes = [s for s in _split_csv(get("MODEL_POLICY_SCOPES")) if s in MODEL_POLICY_SCOPE_TYPES]
+        if scopes:
+            models["policy_scopes"] = scopes
+    if env.get("ALLOW_ORG_POLICY_WRITES") is not None and env.get("ALLOW_ORG_POLICY_WRITES") != "":
+        models["allow_org_policy_writes"] = _parse_bool(env["ALLOW_ORG_POLICY_WRITES"])
+    if get("MODEL_PROTECTED_PRINCIPALS"):
+        models["protected_principals"] = [e.lower() for e in _split_csv(get("MODEL_PROTECTED_PRINCIPALS"))]
+
+    quotas = out["quotas"]
+    if get("QUOTA_CONTACT_EMAIL") and valid_email(get("QUOTA_CONTACT_EMAIL")):
+        quotas["contact_email"] = get("QUOTA_CONTACT_EMAIL")
 
     return out
 

@@ -1,13 +1,21 @@
-# GCP AI Usage & Spend Caps API - Headless Cloud Run + BigQuery Sink + Pub/Sub + Cloud Scheduler
+# GCP AI Usage & Spend Caps API - hub-and-spoke deployment
 #
-# Architecture:
-# - Cloud Run v2 Service: Headless M2M REST API (API Key + Google OIDC auth, zero UI)
-# - Cloud Run v2 Job (`<service>-enforcer`): Runs `python -m usage_caps_api.enforce_job` as its own
-#   dedicated service account — the ONLY identity granted org-level `roles/iam.denyAdmin`.
-# - GCS Bucket: Private, versioned JSON document store (policy, user_caps, api_keys, webhooks, pricing).
-# - BigQuery Dataset + Log Router Sink: Captures Antigravity, Vertex AI Data Access, and Gemini Enterprise logs.
-# - Pub/Sub Topic + Push Subscription: Routes Antigravity inference logs in real time to `/v1/internal/usage-event`.
-# - Cloud Scheduler: Periodic 5-minute safety net & period-reset enforcement + daily pricing sync.
+# ONE hub project (var.project_id) hosts:
+# - Cloud Run v2 Service: headless M2M REST API (API key + Google OIDC auth, zero UI)
+# - Cloud Run v2 Job (`<service>-enforcer`): runs `python -m usage_caps_api.enforce_job` as its own service account,
+#   the ONLY identity granted organization-level `roles/iam.denyAdmin`
+# - GCS bucket: private, versioned JSON document store (policies, hashed API keys, webhooks, pricing, readiness)
+# - ONE central BigQuery dataset (default) receiving a Log Router sink from EVERY managed project
+# - ONE Pub/Sub topic + push subscription fed by a Pub/Sub sink in EVERY managed project (real-time usage events)
+# - Cloud Scheduler: 5-minute enforcement safety net + daily pricing sync
+#
+# MANY managed projects (var.managed_projects; or folder/organization scope via var.scope_type/var.scope_ids):
+# - Log Router sinks (BigQuery -> central dataset, Pub/Sub -> hub topic), writer identities granted on the hub only
+# - least-privilege roles for the runtime and enforcer service accounts (or folder/org-level grants)
+# - optional Vertex AI Data Access audit logs (google_project_iam_audit_config)
+#
+# Existing resources are adopted instead of duplicated: var.reuse_dataset = "PROJECT:DATASET" reads the dataset with a
+# data source and only adds sinks/grants. Run `scripts/preflight.sh` first to detect adoptable datasets and sinks.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -29,40 +37,74 @@ data "google_project" "this" {
 }
 
 locals {
-  api_sa_member     = "serviceAccount:${google_service_account.api_sa.email}"
+  api_sa_member      = "serviceAccount:${google_service_account.api_sa.email}"
   enforcer_sa_member = "serviceAccount:${google_service_account.enforcer_sa.email}"
-  quota_project     = var.quota_project_id != "" ? var.quota_project_id : var.project_id
-  billing_project   = var.billing_project_id != "" ? var.billing_project_id : var.project_id
-  settings_bucket   = var.settings_bucket_name != "" ? var.settings_bucket_name : "${var.project_id}-${var.service_name}-state"
-  dataset_location  = var.dataset_location != "" ? var.dataset_location : var.region
-  run_url           = "https://${var.service_name}-${data.google_project.this.number}.${var.region}.run.app"
-  public_base_url   = var.public_base_url != "" ? trimsuffix(var.public_base_url, "/") : local.run_url
-  enforcer_job_name = "${var.service_name}-enforcer"
-  enforcer_job_ref  = "projects/${var.project_id}/locations/${var.region}/jobs/${local.enforcer_job_name}"
-  usage_topic_name  = "${var.service_name}-usage-events"
-  usage_sub_id      = "${var.service_name}-usage-events-push"
-  usage_sub_ref     = "projects/${var.project_id}/subscriptions/${local.usage_sub_id}"
+  quota_project      = var.quota_project_id != "" ? var.quota_project_id : var.project_id
+  billing_project    = var.billing_project_id != "" ? var.billing_project_id : var.project_id
+  settings_bucket    = var.settings_bucket_name != "" ? var.settings_bucket_name : "${var.project_id}-${var.service_name}-state"
+  dataset_location   = var.dataset_location != "" ? var.dataset_location : var.region
+  run_url            = "https://${var.service_name}-${data.google_project.this.number}.${var.region}.run.app"
+  public_base_url    = var.public_base_url != "" ? trimsuffix(var.public_base_url, "/") : local.run_url
+  enforcer_job_name  = "${var.service_name}-enforcer"
+  enforcer_job_ref   = "projects/${var.project_id}/locations/${var.region}/jobs/${local.enforcer_job_name}"
+  usage_topic_name   = "${var.service_name}-usage-events"
+  usage_sub_id       = "${var.service_name}-usage-events-push"
+  usage_sub_ref      = "projects/${var.project_id}/subscriptions/${local.usage_sub_id}"
+
+  # Hub-and-spoke topology ---------------------------------------------------------------------------------------
+  managed_projects = [for p in distinct(concat(var.managed_projects, var.linked_projects)) : p if p != var.project_id]
+  sink_projects    = concat([var.project_id], local.managed_projects)
+  reuse            = var.reuse_dataset != ""
+  reuse_parts      = local.reuse ? split(":", var.reuse_dataset) : ["", ""]
+  dataset_id       = local.reuse ? local.reuse_parts[1] : var.audit_dataset_id
+  central          = local.reuse || var.central_dataset
+  audit_project    = local.reuse ? local.reuse_parts[0] : (var.central_dataset ? (var.audit_project_id != "" ? var.audit_project_id : var.project_id) : "")
+  # Projects whose dataset this configuration creates (none when an existing dataset is adopted).
+  dataset_projects = var.create_audit_sink && !local.reuse ? (local.central ? [local.audit_project] : local.sink_projects) : []
+  sink_destination = { for p in local.sink_projects : p => (local.central ? local.audit_project : p) }
+  scope_grants     = var.grant_scope_roles && contains(["folder", "organization"], var.scope_type)
 
   required_apis = concat([
     "bigquery.googleapis.com",
     "logging.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "iam.googleapis.com",
+    "iamcredentials.googleapis.com",
     "run.googleapis.com",
     "storage.googleapis.com",
+    "secretmanager.googleapis.com",
+    "artifactregistry.googleapis.com",
     "cloudbilling.googleapis.com",
     "serviceusage.googleapis.com",
     "cloudscheduler.googleapis.com",
     "pubsub.googleapis.com",
+    "orgpolicy.googleapis.com",
+    "cloudquotas.googleapis.com",
+    "monitoring.googleapis.com",
+    "aiplatform.googleapis.com",
   ], var.spend_caps_enabled ? ["billingbudgets.googleapis.com"] : [])
 
+  managed_apis = concat([
+    "logging.googleapis.com",
+    "iam.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "serviceusage.googleapis.com",
+    "orgpolicy.googleapis.com",
+    "cloudquotas.googleapis.com",
+    "monitoring.googleapis.com",
+  ], local.central ? [] : ["bigquery.googleapis.com"])
+
   api_roles = [
+    "roles/browser",
     "roles/bigquery.dataViewer",
     "roles/bigquery.jobUser",
     "roles/logging.viewer",
     "roles/logging.privateLogViewer",
     "roles/logging.logWriter",
     "roles/serviceusage.serviceUsageConsumer",
+    "roles/monitoring.viewer",
+    "roles/cloudquotas.admin",
+    "roles/discoveryengine.editor",
   ]
 
   enforcer_roles = [
@@ -74,6 +116,43 @@ locals {
     "roles/serviceusage.serviceUsageConsumer",
   ]
 
+  api_managed_roles = concat([
+    "roles/browser",
+    "roles/logging.viewer",
+    "roles/logging.privateLogViewer",
+    "roles/monitoring.viewer",
+    "roles/cloudquotas.admin",
+    "roles/discoveryengine.editor",
+    "roles/serviceusage.serviceUsageConsumer",
+  ], local.central ? [] : ["roles/bigquery.dataViewer"])
+
+  enforcer_managed_roles = concat([
+    "roles/logging.viewer",
+    "roles/logging.privateLogViewer",
+  ], local.central ? [] : ["roles/bigquery.dataViewer"])
+
+  # Organization-only roles: Deny Admin (enforcer), Deny Reviewer + Organization Policy Administrator (API, model
+  # governance writes of constraints/vertexai.allowedModels).
+  org_role_grants = {
+    "enforcer|roles/iam.denyAdmin"    = local.enforcer_sa_member
+    "api|roles/iam.denyReviewer"      = local.api_sa_member
+    "api|roles/orgpolicy.policyAdmin" = local.api_sa_member
+  }
+
+  managed_api_pairs = var.enable_managed_apis ? {
+    for pair in setproduct(local.managed_projects, local.managed_apis) : "${pair[0]}|${pair[1]}" => { project = pair[0], service = pair[1] }
+  } : {}
+  api_managed_pairs = var.grant_managed_roles && !local.scope_grants ? {
+    for pair in setproduct(local.managed_projects, local.api_managed_roles) : "${pair[0]}|${pair[1]}" => { project = pair[0], role = pair[1] }
+  } : {}
+  enforcer_managed_pairs = var.grant_managed_roles && !local.scope_grants ? {
+    for pair in setproduct(local.managed_projects, local.enforcer_managed_roles) : "${pair[0]}|${pair[1]}" => { project = pair[0], role = pair[1] }
+  } : {}
+  scope_role_pairs = local.scope_grants ? merge(
+    { for pair in setproduct(var.scope_ids, local.api_managed_roles) : "api|${pair[0]}|${pair[1]}" => { id = pair[0], role = pair[1], member = local.api_sa_member } },
+    { for pair in setproduct(var.scope_ids, local.enforcer_managed_roles) : "enforcer|${pair[0]}|${pair[1]}" => { id = pair[0], role = pair[1], member = local.enforcer_sa_member } },
+  ) : {}
+
   ai_log_filter = join(" OR ", [
     "log_id(\"businessaicode.googleapis.com/inference_response\")",
     "(log_id(\"cloudaudit.googleapis.com/data_access\") AND protoPayload.serviceName=\"aiplatform.googleapis.com\")",
@@ -84,10 +163,11 @@ locals {
   common_env = {
     HOST                          = "0.0.0.0"
     PROJECT_ID                    = var.project_id
-    SCAN_PROJECTS                 = join(",", var.linked_projects)
+    SCAN_PROJECTS                 = join(",", local.managed_projects)
+    SCAN_ALL_PROJECTS             = "false"
     QUOTA_PROJECT_ID              = var.quota_project_id
-    AUDIT_DATASET_ID              = var.audit_dataset_id
-    AUDIT_PROJECT_ID              = var.audit_project_id
+    AUDIT_DATASET_ID              = local.dataset_id
+    AUDIT_PROJECT_ID              = local.audit_project
     SCOPE_TYPE                    = var.scope_type
     SCOPE_IDS                     = join(",", var.scope_ids)
     BILLING_PROJECT_ID            = var.billing_project_id
@@ -98,23 +178,40 @@ locals {
     SETTINGS_BUCKET               = google_storage_bucket.state.name
     PUBLIC_BASE_URL               = local.public_base_url
     OIDC_ALLOWED_SERVICE_ACCOUNTS = join(",", var.oidc_allowed_service_accounts)
+    HUB_REGION                    = var.region
+    SERVICE_NAME                  = var.service_name
     RUNTIME_SERVICE_ACCOUNT       = google_service_account.api_sa.email
+    ENFORCER_SERVICE_ACCOUNT      = google_service_account.enforcer_sa.email
+    ORG_ID                        = var.organization_id
+    VPC_NETWORK                   = var.vpc_network
+    VPC_SUBNET                    = var.vpc_subnet
+    VPC_EGRESS                    = var.vpc_network != "" ? var.vpc_egress : ""
     ENFORCEMENT_BACKEND           = var.enforcement_backend
     ENFORCEMENT_MODE              = var.enforcement_mode
     DENY_ATTACHMENT               = var.deny_attachment
     DENY_POLICY_ID                = var.deny_policy_id
     ENFORCEMENT_JOB               = local.enforcer_job_ref
+    USAGE_EVENTS_TOPIC            = var.realtime_enforcement ? local.usage_topic_name : ""
     USAGE_EVENTS_SUBSCRIPTION     = var.realtime_enforcement ? local.usage_sub_ref : ""
     SPEND_CAPS_ENABLED            = var.spend_caps_enabled ? "true" : "false"
     CAP_CURRENCY                  = var.cap_currency
+    QUOTA_CONTACT_EMAIL           = var.quota_contact_email
+    MODEL_VIOLATION_ACTION        = var.model_violation_action
   }
 }
 
-# 1. Enable required Google Cloud APIs
+# 1. Enable required Google Cloud APIs (hub + managed projects)
 resource "google_project_service" "apis" {
   for_each           = toset(local.required_apis)
   project            = var.project_id
   service            = each.value
+  disable_on_destroy = false
+}
+
+resource "google_project_service" "managed_apis" {
+  for_each           = local.managed_api_pairs
+  project            = each.value.project
+  service            = each.value.service
   disable_on_destroy = false
 }
 
@@ -147,19 +244,53 @@ resource "google_project_iam_member" "enforcer_roles" {
   member   = local.enforcer_sa_member
 }
 
-# Optional Organization-level IAM Deny roles (Deny Reviewer for API, Deny Admin ONLY for Enforcer Job)
-resource "google_organization_iam_member" "api_deny_reviewer" {
-  count  = var.grant_org_roles && var.organization_id != "" ? 1 : 0
-  org_id = var.organization_id
-  role   = "roles/iam.denyReviewer"
-  member = local.api_sa_member
+# Central dataset hosted outside the hub: read access for both identities.
+resource "google_project_iam_member" "audit_project_readers" {
+  for_each = local.central && local.audit_project != var.project_id ? {
+    api      = local.api_sa_member
+    enforcer = local.enforcer_sa_member
+  } : {}
+  project = local.audit_project
+  role    = "roles/bigquery.dataViewer"
+  member  = each.value
 }
 
-resource "google_organization_iam_member" "enforcer_deny_admin" {
-  count  = var.grant_org_roles && var.organization_id != "" ? 1 : 0
-  org_id = var.organization_id
-  role   = "roles/iam.denyAdmin"
-  member = local.enforcer_sa_member
+# Managed projects: least-privilege roles on EVERY managed project ...
+resource "google_project_iam_member" "api_managed_roles" {
+  for_each = local.api_managed_pairs
+  project  = each.value.project
+  role     = each.value.role
+  member   = local.api_sa_member
+}
+
+resource "google_project_iam_member" "enforcer_managed_roles" {
+  for_each = local.enforcer_managed_pairs
+  project  = each.value.project
+  role     = each.value.role
+  member   = local.enforcer_sa_member
+}
+
+# ... or once on the governed folders / organization (var.grant_scope_roles).
+resource "google_folder_iam_member" "scope_roles" {
+  for_each = var.scope_type == "folder" ? local.scope_role_pairs : {}
+  folder   = "folders/${each.value.id}"
+  role     = each.value.role
+  member   = each.value.member
+}
+
+resource "google_organization_iam_member" "scope_roles" {
+  for_each = var.scope_type == "organization" ? local.scope_role_pairs : {}
+  org_id   = each.value.id
+  role     = each.value.role
+  member   = each.value.member
+}
+
+# Organization-only roles (Deny Admin ONLY for the Enforcer Job; Deny Reviewer + Org Policy Admin for the API)
+resource "google_organization_iam_member" "org_roles" {
+  for_each = var.grant_org_roles && var.organization_id != "" ? local.org_role_grants : {}
+  org_id   = var.organization_id
+  role     = split("|", each.key)[1]
+  member   = each.value
 }
 
 # 3. Private Versioned GCS State Bucket
@@ -198,44 +329,75 @@ resource "google_storage_bucket_iam_member" "enforcer_state_rw" {
   member = local.enforcer_sa_member
 }
 
-# 4. BigQuery Audit Dataset + AI Log Router Sink
+# 4. Audit dataset(s) + AI Log Router sinks from every project
+data "google_bigquery_dataset" "reused" {
+  count      = local.reuse ? 1 : 0
+  project    = local.audit_project
+  dataset_id = local.dataset_id
+}
+
 resource "google_bigquery_dataset" "audit" {
-  count                       = var.create_audit_sink ? 1 : 0
-  dataset_id                  = var.audit_dataset_id
-  project                     = var.project_id
-  location                    = local.dataset_location
-  description                 = "AI telemetry logs for GCP AI Usage & Spend Caps API"
-  delete_contents_on_destroy  = false
-  depends_on                  = [google_project_service.apis]
+  for_each                   = toset(local.dataset_projects)
+  dataset_id                 = local.dataset_id
+  project                    = each.value
+  location                   = local.dataset_location
+  description                = "AI telemetry logs for GCP AI Usage & Spend Caps API"
+  delete_contents_on_destroy = false
+  depends_on                 = [google_project_service.apis, google_project_service.managed_apis]
 }
 
 resource "google_logging_project_sink" "ai_logs_bq" {
-  count                  = var.create_audit_sink ? 1 : 0
+  for_each               = var.create_audit_sink ? toset(local.sink_projects) : toset([])
   name                   = "${var.service_name}-ai-logs"
-  project                = var.project_id
-  destination            = "bigquery.googleapis.com/projects/${var.project_id}/datasets/${google_bigquery_dataset.audit[0].dataset_id}"
+  project                = each.value
+  destination            = "bigquery.googleapis.com/projects/${local.sink_destination[each.value]}/datasets/${local.dataset_id}"
   filter                 = local.ai_log_filter
   unique_writer_identity = true
   bigquery_options {
     use_partitioned_tables = true
   }
-  depends_on = [google_bigquery_dataset.audit]
+  depends_on = [google_bigquery_dataset.audit, data.google_bigquery_dataset.reused]
 }
 
 resource "google_bigquery_dataset_iam_member" "sink_writer" {
-  count      = var.create_audit_sink ? 1 : 0
-  project    = var.project_id
-  dataset_id = google_bigquery_dataset.audit[0].dataset_id
+  for_each   = google_logging_project_sink.ai_logs_bq
+  project    = local.sink_destination[each.key]
+  dataset_id = local.dataset_id
   role       = "roles/bigquery.dataEditor"
-  member     = google_logging_project_sink.ai_logs_bq[0].writer_identity
+  member     = each.value.writer_identity
+}
+
+# Optional: Vertex AI Data Access audit logs in every project (per-user Vertex AI usage). This resource is
+# authoritative for the aiplatform.googleapis.com audit config only; other services' configs are untouched.
+resource "google_project_iam_audit_config" "vertex_data_access" {
+  for_each = var.enable_data_access_logs ? toset(local.sink_projects) : toset([])
+  project  = each.value
+  service  = "aiplatform.googleapis.com"
+  audit_log_config {
+    log_type = "ADMIN_READ"
+  }
+  audit_log_config {
+    log_type = "DATA_READ"
+  }
+  audit_log_config {
+    log_type = "DATA_WRITE"
+  }
 }
 
 # 5. Headless Cloud Run v2 API Service
 resource "google_cloud_run_v2_service" "api" {
-  name     = var.service_name
-  location = var.region
-  project  = var.project_id
-  ingress  = var.ingress
+  name                 = var.service_name
+  location             = var.region
+  project              = var.project_id
+  ingress              = var.ingress
+  invoker_iam_disabled = var.no_invoker_iam_check
+
+  dynamic "binary_authorization" {
+    for_each = var.binary_authorization_policy != "" ? [1] : []
+    content {
+      policy = var.binary_authorization_policy
+    }
+  }
 
   template {
     service_account = google_service_account.api_sa.email
@@ -243,6 +405,17 @@ resource "google_cloud_run_v2_service" "api" {
     scaling {
       min_instance_count = var.min_instances
       max_instance_count = var.max_instances
+    }
+
+    dynamic "vpc_access" {
+      for_each = var.vpc_network != "" ? [1] : []
+      content {
+        egress = var.vpc_egress == "private-ranges-only" ? "PRIVATE_RANGES_ONLY" : "ALL_TRAFFIC"
+        network_interfaces {
+          network    = var.vpc_network
+          subnetwork = var.vpc_subnet
+        }
+      }
     }
 
     containers {
@@ -289,9 +462,10 @@ resource "google_cloud_run_v2_service" "api" {
   ]
 }
 
-# Allow external M2M API Key callers at Cloud Run edge if configured (application still enforces Bearer API key / OIDC)
+# Public edge (the application still enforces Bearer API key / OIDC). Skipped when domain restricted sharing forbids
+# allUsers: set no_invoker_iam_check = true instead (scripts/preflight.sh reports which one applies).
 resource "google_cloud_run_v2_service_iam_member" "public_edge" {
-  count    = var.allow_unauthenticated_edge ? 1 : 0
+  count    = var.allow_unauthenticated_edge && !var.no_invoker_iam_check ? 1 : 0
   project  = var.project_id
   location = var.region
   name     = google_cloud_run_v2_service.api.name
@@ -314,12 +488,30 @@ resource "google_cloud_run_v2_job" "enforcer" {
   project             = var.project_id
   deletion_protection = false
 
+  dynamic "binary_authorization" {
+    for_each = var.binary_authorization_policy != "" ? [1] : []
+    content {
+      policy = var.binary_authorization_policy
+    }
+  }
+
   template {
     task_count = 1
     template {
       service_account = google_service_account.enforcer_sa.email
       max_retries     = 0
       timeout         = "600s"
+
+      dynamic "vpc_access" {
+        for_each = var.vpc_network != "" ? [1] : []
+        content {
+          egress = var.vpc_egress == "private-ranges-only" ? "PRIVATE_RANGES_ONLY" : "ALL_TRAFFIC"
+          network_interfaces {
+            network    = var.vpc_network
+            subnetwork = var.vpc_subnet
+          }
+        }
+      }
 
       containers {
         image   = var.container_image
@@ -361,6 +553,7 @@ resource "google_cloud_run_v2_job_iam_member" "api_job_executor" {
 }
 
 # 7. Real-time Pub/Sub Usage Event Pipeline -> POST /v1/internal/usage-event
+#    ONE topic in the hub; a Pub/Sub sink in EVERY project publishes into it.
 resource "google_pubsub_topic" "usage_events" {
   count      = var.realtime_enforcement ? 1 : 0
   name       = local.usage_topic_name
@@ -369,20 +562,20 @@ resource "google_pubsub_topic" "usage_events" {
 }
 
 resource "google_logging_project_sink" "usage_events" {
-  count                  = var.realtime_enforcement ? 1 : 0
+  for_each               = var.realtime_enforcement ? toset(local.sink_projects) : toset([])
   name                   = local.usage_topic_name
-  project                = var.project_id
+  project                = each.value
   destination            = "pubsub.googleapis.com/projects/${var.project_id}/topics/${google_pubsub_topic.usage_events[0].name}"
   filter                 = "log_id(\"businessaicode.googleapis.com/inference_response\")"
   unique_writer_identity = true
 }
 
 resource "google_pubsub_topic_iam_member" "usage_sink_pub" {
-  count   = var.realtime_enforcement ? 1 : 0
-  project = var.project_id
-  topic   = google_pubsub_topic.usage_events[0].name
-  role    = "roles/pubsub.publisher"
-  member  = google_logging_project_sink.usage_events[0].writer_identity
+  for_each = google_logging_project_sink.usage_events
+  project  = var.project_id
+  topic    = google_pubsub_topic.usage_events[0].name
+  role     = "roles/pubsub.publisher"
+  member   = each.value.writer_identity
 }
 
 resource "google_service_account_iam_member" "pubsub_token_creator" {

@@ -30,6 +30,13 @@ ERROR_STATUS = {
     "method_not_allowed": 405,
     "conflict": 409,
     "not_configured": 409,
+    "console_required": 409,
+    "not_applicable": 409,
+    "quota_request_pending": 409,
+    "precondition_failed": 412,
+    "unprocessable": 422,
+    "lockout_prevented": 422,
+    "quota_exceeds_maximum": 422,
     "rate_limited": 429,
     "upstream_error": 502,
     "unavailable": 503,
@@ -43,6 +50,8 @@ ERROR_TYPE = {
     404: "not_found_error",
     405: "invalid_request_error",
     409: "conflict_error",
+    412: "precondition_failed_error",
+    422: "invalid_request_error",
     429: "rate_limit_error",
     502: "upstream_error",
     503: "service_unavailable_error",
@@ -51,7 +60,7 @@ ERROR_TYPE = {
 
 MAX_BODY_BYTES = 256 * 1024
 MAX_QUERY_FIELDS = 64
-ALLOWED_METHODS = ("GET", "POST", "PUT", "DELETE")
+ALLOWED_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 _PARAM_SEGMENT_RE = re.compile(r"^\{([a-zA-Z_][a-zA-Z0-9_]*)\}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -329,6 +338,9 @@ class BaseHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         self._dispatch("PUT")
+
+    def do_PATCH(self):
+        self._dispatch("PATCH")
 
     def do_DELETE(self):
         self._dispatch("DELETE")

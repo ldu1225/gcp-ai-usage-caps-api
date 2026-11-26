@@ -110,6 +110,8 @@ def main(argv=None, *, app: App | None = None, environ=None) -> int:
         ctx.deny_quota_patience = True
         out = caps.enforce_cycle(ctx, trigger=args.trigger, dry_run=args.dry_run, use_job_if_configured=False)
         summary.update(summarize(out))
+        from .services import governance_cycle
+        summary["governance"] = governance_cycle.run(ctx, dry_run=args.dry_run, trigger=args.trigger)
         exit_code = EXIT_FAILED if (summary.get("failed") or summary.get("result") == "failed") else EXIT_OK
     except RuntimeError as err:
         summary.update(result="configuration_error", error=scrub(str(err)))

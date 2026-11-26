@@ -3,7 +3,8 @@
 Security guarantees:
 - API keys are NEVER stored in plaintext. Only a per-key random salt + SHA-256 digest is persisted.
 - Key comparison uses constant-time `hmac.compare_digest`.
-- Scopes: `usage:read`, `caps:read`, `caps:write`, `users:write`, `admin` (`admin` implies all scopes).
+- Scopes: `usage:read`, `caps:read`, `caps:write`, `users:write`, `models:read`, `models:write`, `quotas:read`,
+  `quotas:write`, `admin` (`admin` implies all scopes).
 - GCP OIDC verifies RS256 Google ID tokens (`accounts.google.com`) against `PUBLIC_BASE_URL` audience
   and checks allowlisted service accounts (plus the Cloud Run runtime SA for Pub/Sub & Scheduler).
 """
@@ -33,7 +34,8 @@ LOG = logging.getLogger("usage_caps_api.auth")
 API_KEYS_DOC = "api_keys"
 KEY_PREFIX = "gcpai"
 KEY_ID_RE = re.compile(r"^[0-9a-f]{8,16}$")
-ALL_SCOPES = ("usage:read", "caps:read", "caps:write", "users:write", "admin")
+ALL_SCOPES = ("usage:read", "caps:read", "caps:write", "users:write",
+              "models:read", "models:write", "quotas:read", "quotas:write", "admin")
 ALL_SCOPES_SET = frozenset(ALL_SCOPES)
 INTERNAL_SCOPE = "internal:pubsub"
 
@@ -374,9 +376,12 @@ class Authenticator:
             LOG.warning("OIDC token rejected: service account not in allowlist")
             raise ApiError("forbidden", "This service account is not authorized to call this API.")
         scopes = set(s for s in (auth_cfg.get("oidc_default_scopes") or []) if s in ALL_SCOPES_SET)
+        internal = {str(e).strip().lower() for e in (auth_cfg.get("oidc_internal_service_accounts") or []) if e}
         if own_sa and email == own_sa:
             scopes.update({"caps:write", "caps:read", "usage:read", INTERNAL_SCOPE})
-        else:
+        elif email in internal or not own_sa:
+            # Pub/Sub push / Scheduler identities explicitly allowed to call /v1/internal/* (or legacy deployments
+            # without a known runtime SA).
             scopes.add(INTERNAL_SCOPE)
         return Caller(id=email, name=email, auth_type="oidc", scopes=frozenset(scopes), rate_key="oidc:" + email)
 
@@ -393,7 +398,7 @@ class Authenticator:
             forwarded = any(headers.get(h) for h in FORWARDING_HEADERS)
             if is_loopback(peer) and not forwarded:
                 return Caller(id="local-dev@localhost", name="Local Dev", auth_type="local",
-                              scopes=frozenset(ALL_SCOPES | {INTERNAL_SCOPE}), rate_key="local:" + (peer or "127.0.0.1"))
+                              scopes=frozenset(ALL_SCOPES_SET | {INTERNAL_SCOPE}), rate_key="local:" + (peer or "127.0.0.1"))
         if allow_optional:
             return None
         raise ApiError("unauthenticated", "Missing Authorization: Bearer <token> header.")

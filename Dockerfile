@@ -1,10 +1,10 @@
 # GCP AI Usage & Spend Caps API - Headless Container Image
 #
-# Build: docker build -t gcp-ai-usage-caps-api:1.0.0 .
+# Build: docker build -t gcp-ai-usage-caps-api:1.1.0 .
 # Run:   docker run --rm -p 127.0.0.1:8080:8080 \
 #          -e PROJECT_ID=my-project \
 #          -e BOOTSTRAP_ADMIN_KEY=gcpai_bootstrap_change_me \
-#          gcp-ai-usage-caps-api:1.0.0
+#          gcp-ai-usage-caps-api:1.1.0
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \

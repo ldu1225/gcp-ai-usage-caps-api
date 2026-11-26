@@ -32,6 +32,13 @@ SUPPORTED_EVENTS = (
     "user.unblocked",
     "project_cap.enforced",
     "project_cap.lifted",
+    "model.access_changed",
+    "model.lifecycle_notice",
+    "user.model_violation",
+    "rate_limit.threshold_reached",
+    "quota_request.created",
+    "quota_request.updated",
+    "readiness.degraded",
 )
 SUPPORTED_EVENTS_SET = frozenset(SUPPORTED_EVENTS)
 MAX_WEBHOOKS = 50
@@ -213,4 +220,31 @@ def notify_threshold_once(ctx, *, email: str, period_start: str, threshold_pct: 
         "usage": usage,
         "limit": limit,
     })
+    return True
+
+
+def notify_once(ctx, dedupe_key: str, event_type: str, payload: dict) -> bool:
+    """Dispatches `event_type` at most once per `dedupe_key` (bounded dedupe ledger shared with cap thresholds)."""
+    key = "%s|%s" % (event_type, dedupe_key)
+    already = {"sent": False}
+
+    def mark(doc):
+        sent = dict(doc.get("notified") or {})
+        if key in sent:
+            already["sent"] = True
+            return False
+        if len(sent) > 5000:
+            for k in list(sent.keys())[:1000]:
+                del sent[k]
+        sent[key] = now_iso()
+        doc["notified"] = sent
+        return True
+
+    try:
+        ctx.store.mutate(WEBHOOKS_DOC, mark)
+    except Exception:  # pylint: disable=broad-except
+        return False
+    if already["sent"]:
+        return False
+    dispatch_event(ctx, event_type, payload)
     return True

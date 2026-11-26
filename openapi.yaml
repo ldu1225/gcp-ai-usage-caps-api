@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: GCP AI Usage & Spend Caps API
-  version: 1.0.0
+  version: 1.1.0
   description: |
     Headless M2M REST API for enterprise AI management portals to query per-user Google Cloud AI
     usage & estimated costs (Antigravity, Vertex AI / Agent Platform, Gemini Enterprise) and
@@ -9,7 +9,8 @@ info:
 
     ### Authentication
     - **Scoped API Key**: `Authorization: Bearer gcpai_<id>_<secret>` (salted SHA-256 hashed at rest).
-      Scopes: `usage:read`, `caps:read`, `caps:write`, `users:write`, `admin`.
+      Scopes: `usage:read`, `caps:read`, `caps:write`, `users:write`, `models:read`, `models:write`,
+      `quotas:read`, `quotas:write`, `admin` (admin implies all).
     - **GCP Service Account OIDC**: `Authorization: Bearer <RS256 Google OIDC ID Token>` with
       audience matching `PUBLIC_BASE_URL` (used by Cloud Scheduler, Pub/Sub push, and internal GCP callers).
 
@@ -39,6 +40,13 @@ tags:
   - name: Audit
   - name: Internal
   - name: Admin
+  - name: Models
+  - name: Model Access
+  - name: Surface Models
+  - name: Model Rules
+  - name: Rate Limits & Quotas
+  - name: Operations
+  - name: Readiness
 
 paths:
   /v1/health:
@@ -401,7 +409,7 @@ paths:
     post:
       tags: [Spend Caps]
       summary: Evaluate spend cap policy (G1-G7 safety gates) and enforce blocks/restores
-      description: Requires scope `caps:write` or authorized OIDC Service Account. Defaults to `dryRun: true`.
+      description: "Requires scope `caps:write` or authorized OIDC Service Account. Defaults to `dryRun: true`."
       requestBody:
         content:
           application/json:
@@ -595,6 +603,13 @@ paths:
                       - user.unblocked
                       - project_cap.enforced
                       - project_cap.lifted
+                      - model.access_changed
+                      - model.lifecycle_notice
+                      - user.model_violation
+                      - rate_limit.threshold_reached
+                      - quota_request.created
+                      - quota_request.updated
+                      - readiness.degraded
                 enabled: { type: boolean, default: true }
       responses:
         "201":
@@ -614,7 +629,632 @@ paths:
         "200":
           description: Webhook deleted
 
+  # ===========================================================================
+  # Models (catalog, usage, access decision)
+  # ===========================================================================
+  /v1/models:
+    get:
+      tags: [Models]
+      summary: List models (OpenAI/Anthropic-style model list)
+      description: |
+        Requires `models:read`. Catalog = built-in seed + live Vertex AI Model Garden publisher discovery
+        (google, anthropic, meta, mistralai, ...) + pricing + lifecycle. `include=access` adds the per-surface access
+        decision for `project`; `include=usage` adds observed 30-day usage.
+      parameters:
+        - { name: publisher, in: query, schema: { type: string }, example: anthropic }
+        - { name: surface, in: query, schema: { type: string, enum: [vertex_ai, gemini_enterprise, antigravity] } }
+        - { name: stage, in: query, schema: { type: string, enum: [ga, preview, private_preview, experimental, deprecated] } }
+        - { name: q, in: query, schema: { type: string }, description: Substring search on id / display name }
+        - { name: include, in: query, schema: { type: string }, example: "access,usage" }
+        - { name: project, in: query, schema: { type: string }, description: Project for include=access (default hub) }
+        - { name: include_helpers, in: query, schema: { type: boolean } }
+        - { name: refresh, in: query, schema: { type: boolean }, description: Force Model Garden re-discovery }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Page of models
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ListEnvelope"
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/Model" } }
+                      catalog: { type: object, properties: { fetched_at: { type: [string, "null"] }, errors: { type: object } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/models/sync:
+    post:
+      tags: [Models]
+      summary: Refresh the Model Garden catalog now
+      description: Requires `models:write`. Also runs automatically (catalog TTL, hourly reconcile).
+      responses:
+        "200": { description: Sync summary, content: { application/json: { schema: { type: object, properties: { discovered: { type: integer }, publishers: { type: array, items: { type: string } }, errors: { type: object }, fetched_at: { type: string } } } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/models/{model_id}:
+    get:
+      tags: [Models]
+      summary: Retrieve a model with access decisions for every managed project
+      description: |
+        Requires `models:read`. `model_id` is a Model Garden id (`gemini-2.5-pro`, `claude-sonnet-4-5`); pass
+        `?publisher=` when ambiguous. `access_by_project` shows Vertex AI (Org Policy), Gemini Enterprise (per app)
+        and Antigravity (per location, read-only) decisions.
+      parameters:
+        - $ref: "#/components/parameters/ModelId"
+        - { name: publisher, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Model, content: { application/json: { schema: { $ref: "#/components/schemas/Model" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/models/{model_id}/access:
+    get:
+      tags: [Models]
+      summary: Explain who can use a model (projects, GE apps, per-user rules)
+      description: Requires `models:read`.
+      parameters:
+        - $ref: "#/components/parameters/ModelId"
+      responses:
+        "200": { description: Access decision trace, content: { application/json: { schema: { type: object, properties: { object: { type: string, enum: [model_access] }, model: { type: string }, publisher: { type: string }, projects: { type: object, additionalProperties: { $ref: "#/components/schemas/ModelAccessDecision" } }, user_rules: { type: array, items: { type: object } } } } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/usage/models:
+    get:
+      tags: [Models, Usage & Billing]
+      summary: Usage and estimated cost per model
+      description: Requires `usage:read` or `models:read`. Optional `group_by=user|project|surface` breakdown.
+      parameters:
+        - $ref: "#/components/parameters/Start"
+        - $ref: "#/components/parameters/End"
+        - { name: granularity, in: query, schema: { type: string, enum: [day, week] } }
+        - { name: surface, in: query, schema: { type: string, enum: [all, antigravity, vertex_ai, gemini_enterprise] } }
+        - { name: project, in: query, schema: { type: string } }
+        - { name: group_by, in: query, schema: { type: string, enum: [user, project, surface] } }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200": { description: Page of per-model usage rows, content: { application/json: { schema: { allOf: [ { $ref: "#/components/schemas/ListEnvelope" }, { type: object, properties: { data: { type: array, items: { $ref: "#/components/schemas/ModelUsage" } }, range: { $ref: "#/components/schemas/DateRangeMeta" } } } ] } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  # ===========================================================================
+  # Model access policies (Vertex AI Model Garden via Org Policy vertexai.allowedModels)
+  # ===========================================================================
+  /v1/model-access:
+    get:
+      tags: [Model Access]
+      summary: List model access policies of every managed scope
+      description: Requires `models:read`. One entry per managed project (+ configured folders/organization).
+      parameters:
+        - { name: scope_type, in: query, schema: { type: string, enum: [projects, folders, organizations] } }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200": { description: Page of policies, content: { application/json: { schema: { allOf: [ { $ref: "#/components/schemas/ListEnvelope" }, { type: object, properties: { data: { type: array, items: { $ref: "#/components/schemas/ModelAccessPolicy" } } } } ] } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/model-access/bulk-apply:
+    post:
+      tags: [Model Access]
+      summary: Apply one model policy to many scopes (e.g. every managed project)
+      description: Requires `models:write`. `scopes` accepts `projects/*` (all managed projects) and explicit scopes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/ModelAccessPolicyInput"
+                - type: object
+                  properties:
+                    scopes: { type: array, items: { type: string }, example: ["projects/*"] }
+      responses:
+        "200": { description: Per-scope results, content: { application/json: { schema: { $ref: "#/components/schemas/BulkResult" } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/model-access/reconcile:
+    post:
+      tags: [Model Access]
+      summary: Re-expand stored patterns (new model versions) and fix drift
+      description: Requires `models:write`. Also runs hourly from the scheduled enforcer.
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { dryRun: { type: boolean, default: false } } } } }
+      responses:
+        "200": { description: Reconcile results }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/model-access/{scope_type}/{scope_id}:
+    get:
+      tags: [Model Access]
+      summary: Get the policy, effective (inherited) policy, stored intent and drift for a scope
+      description: Requires `models:read`.
+      parameters:
+        - $ref: "#/components/parameters/ScopeType"
+        - $ref: "#/components/parameters/ScopeId"
+      responses:
+        "200": { description: Policy, content: { application/json: { schema: { $ref: "#/components/schemas/ModelAccessPolicy" } } } }
+        default: { $ref: "#/components/responses/Error" }
+    put:
+      tags: [Model Access]
+      summary: Set the model access policy (allow_list / deny_list / unrestricted / deny_all / inherit)
+      description: |
+        Requires `models:write`. Patterns (`gemini-2.5-*`, `anthropic/*`) are expanded against the catalog
+        (Org Policy has no wildcards, max 500 values). Safety: `dryRun`, impact preview, lockout prevention
+        (`force` required for empty allow lists / deny_all), optimistic concurrency with `If-Match: <etag>`.
+        Returns an `operation` (Org Policy changes usually take effect within minutes, up to ~15).
+      parameters:
+        - $ref: "#/components/parameters/ScopeType"
+        - $ref: "#/components/parameters/ScopeId"
+        - { name: If-Match, in: header, schema: { type: string } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ModelAccessPolicyInput" } } }
+      responses:
+        "200": { description: Change result, content: { application/json: { schema: { $ref: "#/components/schemas/ModelAccessChange" } } } }
+        "412": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [Model Access]
+      summary: Remove the policy (scope inherits from its parent)
+      description: Requires `models:write`. Supports `?dryRun=true`.
+      parameters:
+        - $ref: "#/components/parameters/ScopeType"
+        - $ref: "#/components/parameters/ScopeId"
+        - { name: dryRun, in: query, schema: { type: boolean } }
+      responses:
+        "200": { description: Change result, content: { application/json: { schema: { $ref: "#/components/schemas/ModelAccessChange" } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/model-access/{scope_type}/{scope_id}/preview:
+    post:
+      tags: [Model Access]
+      summary: Preview the impact of a policy (users/models that would be blocked) without writing
+      description: Requires `models:read`.
+      parameters:
+        - $ref: "#/components/parameters/ScopeType"
+        - $ref: "#/components/parameters/ScopeId"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ModelAccessPolicyInput" } } }
+      responses:
+        "200": { description: Dry-run change incl. impact, content: { application/json: { schema: { $ref: "#/components/schemas/ModelAccessChange" } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/model-access/{scope_type}/{scope_id}/models/{model_id}/allow:
+    post:
+      tags: [Model Access]
+      summary: Allow one model (lift a restriction)
+      description: Requires `models:write`. Adds to allow lists / removes from deny lists. 409 when denied by a pattern or by a parent policy.
+      parameters:
+        - $ref: "#/components/parameters/ScopeType"
+        - $ref: "#/components/parameters/ScopeId"
+        - $ref: "#/components/parameters/ModelId"
+      requestBody:
+        content: { application/json: { schema: { $ref: "#/components/schemas/ModelToggleInput" } } }
+      responses:
+        "200": { description: Change result, content: { application/json: { schema: { $ref: "#/components/schemas/ModelAccessChange" } } } }
+        "409": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/model-access/{scope_type}/{scope_id}/models/{model_id}/restrict:
+    post:
+      tags: [Model Access]
+      summary: Restrict one model
+      description: Requires `models:write`. Removes from allow lists / adds to deny lists (creates a deny_list when unrestricted).
+      parameters:
+        - $ref: "#/components/parameters/ScopeType"
+        - $ref: "#/components/parameters/ScopeId"
+        - $ref: "#/components/parameters/ModelId"
+      requestBody:
+        content: { application/json: { schema: { $ref: "#/components/schemas/ModelToggleInput" } } }
+      responses:
+        "200": { description: Change result, content: { application/json: { schema: { $ref: "#/components/schemas/ModelAccessChange" } } } }
+        "409": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+
+  # ===========================================================================
+  # Surface model controls
+  # ===========================================================================
+  /v1/gemini-enterprise/apps:
+    get:
+      tags: [Surface Models]
+      summary: List Gemini Enterprise apps and their model selection across managed projects
+      description: Requires `models:read`. Projects without an app report `status=not_applicable`.
+      parameters:
+        - { name: project, in: query, schema: { type: string } }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200": { description: Apps, content: { application/json: { schema: { allOf: [ { $ref: "#/components/schemas/ListEnvelope" }, { type: object, properties: { data: { type: array, items: { $ref: "#/components/schemas/GeminiEnterpriseApp" } }, projects: { type: object } } } ] } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/gemini-enterprise/apps/bulk-models:
+    post:
+      tags: [Surface Models]
+      summary: Turn models on/off in many (or all `*`) Gemini Enterprise apps
+      description: Requires `models:write`.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [models], properties: { apps: { type: array, items: { type: string }, example: ["*"] }, models: { $ref: "#/components/schemas/GeModelStates" }, dryRun: { type: boolean } } } } }
+      responses:
+        "200": { description: Per-app results, content: { application/json: { schema: { $ref: "#/components/schemas/BulkResult" } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/gemini-enterprise/apps/{app_id}/models:
+    get:
+      tags: [Surface Models]
+      summary: Get one app's model selection
+      description: Requires `models:read`. `app_id` = `PROJECT~LOCATION~ENGINE_ID`.
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+      responses:
+        "200": { description: App models, content: { application/json: { schema: { $ref: "#/components/schemas/GeminiEnterpriseApp" } } } }
+        default: { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [Surface Models]
+      summary: Merge-update one app's model selection (on | off | default)
+      description: Requires `models:write`. The engine is re-read and only listed keys change (console edits preserved).
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [models], properties: { models: { $ref: "#/components/schemas/GeModelStates" }, dryRun: { type: boolean } } } } }
+      responses:
+        "200": { description: Change result }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/antigravity/models:
+    get:
+      tags: [Surface Models]
+      summary: Antigravity authorized models per project/location (read-only)
+      description: Requires `models:read`. `write_mode=console_required`; use per-user model rules for API enforcement.
+      parameters:
+        - { name: project, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Antigravity model configs }
+        default: { $ref: "#/components/responses/Error" }
+    put:
+      tags: [Surface Models]
+      summary: Always 409 console_required (Google restricts UpdateDevToolsConfig to the Cloud Console)
+      description: Requires `models:write`. Explicit, documented behaviour so portals can deep-link the console.
+      responses:
+        "409": { $ref: "#/components/responses/Error" }
+
+  # ===========================================================================
+  # Per-user model rules
+  # ===========================================================================
+  /v1/model-rules:
+    get:
+      tags: [Model Rules]
+      summary: List per-user model rules (plus the workspace default rule)
+      description: Requires `models:read`.
+      parameters:
+        - { name: email, in: query, schema: { type: string } }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200": { description: Rules }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/model-rules/default:
+    get:
+      tags: [Model Rules]
+      summary: Get the default model rule applied to every user without an override
+      description: Requires `models:read`.
+      responses:
+        "200": { description: Default rule, content: { application/json: { schema: { type: object, properties: { object: { type: string }, scope: { type: string }, rule: { $ref: "#/components/schemas/ModelRule" } } } } } }
+    put:
+      tags: [Model Rules]
+      summary: Set the default model rule
+      description: Requires `models:write`. Default `on_violation=block_service` (block first, always notify).
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ModelRuleInput" } } }
+      responses:
+        "200": { description: Saved rule }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [Model Rules]
+      summary: Remove the default model rule
+      description: Requires `models:write`.
+      responses:
+        "200": { description: Deleted }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/model-rules/evaluate:
+    post:
+      tags: [Model Rules]
+      summary: Evaluate model rules now (dry run by default)
+      description: Requires `models:write`. Same evaluation the scheduled enforcer runs every 5 minutes.
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { dryRun: { type: boolean, default: true } } } } }
+      responses:
+        "200": { description: Evaluation result incl. violations and blocks }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/model-violations:
+    get:
+      tags: [Model Rules]
+      summary: List detected model rule violations
+      description: Requires `models:read`.
+      parameters:
+        - { name: email, in: query, schema: { type: string } }
+        - { name: type, in: query, schema: { type: string, enum: [model_not_allowed, model_denied, limit_exceeded] } }
+        - { name: action, in: query, schema: { type: string, enum: [block_service, notify, deferred] } }
+        - { name: surface, in: query, schema: { type: string } }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200": { description: Violations, content: { application/json: { schema: { allOf: [ { $ref: "#/components/schemas/ListEnvelope" }, { type: object, properties: { data: { type: array, items: { $ref: "#/components/schemas/ModelViolation" } } } } ] } } } }
+
+  /v1/users/{email}/model-rules:
+    get:
+      tags: [Model Rules]
+      summary: A user's own rule, effective rule, today's per-model usage and recent violations
+      description: Requires `models:read`.
+      parameters:
+        - $ref: "#/components/parameters/Email"
+      responses:
+        "200": { description: User model rules }
+    put:
+      tags: [Model Rules]
+      summary: Set a user's model rule (overrides the default; mode=inherit keeps default models)
+      description: Requires `models:write`.
+      parameters:
+        - $ref: "#/components/parameters/Email"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ModelRuleInput" } } }
+      responses:
+        "200": { description: Saved rule }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [Model Rules]
+      summary: Remove a user's model rule
+      description: Requires `models:write`.
+      parameters:
+        - $ref: "#/components/parameters/Email"
+      responses:
+        "200": { description: Deleted }
+        "404": { $ref: "#/components/responses/Error" }
+
+  # ===========================================================================
+  # Rate limits & quotas
+  # ===========================================================================
+  /v1/rate-limits:
+    get:
+      tags: [Rate Limits & Quotas]
+      summary: Rate limits (RPM/TPM per model & region) with usage and headroom across managed projects
+      description: Requires `quotas:read`. Source = Cloud Quotas API + Cloud Monitoring (24h peak).
+      parameters:
+        - { name: project, in: query, schema: { type: string } }
+        - { name: model, in: query, schema: { type: string }, description: "base_model dimension; `default` for rows without a model" }
+        - { name: location, in: query, schema: { type: string } }
+        - { name: metric, in: query, schema: { type: string, enum: [requests_per_minute, tokens_per_minute, requests_per_day, tokens_per_day, other] } }
+        - { name: near_limit, in: query, schema: { type: boolean }, description: "Only rows at/above quotas.headroom_warn_pct utilization" }
+        - { name: all, in: query, schema: { type: boolean }, description: Include non generative-AI quotas }
+        - { name: include_usage, in: query, schema: { type: boolean, default: true } }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200": { description: Rate limits, content: { application/json: { schema: { allOf: [ { $ref: "#/components/schemas/ListEnvelope" }, { type: object, properties: { data: { type: array, items: { $ref: "#/components/schemas/RateLimit" } }, errors: { type: object } } } ] } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/rate-limits/users/{email}:
+    get:
+      tags: [Rate Limits & Quotas]
+      summary: Per-user per-model limits (RPM, TPM, daily/monthly requests, tokens, cost)
+      description: Requires `quotas:read`. Alias of the `limits` slice of the user's model rule.
+      parameters:
+        - $ref: "#/components/parameters/Email"
+      responses:
+        "200": { description: User limits }
+    put:
+      tags: [Rate Limits & Quotas]
+      summary: Set per-user per-model limits
+      description: Requires `quotas:write`. Enforced by detection + IAM Deny block (RPM/TPM real-time; daily/monthly every 5 min).
+      parameters:
+        - $ref: "#/components/parameters/Email"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [limits], properties: { limits: { type: array, items: { $ref: "#/components/schemas/ModelLimit" } }, on_violation: { type: string, enum: [block_service, notify] }, block_minutes: { type: integer }, block_services: { type: array, items: { type: string } } } } } }
+      responses:
+        "200": { description: Saved }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [Rate Limits & Quotas]
+      summary: Remove per-user limits (default rule limits apply)
+      description: Requires `quotas:write`.
+      parameters:
+        - $ref: "#/components/parameters/Email"
+      responses:
+        "200": { description: Deleted }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/projects/{project_id}/rate-limits:
+    get:
+      tags: [Rate Limits & Quotas]
+      summary: Rate limits of one project
+      description: Requires `quotas:read`.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - { name: model, in: query, schema: { type: string } }
+        - { name: location, in: query, schema: { type: string } }
+        - { name: metric, in: query, schema: { type: string } }
+        - { name: all, in: query, schema: { type: boolean } }
+      responses:
+        "200": { description: Rate limits }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/projects/{project_id}/rate-limits/{limit_id}:
+    get:
+      tags: [Rate Limits & Quotas]
+      summary: One rate limit
+      description: Requires `quotas:read`.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/LimitId"
+      responses:
+        "200": { description: Rate limit, content: { application/json: { schema: { $ref: "#/components/schemas/RateLimit" } } } }
+        default: { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [Rate Limits & Quotas]
+      summary: Change a rate limit (value <= current = cap/decrease; value > current = increase request)
+      description: Requires `quotas:write`. Decreases below the observed 24h peak need `force=true`.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/LimitId"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [value], properties: { value: { type: integer, minimum: 0 }, justification: { type: string }, contact_email: { type: string, format: email }, force: { type: boolean }, dryRun: { type: boolean } } } } }
+      responses:
+        "200": { description: Quota request, content: { application/json: { schema: { $ref: "#/components/schemas/QuotaRequest" } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/quota-requests:
+    get:
+      tags: [Rate Limits & Quotas]
+      summary: List quota requests
+      description: Requires `quotas:read`. `refresh=true` re-reads pending requests from Cloud Quotas.
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [pending, approved, partially_approved, denied, applied, cancelled, failed] } }
+        - { name: project, in: query, schema: { type: string } }
+        - { name: refresh, in: query, schema: { type: boolean } }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200": { description: Quota requests, content: { application/json: { schema: { allOf: [ { $ref: "#/components/schemas/ListEnvelope" }, { type: object, properties: { data: { type: array, items: { $ref: "#/components/schemas/QuotaRequest" } } } } ] } } } }
+    post:
+      tags: [Rate Limits & Quotas]
+      summary: Submit a quota increase/decrease directly to Google Cloud (one project or many)
+      description: |
+        Requires `quotas:write`. Target with `limit_id`, or `quota_id` (+ `model`, `location`). Bulk with
+        `projects: ["*"]`. Increases need `justification` (>=10 chars) and `contact_email`. Supports
+        `Idempotency-Key` header and `dryRun`.
+      parameters:
+        - { name: Idempotency-Key, in: header, schema: { type: string } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/QuotaRequestInput" } } }
+      responses:
+        "201": { description: Submitted, content: { application/json: { schema: { $ref: "#/components/schemas/QuotaRequest" } } } }
+        "200": { description: "Dry run, bulk result or idempotent replay" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/quota-requests/{request_id}:
+    get:
+      tags: [Rate Limits & Quotas]
+      summary: Get a quota request (live status)
+      description: Requires `quotas:read`.
+      parameters:
+        - { name: request_id, in: path, required: true, schema: { type: string, pattern: "^qr_[0-9a-f]{16}$" } }
+      responses:
+        "200": { description: Quota request, content: { application/json: { schema: { $ref: "#/components/schemas/QuotaRequest" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/quota-requests/{request_id}/cancel:
+    post:
+      tags: [Rate Limits & Quotas]
+      summary: Cancel a pending request (restores the granted/previous value)
+      description: Requires `quotas:write`.
+      parameters:
+        - { name: request_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Cancelled, content: { application/json: { schema: { $ref: "#/components/schemas/QuotaRequest" } } } }
+        "409": { $ref: "#/components/responses/Error" }
+
+  # ===========================================================================
+  # Environment readiness (preflight)
+  # ===========================================================================
+  /v1/admin/readiness:
+    get:
+      tags: [Readiness]
+      summary: Environment readiness report for the hub and every managed project (cached)
+      description: |
+        Requires `admin`. Exhaustive checks: project/billing, APIs, organization policies (resource locations, domain
+        restricted sharing, Cloud Run ingress/egress, CMEK, restricted services, vertexai.allowedModels), VPC Service
+        Controls (incl. hub<->spoke cross-perimeter), network (PGA, NAT), BigQuery datasets/tables (adoption of existing
+        ones), log sinks (incl. aggregated), Data Access audit logs, Gemini Enterprise / Antigravity / Vertex AI
+        presence, IAM permissions, IAM Deny capacity, Pub/Sub/Scheduler/Cloud Run, Cloud Quotas. Each check carries a
+        bilingual title, impact and remediation commands; `remediation_script` aggregates every fix.
+      parameters:
+        - { name: refresh, in: query, schema: { type: boolean } }
+        - { name: project, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Readiness report, content: { application/json: { schema: { $ref: "#/components/schemas/ReadinessReport" } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/admin/readiness/run:
+    post:
+      tags: [Readiness]
+      summary: Run readiness checks now (optionally for some projects / categories)
+      description: "Requires `admin`. Categories: project, apis, orgpolicy, vpcsc, network, bigquery, logging, surfaces, iam, enforcement, quotas, config."
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { projects: { type: array, items: { type: string } }, categories: { type: array, items: { type: string, enum: [project, apis, orgpolicy, vpcsc, network, bigquery, logging, surfaces, iam, enforcement, quotas, config] } } } } } }
+      responses:
+        "200": { description: Readiness report, content: { application/json: { schema: { $ref: "#/components/schemas/ReadinessReport" } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/projects/{project_id}/capabilities:
+    get:
+      tags: [Readiness]
+      summary: What this control plane can do in one managed project
+      description: |
+        Requires `models:read`, `quotas:read` or `caps:read`. Per-surface availability (Vertex AI, Gemini Enterprise
+        apps, Antigravity), whether model policies / IAM Deny / Cloud Quotas are writable, and the effective
+        `vertexai.allowedModels` policy. Served from the last readiness report or lightweight probes.
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+      responses:
+        "200": { description: Capabilities, content: { application/json: { schema: { type: object, properties: { object: { type: string, enum: [capabilities] }, project_id: { type: string }, role: { type: string }, source: { type: string, enum: [cache, probe] }, vertex_ai: { type: object }, gemini_enterprise: { type: object }, antigravity: { type: object }, org_policy_writable: { type: [boolean, "null"] }, quotas_api: { type: [boolean, "null"] }, deny_writable: { type: [boolean, "null"] }, allowed_models_policy: { type: [object, "null"] } } } } } }
+        "403": { $ref: "#/components/responses/Error" }
+
+  # ===========================================================================
+  # Operations
+  # ===========================================================================
+  /v1/operations:
+    get:
+      tags: [Operations]
+      summary: List long-running governance operations
+      description: Requires `models:read`, `quotas:read` or `caps:read`.
+      parameters:
+        - { name: kind, in: query, schema: { type: string }, example: model_access }
+        - { name: status, in: query, schema: { type: string, enum: [propagating, succeeded, failed] } }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200": { description: Operations }
+
+  /v1/operations/{operation_id}:
+    get:
+      tags: [Operations]
+      summary: Poll an operation (Org Policy / GE / IAM / quota propagation)
+      description: Requires `models:read`, `quotas:read` or `caps:read`.
+      parameters:
+        - { name: operation_id, in: path, required: true, schema: { type: string, pattern: "^op_[0-9a-f]{16}$" } }
+      responses:
+        "200": { description: Operation, content: { application/json: { schema: { $ref: "#/components/schemas/Operation" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+
 components:
+  parameters:
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 1000, default: 100 } }
+    Cursor: { name: cursor, in: query, schema: { type: string }, description: Opaque cursor from `next_cursor` }
+    Start: { name: start, in: query, schema: { type: string, format: date } }
+    End: { name: end, in: query, schema: { type: string, format: date } }
+    ModelId: { name: model_id, in: path, required: true, schema: { type: string }, example: gemini-2.5-pro }
+    ScopeType: { name: scope_type, in: path, required: true, schema: { type: string, enum: [projects, folders, organizations] } }
+    ScopeId: { name: scope_id, in: path, required: true, schema: { type: string }, example: team-a-prod }
+    AppId: { name: app_id, in: path, required: true, schema: { type: string }, example: "my-project~global~corp-assistant" }
+    Email: { name: email, in: path, required: true, schema: { type: string }, example: "alice%40company.com" }
+    ProjectId: { name: project_id, in: path, required: true, schema: { type: string } }
+    LimitId: { name: limit_id, in: path, required: true, schema: { type: string, pattern: "^rl_[0-9a-f]{16}$" } }
+
   securitySchemes:
     BearerApiKey:
       type: http
@@ -778,3 +1418,343 @@ components:
         remaining: { type: object }
         restore_at: { type: ["string", "null"], format: date-time }
         rule: { type: ["object", "null"] }
+
+    ListEnvelope:
+      type: object
+      properties:
+        object: { type: string, enum: [list] }
+        has_more: { type: boolean }
+        next_cursor: { type: [string, "null"] }
+        total: { type: integer }
+
+    Model:
+      type: object
+      description: OpenAI/Anthropic-compatible model object extended with GCP surfaces, lifecycle, pricing and access.
+      properties:
+        object: { type: string, enum: [model] }
+        id: { type: string, example: gemini-2.5-pro }
+        owned_by: { type: string, example: google }
+        publisher: { type: string }
+        display_name: { type: string }
+        family: { type: string }
+        resource_name: { type: string, example: publishers/google/models/gemini-2.5-pro }
+        policy_values: { type: array, items: { type: string }, example: ["publishers/google/models/gemini-2.5-pro:predict"] }
+        surfaces: { type: array, items: { type: string, enum: [vertex_ai, gemini_enterprise, antigravity] } }
+        lifecycle:
+          type: object
+          properties:
+            stage: { type: [string, "null"], enum: [ga, preview, private_preview, experimental, deprecated, null] }
+            version_id: { type: [string, "null"] }
+            version_state: { type: [string, "null"] }
+            deprecation_date: { type: [string, "null"], format: date }
+            shutdown_date: { type: [string, "null"], format: date }
+            replacement: { type: [string, "null"] }
+        pricing:
+          type: [object, "null"]
+          properties:
+            currency: { type: string }
+            input_per_1m_tokens: { type: [number, "null"] }
+            output_per_1m_tokens: { type: [number, "null"] }
+            cached_input_per_1m_tokens: { type: [number, "null"] }
+            source: { type: string }
+        access: { $ref: "#/components/schemas/ModelAccessDecision" }
+        access_by_project: { type: object, additionalProperties: { $ref: "#/components/schemas/ModelAccessDecision" } }
+        usage: { type: [object, "null"], properties: { requests: { type: integer }, total_tokens: { type: integer }, users: { type: integer }, window_days: { type: integer } } }
+        source: { type: string, enum: [seed, model_garden] }
+
+    ModelAccessDecision:
+      type: object
+      properties:
+        project_id: { type: string }
+        vertex_ai: { type: object, properties: { decision: { type: string, enum: [allowed, denied, unknown] }, reason: { type: string }, enforcement: { type: string, enum: [org_policy] }, policy_mode: { type: string } } }
+        gemini_enterprise: { type: object, properties: { decision: { type: string, enum: [per_app, not_applicable, unknown] }, apps: { type: object, additionalProperties: { type: string, enum: [enabled, disabled, product_default] } }, enforcement: { type: string } } }
+        antigravity: { type: object, properties: { decision: { type: string, enum: [per_location, not_applicable, unknown] }, locations: { type: object, additionalProperties: { type: string, enum: [allowed, denied] } }, enforcement: { type: string, enum: [console_only] }, write_mode: { type: string } } }
+
+    ModelUsage:
+      type: object
+      properties:
+        object: { type: string, enum: [model_usage] }
+        model: { type: string }
+        surface: { type: string }
+        requests: { type: integer }
+        input_tokens: { type: integer }
+        output_tokens: { type: integer }
+        cached_tokens: { type: integer }
+        total_tokens: { type: integer }
+        active_users: { type: integer }
+        estimated_cost: { type: [number, "null"] }
+        cost_partial: { type: boolean }
+        currency: { type: [string, "null"] }
+        group_by: { type: string }
+        groups: { type: array, items: { type: object } }
+
+    ModelAccessPolicyInput:
+      type: object
+      required: [mode]
+      properties:
+        mode: { type: string, enum: [allow_list, deny_list, unrestricted, deny_all, inherit] }
+        models: { type: array, items: { type: string }, example: ["gemini-2.5-*", "anthropic/claude-haiku-4-5"] }
+        actions: { type: array, items: { type: string, enum: [predict, deploy, tune] }, default: [predict] }
+        inherit_from_parent: { type: boolean, default: false }
+        force: { type: boolean, default: false, description: Confirm lockout-risk changes (empty allow list, deny_all) }
+        reason: { type: string, maxLength: 300 }
+        dryRun: { type: boolean, default: false }
+
+    ModelToggleInput:
+      type: object
+      properties:
+        actions: { type: array, items: { type: string, enum: [predict, deploy, tune] } }
+        reason: { type: string }
+        force: { type: boolean }
+        dryRun: { type: boolean }
+
+    ModelAccessPolicy:
+      type: object
+      properties:
+        object: { type: string, enum: [model_access_policy] }
+        scope: { type: string, example: projects/team-a-prod }
+        scope_type: { type: string, enum: [projects, folders, organizations] }
+        scope_id: { type: string }
+        constraint: { type: string, example: constraints/vertexai.allowedModels }
+        mode: { type: string, enum: [allow_list, deny_list, unrestricted, deny_all, inherit, mixed] }
+        models: { type: array, items: { type: object, properties: { publisher: { type: string }, model: { type: string }, action: { type: string }, value: { type: string } } } }
+        allowed_values: { type: array, items: { type: string } }
+        denied_values: { type: array, items: { type: string } }
+        inherit_from_parent: { type: boolean }
+        etag: { type: [string, "null"] }
+        update_time: { type: [string, "null"] }
+        policy_exists: { type: boolean }
+        effective: { type: object, description: Effective policy including inheritance from folders/organization }
+        intent: { type: object, description: Patterns stored by this API (re-expanded hourly) }
+        drift: { type: [array, "null"], items: { type: string }, description: Values that differ from the re-expanded intent }
+        managed_by_api: { type: boolean }
+        error: { type: string }
+
+    ModelAccessChange:
+      type: object
+      properties:
+        object: { type: string, enum: [model_access_change] }
+        scope: { type: string }
+        status: { type: string, enum: [applied, unchanged, dry_run] }
+        dry_run: { type: boolean }
+        before: { $ref: "#/components/schemas/ModelAccessPolicy" }
+        after: { $ref: "#/components/schemas/ModelAccessPolicy" }
+        expanded_models: { type: array, items: { type: string } }
+        impact:
+          type: object
+          properties:
+            window_days: { type: integer }
+            telemetry_ok: { type: boolean }
+            affected_users: { type: integer }
+            denied_models_in_use: { type: array, items: { type: object } }
+            catalog_models_allowed: { type: integer }
+            catalog_models_total: { type: integer }
+        operation: { $ref: "#/components/schemas/Operation" }
+
+    GeModelStates:
+      type: object
+      additionalProperties: { type: string, enum: ["on", "off", default] }
+      example: { "gemini-2.5-pro": "on", "claude-sonnet-4-5": "off" }
+
+    GeminiEnterpriseApp:
+      type: object
+      properties:
+        object: { type: string }
+        id: { type: string, example: my-project/global/corp-assistant }
+        project_id: { type: string }
+        location: { type: string }
+        engine_id: { type: string }
+        display_name: { type: string }
+        models: { type: object, additionalProperties: { type: string, enum: ["on", "off"] } }
+        update_time: { type: [string, "null"] }
+
+    ModelLimit:
+      type: object
+      required: [model]
+      properties:
+        model: { type: string, description: "Model id or pattern; `*` = all models", example: "claude-*" }
+        rpm: { type: integer, minimum: 0, description: Requests per minute (real-time, Antigravity) }
+        tpm: { type: integer, minimum: 0, description: Tokens per minute (real-time, Antigravity) }
+        daily_requests: { type: integer, minimum: 0 }
+        daily_tokens: { type: integer, minimum: 0 }
+        monthly_requests: { type: integer, minimum: 0 }
+        monthly_tokens: { type: integer, minimum: 0 }
+        monthly_cost: { type: number, minimum: 0 }
+
+    ModelRuleInput:
+      type: object
+      properties:
+        mode: { type: string, enum: [allow_list, deny_list, unrestricted, inherit] }
+        models: { type: array, items: { type: string } }
+        surfaces: { type: array, items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] } }
+        limits: { type: array, items: { $ref: "#/components/schemas/ModelLimit" } }
+        on_violation: { type: string, enum: [block_service, notify], default: block_service }
+        block_services: { type: array, items: { type: string, enum: [antigravity, vertex_ai, gemini_enterprise] }, description: Default = surfaces where the violation occurred }
+        block_minutes: { type: integer, minimum: 0, description: "Auto-lift after N minutes (0/omitted: model violations stay blocked until unblock; limit violations lift at window reset)" }
+        until: { type: string, format: date-time }
+        note: { type: string }
+        force: { type: boolean }
+
+    ModelRule:
+      allOf:
+        - $ref: "#/components/schemas/ModelRuleInput"
+        - type: object
+          properties:
+            updated_at: { type: string, format: date-time }
+            updated_by: { type: string }
+
+    ModelViolation:
+      type: object
+      properties:
+        object: { type: string, enum: [model_violation] }
+        id: { type: string }
+        email: { type: string }
+        type: { type: string, enum: [model_not_allowed, model_denied, limit_exceeded] }
+        model: { type: [string, "null"] }
+        surface: { type: [string, "null"] }
+        metric: { type: [string, "null"] }
+        limit: { type: [number, "null"] }
+        observed: { type: [number, "null"] }
+        action: { type: string, enum: [block_service, notify, deferred] }
+        action_note: { type: [string, "null"] }
+        block_services: { type: array, items: { type: string } }
+        block_until: { type: [string, "null"], format: date-time }
+        trigger: { type: string, enum: [usage_event, scheduler, api] }
+        detected_at: { type: string, format: date-time }
+
+    RateLimit:
+      type: object
+      properties:
+        object: { type: string, enum: [rate_limit] }
+        id: { type: string, example: rl_1a2b3c4d5e6f7a8b }
+        project_id: { type: string }
+        service: { type: string, example: aiplatform.googleapis.com }
+        quota_id: { type: string, example: GenerateContentRequestsPerMinutePerProjectPerBaseModel }
+        metric: { type: string }
+        metric_kind: { type: string, enum: [requests_per_minute, tokens_per_minute, requests_per_day, tokens_per_day, other] }
+        display_name: { type: string }
+        unit: { type: [string, "null"] }
+        refresh_interval: { type: [string, "null"] }
+        model: { type: [string, "null"] }
+        location: { type: string }
+        dimensions: { type: object }
+        is_default: { type: boolean }
+        limit: { type: [integer, "null"] }
+        usage_peak: { type: [integer, "null"] }
+        usage_window_hours: { type: [integer, "null"] }
+        utilization_pct: { type: [number, "null"] }
+        headroom_pct: { type: [number, "null"] }
+        increase_eligible: { type: [boolean, "null"] }
+        ineligibility_reason: { type: [string, "null"] }
+        is_fixed: { type: boolean }
+        preference: { type: [object, "null"] }
+
+    QuotaRequestInput:
+      type: object
+      properties:
+        project_id: { type: string }
+        projects: { type: array, items: { type: string }, example: ["*"] }
+        limit_id: { type: string }
+        quota_id: { type: string }
+        model: { type: string }
+        location: { type: string }
+        requested_value: { type: integer, minimum: 0 }
+        increase_pct: { type: number, exclusiveMinimum: 0 }
+        justification: { type: string, minLength: 10 }
+        contact_email: { type: string, format: email }
+        force: { type: boolean }
+        dryRun: { type: boolean }
+
+    QuotaRequest:
+      type: object
+      properties:
+        object: { type: string, enum: [quota_request] }
+        id: { type: string, example: qr_0123456789abcdef }
+        project_id: { type: string }
+        service: { type: string }
+        quota_id: { type: string }
+        limit_id: { type: string }
+        dimensions: { type: object }
+        model: { type: [string, "null"] }
+        location: { type: [string, "null"] }
+        kind: { type: string, enum: [increase, decrease] }
+        previous_value: { type: [integer, "null"] }
+        requested_value: { type: integer }
+        granted_value: { type: [integer, "null"] }
+        status: { type: string, enum: [dry_run, pending, approved, partially_approved, denied, applied, cancelled, failed] }
+        status_detail: { type: [string, "null"] }
+        preference_name: { type: [string, "null"] }
+        justification: { type: [string, "null"] }
+        contact_email: { type: [string, "null"] }
+        operation_id: { type: string }
+        history: { type: array, items: { type: object, properties: { at: { type: string }, status: { type: string }, granted_value: { type: [integer, "null"] } } } }
+        created_at: { type: string }
+        updated_at: { type: string }
+        idempotent_replay: { type: boolean }
+
+    Operation:
+      type: object
+      properties:
+        object: { type: string, enum: [operation] }
+        id: { type: string, example: op_0123456789abcdef }
+        kind: { type: string, example: model_access.update }
+        target: { type: string }
+        status: { type: string, enum: [propagating, succeeded, failed] }
+        detail: { type: string }
+        created_at: { type: string }
+        updated_at: { type: string }
+        expected_effective_by: { type: string }
+        result: { type: object }
+
+    BulkResult:
+      type: object
+      properties:
+        object: { type: string, enum: [bulk_result] }
+        results: { type: array, items: { type: object } }
+        applied: { type: integer }
+        updated: { type: integer }
+        unchanged: { type: integer }
+        dry_run: { type: [integer, boolean] }
+        failed: { type: integer }
+
+    ReadinessCheck:
+      type: object
+      properties:
+        id: { type: string, example: vpcsc.cross_project }
+        category: { type: string }
+        status: { type: string, enum: [pass, warn, fail, skip, info] }
+        title_ko: { type: string }
+        title_en: { type: string }
+        detail: { type: string }
+        impact: { type: array, items: { type: string } }
+        remediation: { type: object, properties: { commands: { type: array, items: { type: string } }, docs_url: { type: string } } }
+        auto_fixable: { type: boolean }
+        blocking: { type: boolean }
+        project: { type: string }
+        data: { type: object }
+
+    ReadinessReport:
+      type: object
+      properties:
+        object: { type: string, enum: [readiness_report] }
+        generated_at: { type: string, format: date-time }
+        overall: { type: string, enum: [ready, ready_with_warnings, blocked] }
+        summary: { type: object, properties: { pass: { type: integer }, warn: { type: integer }, fail: { type: integer }, skip: { type: integer }, info: { type: integer }, total: { type: integer }, blocking: { type: integer }, blocking_unfixable: { type: integer } } }
+        hub: { type: object }
+        projects:
+          type: array
+          items:
+            type: object
+            properties:
+              project_id: { type: string }
+              project_number: { type: [string, "null"] }
+              role: { type: string, enum: [hub, managed] }
+              parent: { type: object }
+              organization_id: { type: [string, "null"] }
+              checks: { type: array, items: { $ref: "#/components/schemas/ReadinessCheck" } }
+        cross_project: { type: array, items: { $ref: "#/components/schemas/ReadinessCheck" } }
+        capabilities: { type: object, additionalProperties: { type: object } }
+        adaptations: { type: object }
+        remediation_script: { type: string }
+        cached: { type: boolean }
+        cache_age_seconds: { type: [number, "null"] }

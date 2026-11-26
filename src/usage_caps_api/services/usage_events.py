@@ -21,7 +21,7 @@ from .. import identity, timeutil
 from ..auth import INTERNAL_SCOPE
 from ..gcp import GcpError
 from ..httpkit import ApiError
-from . import caps as caps_svc, pricing as pricing_svc, usage as usage_svc, webhooks
+from . import caps as caps_svc, pricing as pricing_svc, usage as usage_svc, user_model_rules, webhooks
 from .base import iso, to_int
 
 LOG = logging.getLogger("usage_caps_api.usage_events")
@@ -165,6 +165,18 @@ def handle_usage_event(ctx) -> dict:
         return _ack("ignored", reason="not_matching_inference_entry")
 
     TRACKER.remember(item, now)
+
+    # Per-user model rules (allow/deny lists, RPM/TPM): evaluated on every event, independent of spend caps.
+    try:
+        recent = TRACKER.unseen(item["person"], None, now - dt.timedelta(minutes=2), item)
+        model_res = user_model_rules.check_event(ctx, item, recent)
+    except Exception as err:  # pylint: disable=broad-except
+        LOG.warning("model rule check failed: %s", type(err).__name__)
+        model_res = None
+    if model_res and model_res.get("blocked"):
+        TRACKER.drop_snapshot()
+        return _ack("model_violation_blocked", violations=len(model_res.get("violations") or []))
+
     try:
         snap = TRACKER.snapshot(ctx, now)
     except (GcpError, ApiError):

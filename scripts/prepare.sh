@@ -1,101 +1,93 @@
 #!/usr/bin/env bash
-# Prepare GCP project(s): enable APIs, create BigQuery audit dataset, and configure AI Log Router Sink.
+# Prepare the hub and every managed project for log collection (idempotent, adoptive of existing resources):
+#   0. readiness preflight (stops before creating anything when blocked)
+#   1. enable APIs per project (per-API fallback)
+#   2. ONE central audit dataset in the hub (default), an adopted dataset (--reuse-dataset), or legacy per-project
+#      datasets (--per-project-datasets)
+#   3. a Log Router sink in EVERY project (or one folder/org aggregated sink) routing AI logs to that dataset; each
+#      writer identity gets BigQuery Data Editor on the destination dataset only
+#   4. optional Vertex AI Data Access audit logs (--enable-data-access-logs), merged without clobbering auditConfigs
 set -euo pipefail
 
-PROJECT_ID=""
-LINK_PROJECTS=""
-REGION="asia-northeast3"
-DATASET="ge_analytics"
-SERVICE_NAME="gcp-ai-usage-caps-api"
-DRY_RUN=0
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/common.sh
+source "${ROOT_DIR}/scripts/lib/common.sh"
 
 usage() {
-  cat <<'HELP'
-Usage: scripts/prepare.sh --project PROJECT_ID [--link-projects A,B] [--region REGION] [--dataset NAME] [--dry-run]
+  cat <<HELP
+Usage: scripts/prepare.sh --project HUB [--managed-projects A,B] [options]
+
+${COMMON_FLAGS_HELP}
 HELP
   exit "${1:-0}"
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --project) PROJECT_ID="${2:-}"; shift 2 ;;
-    --link-projects) LINK_PROJECTS="${2:-}"; shift 2 ;;
-    --region) REGION="${2:-}"; shift 2 ;;
-    --dataset) DATASET="${2:-}"; shift 2 ;;
-    --service-name) SERVICE_NAME="${2:-}"; shift 2 ;;
-    --dry-run) DRY_RUN=1; shift ;;
-    -h|--help) usage 0 ;;
-    # Ignore deploy-only flags when forwarded from install.sh
-    --org-id|--billing-account|--mode) shift 2 ;;
-    --grant-org-roles|--spend-caps|--no-realtime) shift ;;
-    *) echo "Unknown option: $1" >&2; usage 2 ;;
-  esac
+init_defaults
+parse_common_args "$@"
+finalize_args
+command -v bq >/dev/null || die "bq CLI is required"
+
+run_preflight
+load_project_arrays
+
+HUB_PREP_REQUIRED="serviceusage.googleapis.com cloudresourcemanager.googleapis.com iam.googleapis.com logging.googleapis.com bigquery.googleapis.com orgpolicy.googleapis.com cloudquotas.googleapis.com monitoring.googleapis.com aiplatform.googleapis.com"
+HUB_PREP_OPTIONAL="accesscontextmanager.googleapis.com cloudbilling.googleapis.com"
+MANAGED_REQUIRED="serviceusage.googleapis.com cloudresourcemanager.googleapis.com iam.googleapis.com logging.googleapis.com orgpolicy.googleapis.com cloudquotas.googleapis.com"
+MANAGED_OPTIONAL="monitoring.googleapis.com"
+[[ "$DATASET_MODE" == "per_project" ]] && MANAGED_REQUIRED="${MANAGED_REQUIRED} bigquery.googleapis.com"
+
+log "1. Enabling APIs (hub ${HUB} + managed projects)"
+enable_apis "$HUB" "$HUB_PREP_REQUIRED" "$HUB_PREP_OPTIONAL"
+for pid in ${MANAGED_ARR[@]+"${MANAGED_ARR[@]}"}; do
+  enable_apis "$pid" "$MANAGED_REQUIRED" "$MANAGED_OPTIONAL"
 done
 
-run() {
-  if [[ "$DRY_RUN" == "1" ]]; then
-    echo "[dry-run] $*"
-  else
-    "$@"
-  fi
-}
-
-command -v gcloud >/dev/null || { echo "error: gcloud CLI is required" >&2; exit 1; }
-command -v bq >/dev/null || { echo "error: bq CLI is required" >&2; exit 1; }
-
-if [[ -z "$PROJECT_ID" ]]; then
-  PROJECT_ID="$(gcloud config get-value project 2>/dev/null || true)"
-fi
-[[ -n "$PROJECT_ID" && "$PROJECT_ID" != "(unset)" ]] || { echo "error: pass --project PROJECT_ID" >&2; exit 1; }
-
-prepare_one() {
-  local pid="$1"
-  echo "==> Preparing project: ${pid} (dataset=${DATASET}, region=${REGION})"
-  run gcloud services enable \
-    bigquery.googleapis.com \
-    logging.googleapis.com \
-    cloudresourcemanager.googleapis.com \
-    iam.googleapis.com \
-    cloudbilling.googleapis.com \
-    serviceusage.googleapis.com \
-    --project="$pid"
-
-  if ! bq --project_id="$pid" show --dataset "${pid}:${DATASET}" >/dev/null 2>&1; then
-    run bq --project_id="$pid" mk --dataset --location="$REGION" \
-      --description="AI telemetry logs for GCP AI Usage & Spend Caps API" \
-      "${pid}:${DATASET}"
-  fi
-
-  local sink_name="${SERVICE_NAME}-ai-logs"
-  local log_filter='log_id("businessaicode.googleapis.com/inference_response") OR (log_id("cloudaudit.googleapis.com/data_access") AND protoPayload.serviceName="aiplatform.googleapis.com") OR log_id("discoveryengine.googleapis.com/gemini_enterprise_user_activity") OR log_id("discoveryengine.googleapis.com/gen_ai_user_message")'
-  local dest="bigquery.googleapis.com/projects/${pid}/datasets/${DATASET}"
-
-  if gcloud logging sinks describe "$sink_name" --project="$pid" >/dev/null 2>&1; then
-    run gcloud logging sinks update "$sink_name" "$dest" \
-      --project="$pid" --log-filter="$log_filter" --use-partitioned-tables
-  else
-    run gcloud logging sinks create "$sink_name" "$dest" \
-      --project="$pid" --log-filter="$log_filter" --use-partitioned-tables
-  fi
-
-  if [[ "$DRY_RUN" != "1" ]]; then
-    local writer
-    writer="$(gcloud logging sinks describe "$sink_name" --project="$pid" --format='value(writerIdentity)')"
-    if [[ -n "$writer" ]]; then
-      bq show --format=prettyjson "${pid}:${DATASET}" >/dev/null 2>&1 || true
-      gcloud projects add-iam-policy-binding "$pid" \
-        --member="$writer" --role="roles/bigquery.dataEditor" --condition=None >/dev/null
+log "2. Audit dataset (${DATASET_MODE})"
+if [[ "$DATASET_MODE" == "central" ]]; then
+  if [[ -n "$REUSE_DATASET" ]]; then
+    info "adopting existing dataset ${AUDIT_PROJECT}:${DATASET} (--reuse-dataset); nothing is created"
+    if [[ "$DRY_RUN" != "1" ]] && ! probe bq --project_id="$AUDIT_PROJECT" show --dataset "${AUDIT_PROJECT}:${DATASET}"; then
+      die "--reuse-dataset ${AUDIT_PROJECT}:${DATASET} cannot be read"
     fi
+  else
+    ensure_dataset "$AUDIT_PROJECT" "$DATASET" "$DATASET_LOCATION"
   fi
-}
-
-prepare_one "$PROJECT_ID"
-if [[ -n "$LINK_PROJECTS" ]]; then
-  IFS=',' read -r -a EXTRA_LIST <<<"$LINK_PROJECTS"
-  for extra in "${EXTRA_LIST[@]}"; do
-    extra="$(echo "$extra" | tr -d '[:space:]')"
-    [[ -n "$extra" && "$extra" != "$PROJECT_ID" ]] && prepare_one "$extra"
+else
+  for pid in "${ALL_ARR[@]}"; do
+    ensure_dataset "$pid" "$DATASET" "$DATASET_LOCATION"
   done
 fi
 
+log "3. Log Router sinks -> BigQuery"
+if [[ "$AGGREGATED_SINK" == "1" && "$SCOPE_TYPE" != "projects" && "$DATASET_MODE" == "central" ]]; then
+  for sid in ${SCOPE_ID_ARR[@]+"${SCOPE_ID_ARR[@]}"}; do
+    ensure_aggregated_bq_sink "$SCOPE_TYPE" "$sid" "$AUDIT_PROJECT" "$DATASET"
+  done
+  # The hub may sit outside the folder/org scope: give it its own sink.
+  ensure_bq_sink "$HUB" "$AUDIT_PROJECT" "$DATASET"
+else
+  for pid in "${ALL_ARR[@]}"; do
+    if [[ "$DATASET_MODE" == "central" ]]; then
+      ensure_bq_sink "$pid" "$AUDIT_PROJECT" "$DATASET"
+    else
+      ensure_bq_sink "$pid" "$pid" "$DATASET"
+    fi
+  done
+fi
+
+log "4. Vertex AI Data Access audit logs"
+if [[ "$ENABLE_DATA_ACCESS_LOGS" == "1" ]]; then
+  for pid in "${ALL_ARR[@]}"; do
+    enable_data_access_logs "$pid"
+  done
+else
+  info "unchanged (pass --enable-data-access-logs to merge DATA_READ/DATA_WRITE for aiplatform.googleapis.com)"
+fi
+
+echo ""
 echo "==> Preparation complete."
+if [[ "$DATASET_MODE" == "central" ]]; then
+  echo "    Central dataset: ${AUDIT_PROJECT}:${DATASET}  (deploy with AUDIT_PROJECT_ID=${AUDIT_PROJECT})"
+else
+  echo "    Per-project datasets: <project>:${DATASET}"
+fi

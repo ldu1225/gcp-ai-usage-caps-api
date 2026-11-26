@@ -12,8 +12,9 @@ from .cache import TTLCache
 from .gcp import Gcp
 from .httpkit import ApiError, BaseHandler, Router, Server, now_iso, parse_json_object, parse_query
 from .schema import SchemaRegistry
-from .services import (audit, base as svc_base, caps, chargeback, pricing_sync, spend_caps, usage,
-                       usage_events, webhooks)
+from .services import (audit, base as svc_base, caps, chargeback, model_access, model_registry, operations,
+                       pricing_sync, quotas, readiness, spend_caps, surface_models, usage, usage_events,
+                       user_model_rules, webhooks)
 from .store import make_doc_store
 
 LOG = logging.getLogger("usage_caps_api.app")
@@ -84,6 +85,31 @@ def _admin_revoke_key(ctx) -> dict:
     return revoked
 
 
+def _notify_readiness(ctx, report: dict) -> dict:
+    """Emits `readiness.degraded` (once per overall state per day) when the environment is not fully ready."""
+    if isinstance(report, dict) and report.get("overall") in ("blocked", "ready_with_warnings") and \
+            not report.get("cached"):
+        webhooks.notify_once(ctx, "%s|%s" % (report["overall"], now_iso()[:10]), "readiness.degraded", {
+            "overall": report["overall"], "summary": report.get("summary"), "generated_at": report.get("generated_at"),
+        })
+    return report
+
+
+def _readiness_get(ctx) -> dict:
+    return _notify_readiness(ctx, readiness.get_readiness(ctx))
+
+
+def _readiness_run(ctx) -> dict:
+    return _notify_readiness(ctx, readiness.run_readiness_handler(ctx))
+
+
+def _project_capabilities(ctx) -> dict:
+    project = (ctx.path_params.get("project_id") or "").strip().lower()
+    if project not in ctx.all_projects:
+        raise ApiError("forbidden", "Project '%s' is not managed by this control plane." % project)
+    return readiness.capabilities(ctx, project)
+
+
 # ---------------------------------------------------------------------------
 # Route table (/v1/...)
 # ---------------------------------------------------------------------------
@@ -120,6 +146,83 @@ ROUTER.route("DELETE", "/v1/admin/api-keys/{key_id}", scope="admin", rate="write
 ROUTER.route("GET", "/v1/admin/webhooks", scope="admin", rate="general")(webhooks.list_webhooks)
 ROUTER.route("POST", "/v1/admin/webhooks", scope="admin", rate="write")(webhooks.create_webhook)
 ROUTER.route("DELETE", "/v1/admin/webhooks/{webhook_id}", scope="admin", rate="write")(webhooks.delete_webhook)
+
+# -- Models: catalog, usage, access decision ---------------------------------
+ROUTER.route("GET", "/v1/models", scope="models:read", rate="general")(model_registry.list_models)
+ROUTER.route("POST", "/v1/models/sync", scope="models:write", rate="enforce")(model_registry.sync_models)
+ROUTER.route("GET", "/v1/models/{model_id}", scope="models:read", rate="general")(model_registry.get_model)
+ROUTER.route("GET", "/v1/models/{model_id}/access", scope="models:read", rate="general")(model_registry.get_model_access)
+ROUTER.route("GET", "/v1/usage/models", scope=("usage:read", "models:read"), range=True,
+             rate="general")(model_registry.usage_by_model)
+
+# -- Model access policies (Vertex AI, Org Policy vertexai.allowedModels) -----
+ROUTER.route("GET", "/v1/model-access", scope="models:read", rate="general")(model_access.list_policies)
+ROUTER.route("POST", "/v1/model-access/bulk-apply", scope="models:write", rate="enforce")(model_access.bulk_apply)
+ROUTER.route("POST", "/v1/model-access/reconcile", scope="models:write", rate="enforce")(model_access.reconcile_handler)
+ROUTER.route("GET", "/v1/model-access/{scope_type}/{scope_id}", scope="models:read", rate="general")(model_access.get_policy)
+ROUTER.route("PUT", "/v1/model-access/{scope_type}/{scope_id}", scope="models:write", rate="write")(model_access.put_policy)
+ROUTER.route("DELETE", "/v1/model-access/{scope_type}/{scope_id}", scope="models:write",
+             rate="write")(model_access.delete_policy)
+ROUTER.route("POST", "/v1/model-access/{scope_type}/{scope_id}/preview", scope="models:read",
+             rate="enforce")(model_access.preview_policy)
+ROUTER.route("POST", "/v1/model-access/{scope_type}/{scope_id}/models/{model_id}/allow", scope="models:write",
+             rate="write")(model_access.allow_model)
+ROUTER.route("POST", "/v1/model-access/{scope_type}/{scope_id}/models/{model_id}/restrict", scope="models:write",
+             rate="write")(model_access.restrict_model)
+
+# -- Surface model controls ----------------------------------------------------
+ROUTER.route("GET", "/v1/gemini-enterprise/apps", scope="models:read", rate="general")(surface_models.list_apps_handler)
+ROUTER.route("POST", "/v1/gemini-enterprise/apps/bulk-models", scope="models:write",
+             rate="enforce")(surface_models.bulk_patch_app_models)
+ROUTER.route("GET", "/v1/gemini-enterprise/apps/{app_id}/models", scope="models:read",
+             rate="general")(surface_models.get_app_models)
+ROUTER.route("PATCH", "/v1/gemini-enterprise/apps/{app_id}/models", scope="models:write",
+             rate="write")(surface_models.patch_app_models)
+ROUTER.route("GET", "/v1/antigravity/models", scope="models:read", rate="general")(surface_models.agy_models_handler)
+ROUTER.route("PUT", "/v1/antigravity/models", scope="models:write", rate="write")(surface_models.agy_models_write_handler)
+
+# -- Per-user model rules & violations -----------------------------------------
+ROUTER.route("GET", "/v1/model-rules", scope="models:read", rate="general")(user_model_rules.list_user_rules)
+ROUTER.route("GET", "/v1/model-rules/default", scope="models:read", rate="general")(user_model_rules.get_default_rule)
+ROUTER.route("PUT", "/v1/model-rules/default", scope="models:write", rate="write")(user_model_rules.put_default_rule)
+ROUTER.route("DELETE", "/v1/model-rules/default", scope="models:write",
+             rate="write")(user_model_rules.delete_default_rule)
+ROUTER.route("POST", "/v1/model-rules/evaluate", scope="models:write", rate="enforce")(user_model_rules.evaluate_handler)
+ROUTER.route("GET", "/v1/model-violations", scope="models:read", rate="general")(user_model_rules.list_violations)
+ROUTER.route("GET", "/v1/users/{email}/model-rules", scope="models:read", rate="general")(user_model_rules.get_user_rule)
+ROUTER.route("PUT", "/v1/users/{email}/model-rules", scope="models:write", rate="write")(user_model_rules.put_user_rule)
+ROUTER.route("DELETE", "/v1/users/{email}/model-rules", scope="models:write",
+             rate="write")(user_model_rules.delete_user_rule)
+
+# -- Rate limits & quotas -----------------------------------------------------
+ROUTER.route("GET", "/v1/rate-limits", scope="quotas:read", rate="general")(quotas.list_all_limits)
+ROUTER.route("GET", "/v1/rate-limits/users/{email}", scope="quotas:read",
+             rate="general")(user_model_rules.get_user_rate_limits)
+ROUTER.route("PUT", "/v1/rate-limits/users/{email}", scope="quotas:write",
+             rate="write")(user_model_rules.put_user_rate_limits)
+ROUTER.route("DELETE", "/v1/rate-limits/users/{email}", scope="quotas:write",
+             rate="write")(user_model_rules.delete_user_rate_limits)
+ROUTER.route("GET", "/v1/projects/{project_id}/rate-limits", scope="quotas:read", rate="general")(quotas.list_project_limits)
+ROUTER.route("GET", "/v1/projects/{project_id}/rate-limits/{limit_id}", scope="quotas:read",
+             rate="general")(quotas.get_project_limit)
+ROUTER.route("PATCH", "/v1/projects/{project_id}/rate-limits/{limit_id}", scope="quotas:write",
+             rate="write")(quotas.patch_project_limit)
+ROUTER.route("GET", "/v1/quota-requests", scope="quotas:read", rate="general")(quotas.list_requests)
+ROUTER.route("POST", "/v1/quota-requests", scope="quotas:write", rate="write")(quotas.create_request)
+ROUTER.route("GET", "/v1/quota-requests/{request_id}", scope="quotas:read", rate="general")(quotas.get_request)
+ROUTER.route("POST", "/v1/quota-requests/{request_id}/cancel", scope="quotas:write", rate="write")(quotas.cancel_request)
+
+# -- Environment readiness (preflight) ------------------------------------------
+ROUTER.route("GET", "/v1/admin/readiness", scope="admin", rate="general")(_readiness_get)
+ROUTER.route("POST", "/v1/admin/readiness/run", scope="admin", rate="enforce")(_readiness_run)
+ROUTER.route("GET", "/v1/projects/{project_id}/capabilities", scope=("models:read", "quotas:read", "caps:read"),
+             rate="general")(_project_capabilities)
+
+# -- Operations ---------------------------------------------------------------
+ROUTER.route("GET", "/v1/operations", scope=("models:read", "quotas:read", "caps:read"),
+             rate="general")(operations.list_operations)
+ROUTER.route("GET", "/v1/operations/{operation_id}", scope=("models:read", "quotas:read", "caps:read"),
+             rate="general")(operations.get_operation)
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +283,7 @@ class App:
                     app.limiter.check("anon:" + (self.client_ip() or "unknown"), "general")
 
                 body = {}
-                if method in ("POST", "PUT", "DELETE"):
+                if method in ("POST", "PUT", "PATCH", "DELETE"):
                     raw = self.read_body_bytes()
                     if raw:
                         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
@@ -193,11 +296,16 @@ class App:
                     ws = app.config["workspace"]
                     rng = timeutil.parse_range(params, ws.get("timezone") or "UTC", ws.get("default_range_days", 14))
 
-                ctx = svc_base.Ctx(app, app.config, caller, params=params, path_params=path_params, body=body, rng=rng)
+                fwd_headers = {name: self.headers.get(name) for name in ("If-Match", "Idempotency-Key")}
+                ctx = svc_base.Ctx(app, app.config, caller, params=params, path_params=path_params, body=body, rng=rng,
+                                   headers=fwd_headers)
                 result = fn(ctx)
                 if isinstance(result, dict) and ctx.warnings:
                     result = dict(result, warnings=ctx.warnings)
-                status = 201 if (method == "POST" and path in ("/v1/admin/api-keys", "/v1/admin/webhooks")) else 200
+                created = path in ("/v1/admin/api-keys", "/v1/admin/webhooks") or (
+                    path == "/v1/quota-requests" and isinstance(result, dict) and result.get("object") == "quota_request"
+                    and result.get("status") != "dry_run" and not result.get("idempotent_replay"))
+                status = 201 if (method == "POST" and created) else 200
                 self.send_json(status, result)
 
         return Handler

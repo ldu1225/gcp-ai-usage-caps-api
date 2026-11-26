@@ -32,6 +32,27 @@ output "org_iam_commands" {
   value = var.grant_org_roles ? [] : [
     "gcloud organizations add-iam-policy-binding ${var.organization_id != "" ? var.organization_id : "ORGANIZATION_ID"} --member=serviceAccount:${google_service_account.enforcer_sa.email} --role=roles/iam.denyAdmin --condition=None",
     "gcloud organizations add-iam-policy-binding ${var.organization_id != "" ? var.organization_id : "ORGANIZATION_ID"} --member=serviceAccount:${google_service_account.api_sa.email} --role=roles/iam.denyReviewer --condition=None",
+    "gcloud organizations add-iam-policy-binding ${var.organization_id != "" ? var.organization_id : "ORGANIZATION_ID"} --member=serviceAccount:${google_service_account.api_sa.email} --role=roles/orgpolicy.policyAdmin --condition=None",
   ]
-  description = "Commands for an Organization Admin to enable IAM Deny v2 enforcement when grant_org_roles=false."
+  description = "Commands for an Organization Admin (IAM Deny v2 enforcement + model governance org policies) when grant_org_roles=false."
+}
+
+output "managed_projects" {
+  value       = local.managed_projects
+  description = "Managed (spoke) projects governed by the hub."
+}
+
+output "audit_dataset" {
+  value       = local.central ? "${local.audit_project}:${local.dataset_id}" : "<project>:${local.dataset_id}"
+  description = "Central audit dataset (or the per-project dataset pattern)."
+}
+
+output "ai_log_sink_writers" {
+  value       = { for p, s in google_logging_project_sink.ai_logs_bq : p => s.writer_identity }
+  description = "Writer identity of the AI log sink in each project (granted BigQuery Data Editor on the destination dataset)."
+}
+
+output "usage_event_sink_writers" {
+  value       = { for p, s in google_logging_project_sink.usage_events : p => s.writer_identity }
+  description = "Writer identity of the real-time Pub/Sub sink in each project (granted Pub/Sub Publisher on the hub topic)."
 }

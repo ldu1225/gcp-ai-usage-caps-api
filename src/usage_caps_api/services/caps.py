@@ -332,7 +332,7 @@ def evaluate_gates_and_plan(users: list[dict], *, deny_readable: bool, telemetry
             else:
                 review_list.append(email)
         elif currently_denied and over is not True:
-            if _suspension_ended(susp, now) or (over is False and g3_ok):
+            if u.get("expired_block") or _suspension_ended(susp, now) or (over is False and g3_ok):
                 restore_list.append(email)
             elif not g3_ok:
                 withheld_restores = True
@@ -529,10 +529,15 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
         elif status == "blocked":
             restore_at = (mblock or {}).get("until") or (rule or {}).get("until")
 
+        raw_block = state["blocks"].get(email) if isinstance(state["blocks"].get(email), dict) else None
         rows.append({
             "email": email,
             "uid": identity.uid_for(email),
             "status": status,
+            "block_source": ((mblock or {}).get("source") or "manual") if mblock else
+                            ("rule" if (rule and rule.get("type") == "block") else
+                             ("auto_cap" if status == "suspended" else None)),
+            "expired_block": bool(raw_block and _rule_expired(raw_block, now) and not mblock),
             "blocked_services": blocked_svcs,
             "over_cap": over,
             "over_cap_reasons": reasons,
@@ -614,6 +619,7 @@ def _public_user_cap(row: dict) -> dict:
     out = dict(row)
     out.pop("suspension", None)
     out.pop("manual_block", None)
+    out.pop("expired_block", None)
     return out
 
 
@@ -934,8 +940,25 @@ def _reconcile_direct_change(ctx, policy: dict, state_doc: dict, *,
                              deny_client: enforcers.DenyPolicyClient | None = None,
                              force_unblock: str | None = None) -> dict:
     backend = policy.get("enforcement_backend") or "iam_deny"
-    if backend == "notify_only":
+    if backend == "notify_only" and not force_unblock:
         return {"backend": "notify_only", "applied": False, "detail": "Notify-only mode; no IAM change applied."}
+    if backend == "notify_only":
+        # Break-glass: notify_only never adds principals, but an unblock still removes any existing deny entries.
+        try:
+            deny_state = enforcers.read_state(ctx, client=deny_client)
+        except Exception:  # pylint: disable=broad-except
+            return {"backend": "notify_only", "applied": False, "error": "deny_policy_unreadable"}
+        if not deny_state.readable or force_unblock not in deny_state.services_by_person:
+            return {"backend": "notify_only", "applied": False, "detail": "No IAM deny entry to remove."}
+        desired = {}
+        for person, svcs in deny_state.services_by_person.items():
+            if person != force_unblock and svcs:
+                uri = identity.deny_principal(person)
+                if uri:
+                    desired[uri] = frozenset(svcs)
+        res = enforcers.apply(ctx, deny_state, desired, dry_run=False, client=deny_client)
+        return {"backend": "notify_only", "applied": bool(res.get("applied")), "items": res.get("items") or [],
+                "note": "Existing IAM deny entry removed (break-glass unblock in notify_only mode)."}
     # If an external Cloud Run Enforcer Job is configured and no explicit direct client is injected, trigger it.
     if deny_client is None and (ctx.config.get("caps") or {}).get("enforcement_job"):
         try:
@@ -1064,6 +1087,12 @@ def enforce_cycle(ctx, *, trigger: str = "api", dry_run: bool = False,
         def persist(doc):
             susps = dict(doc.get("suspensions") or {})
             if ok_apply:
+                blocks = dict(doc.get("blocks") or {})
+                for em in plan["restore"]:
+                    blk = blocks.get(em)
+                    if isinstance(blk, dict) and _rule_expired(blk, now):
+                        blocks.pop(em, None)
+                doc["blocks"] = blocks
                 for em in plan["suspend"]:
                     u = users_by_email.get(em) or {}
                     susps[em] = {
@@ -1119,4 +1148,8 @@ def enforce_handler(ctx) -> dict:
     if not isinstance(dry_run, bool):
         raise ApiError("bad_request", "Field 'dryRun' must be a boolean.")
     trigger = "scheduler" if ctx.caller.auth_type == "oidc" else "api"
-    return enforce_cycle(ctx, trigger=trigger, dry_run=dry_run, use_job_if_configured=True)
+    out = enforce_cycle(ctx, trigger=trigger, dry_run=dry_run, use_job_if_configured=True)
+    if out.get("result") != "job_started":
+        from . import governance_cycle
+        out["governance"] = governance_cycle.run(ctx, dry_run=dry_run, trigger=trigger)
+    return out

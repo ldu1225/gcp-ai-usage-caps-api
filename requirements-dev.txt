@@ -1,0 +1,3 @@
+# Development / CI only (runtime needs none of these)
+pyyaml>=6.0
+openapi-spec-validator>=0.7

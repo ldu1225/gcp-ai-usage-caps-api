@@ -1,21 +1,44 @@
-project_id      = "my-gcp-project-id"
+project_id      = "my-hub-project-id"
 region          = "asia-northeast3"
-container_image = "asia-northeast3-docker.pkg.dev/my-gcp-project-id/ai-usage-caps/gcp-ai-usage-caps-api:latest"
+container_image = "asia-northeast3-docker.pkg.dev/my-hub-project-id/ai-usage-caps/gcp-ai-usage-caps-api:latest"
 
-# Optional multi-project / org scope
-linked_projects  = []
-scope_type       = "projects"
-scope_ids        = []
-organization_id  = ""
-grant_org_roles  = false
+# Hub-and-spoke: projects governed by the hub (sinks + least-privilege grants are created in each)
+managed_projects    = ["team-a-project", "team-b-project"]
+enable_managed_apis = true
+grant_managed_roles = true
+
+# Or govern every project under folders / an organization (discovered at runtime)
+scope_type        = "projects" # projects | folder | organization
+scope_ids         = []
+grant_scope_roles = false
+
+# Logs: ONE central dataset in the hub (default). Adopt an existing dataset with reuse_dataset = "PROJECT:DATASET".
+central_dataset         = true
+audit_dataset_id        = "ge_analytics"
+reuse_dataset           = ""
+enable_data_access_logs = false
+
+# Organization-only roles (Deny Admin / Deny Reviewer / Organization Policy Administrator)
+organization_id = ""
+grant_org_roles = false
+
+# Organization policy adaptations (scripts/preflight.sh tells which apply)
+no_invoker_iam_check        = false # true under domain restricted sharing
+allow_unauthenticated_edge  = true
+binary_authorization_policy = ""
+vpc_network                 = ""
+vpc_subnet                  = ""
+vpc_egress                  = "all-traffic"
 
 # Optional billing export & project hard spend caps
 billing_account_id = ""
 spend_caps_enabled = false
 
-# Enforcement defaults
-enforcement_backend  = "iam_deny"
-enforcement_mode     = "manual"
-realtime_enforcement = true
-workspace_timezone   = "Asia/Seoul"
-cap_currency         = "USD"
+# Enforcement, models and quotas
+enforcement_backend    = "iam_deny"
+enforcement_mode       = "manual"
+realtime_enforcement   = true
+model_violation_action = "block_service"
+quota_contact_email    = ""
+workspace_timezone     = "Asia/Seoul"
+cap_currency           = "USD"

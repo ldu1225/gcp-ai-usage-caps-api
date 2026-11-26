@@ -103,3 +103,42 @@ pricing:
     - "duet ai"
   fx_sources:
     - "https://open.er-api.com/v6/latest/USD"
+
+# Central (hub) deployment facts — filled by scripts/deploy.sh via environment variables.
+hub:
+  region: "asia-northeast3"
+  service_name: "gcp-ai-usage-caps-api"
+  runtime_service_account: ""
+  enforcer_service_account: ""
+  org_id: ""
+  vpc_network: ""
+  vpc_subnet: ""
+  vpc_egress: ""
+  usage_events_topic: ""
+
+# Model governance (Org Policy vertexai.allowedModels, Gemini Enterprise app models, per-user model rules)
+models:
+  violation_action: "block_service"   # block_service (default: block first, always notify) | notify
+  violation_block_minutes: 0          # 0 = model violations stay blocked until POST /v1/users/{email}/unblock
+  violation_notify: true
+  policy_scopes: ["projects"]         # projects | folders | organizations (writes need org-level roles/orgpolicy.policyAdmin)
+  allow_org_policy_writes: true
+  default_actions: ["predict"]        # predict | deploy | tune
+  always_allow: ["publishers/anthropic/models/count-tokens"]
+  publishers: ["google", "anthropic", "meta", "mistralai", "ai21", "deepseek-ai", "qwen", "openai"]
+  catalog_ttl_seconds: 3600
+  max_policy_values: 500
+  protected_principals: []            # e.g. ["ceo@company.com", "*@breakglass.company.com"] -> notify only
+  managed_folders: []
+  lifecycle_overrides: []             # [{model, deprecation_date, shutdown_date, replacement}]
+
+# Rate limits & quota requests (Cloud Quotas API)
+quotas:
+  service: "aiplatform.googleapis.com"
+  contact_email: ""                   # default contact for quota increase requests
+  headroom_warn_pct: 80
+  max_projects_per_call: 50
+
+readiness:
+  cache_ttl_seconds: 900
+  strict: true
