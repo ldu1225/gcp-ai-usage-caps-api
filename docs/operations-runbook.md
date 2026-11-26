@@ -4,12 +4,14 @@
 > Enforcer Job executions, daily price sync), verifying enforcement (IAM Deny v2 typically propagates in ~1–2 minutes),
 > emergency unblock / break-glass (order matters: unblock while `enforcement_backend=iam_deny`, or delete the managed
 > deny policy after switching to `notify_only`), protected principals and `allow` overrides, a symptom → cause → fix
-> troubleshooting table (missing usage data, Vertex AI `requests_only`, high `unattributed`, unpriced models, VPC-SC
+> troubleshooting table (missing usage data, Gemini Platform (Gemini Enterprise Agent Platform, formerly Vertex AI) `requests_only`, high `unattributed`, unpriced models, VPC-SC
 > denials, permission denied on Org Policy / Cloud Quotas / deny policies, IAM v2 read quota, Pub/Sub push failures,
 > Scheduler, stuck quota requests, model policy drift, Gemini Enterprise `not_applicable`), webhook signature
 > verification with a Python sample, API key rotation, GCS state bucket backup/restore, upgrade/rollback, and §10 on
-> cost & attribution operations (official SKU price sync — no Cloud Billing export —, enabling Vertex AI inference
-> request logging, reading `telemetry.attribution`, handling unattributed usage, new-model tracking).
+> cost & attribution operations (official SKU price sync — no Cloud Billing export —, enabling Gemini Platform inference
+> request logging, reading `telemetry.attribution`, handling unattributed usage, new-model tracking), and §11 on user
+> group operations (lifting a group block, exclusions and user-level allows, Google Group sync troubleshooting,
+> diagnosing who or what blocked a person).
 
 ---
 
@@ -25,6 +27,7 @@
 8. [GCS 상태 버킷 백업·복구](#8-gcs-상태-버킷-백업복구)
 9. [업그레이드·롤백](#9-업그레이드롤백)
 10. [비용·단가·사용자 귀속 운영](#10-비용단가사용자-귀속-운영)
+11. [그룹 운영](#11-그룹-운영)
 
 공통 변수(예시):
 
@@ -46,7 +49,7 @@ ADMIN_KEY=gcpai_xxxxxxxxxxxx_yyyyyyyy...   # admin 스코프 키
 | Enforcer Job 실행 이력 | `gcloud run jobs executions list --job $SVC-enforcer --region $REGION --project $HUB --limit 5` | 5분 간격 성공 실행 |
 | 스케줄러 | `gcloud scheduler jobs describe $SVC-enforce-schedule --location $REGION --project $HUB --format='value(state,lastAttemptTime,status)'` | `ENABLED`, 최근 시도 성공 |
 | **단가 동기화** | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/pricing" \| jq '.pricing_source'` / `gcloud scheduler jobs describe $SVC-pricing-sync --location $REGION --project $HUB` | `catalog_synced_at`이 24시간 이내, `official_sku_models > 0`, `billing_export: "not_used"` |
-| **Vertex AI 토큰 출처** | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/usage/users?limit=1" \| jq '.telemetry'` | `token_sources.gemini_platform = "logs"`, `attribution.unattributed`가 전체 대비 작음 |
+| **Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI) 토큰 출처** | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/usage/users?limit=1" \| jq '.telemetry'` | `token_sources.gemini_platform = "logs"`, `attribution.unattributed`가 전체 대비 작음 |
 | 실시간 구독 적체 | Cloud Monitoring `pubsub.googleapis.com/subscription/num_undelivered_messages` (구독 `$SVC-usage-events-push`) | 0 근처 |
 | 감사 로그 | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/audit-logs"` | 예상하지 못한 `api_key.created`, `user.blocked` 등 없음 |
 
@@ -110,7 +113,7 @@ sequenceDiagram
      --kind=denypolicies --format=json | jq '.rules[].denyRule'
    ```
 
-   서비스별 거부 권한: Antigravity `businessaicode.googleapis.com/locations.generateContent`, Vertex AI
+   서비스별 거부 권한: Antigravity `businessaicode.googleapis.com/locations.generateContent`, Gemini Platform
    `aiplatform.googleapis.com/endpoints.predict`, Gemini Enterprise `discoveryengine.googleapis.com/assistants.assist`.
 4. **전파 대기**: IAM Deny는 보통 **1–2분** 안에 적용됩니다(환경에 따라 더 걸릴 수 있음). 즉시 확인되지 않아도
    2–3분 뒤 다시 시도하세요.
@@ -181,9 +184,9 @@ done
 
 | 증상 | 가능한 원인 | 확인 | 조치 |
 |---|---|---|---|
-| 사용량이 0 / 특정 서피스 데이터 없음 | 싱크 없음·비활성·writer 권한 없음, `_Default` 제외 필터, Vertex AI Data Access 로그 꺼짐, Antigravity Metadata logging 꺼짐, 서비스가 데이터세트를 잘못 가리킴 | readiness `logging.sink.bigquery`, `logging.sink.writer_access`, `logging.sink.disabled`, `logging.default_sink`, `logging.audit_config.aiplatform`, `surface.antigravity.metadata_logging`, `bq.freshness.*`; Cloud Run 환경변수 `AUDIT_PROJECT_ID`/`AUDIT_DATASET_ID` | `prepare.sh` 재실행(싱크·권한), `--enable-data-access-logs`, 콘솔에서 Metadata logging 켜기, 환경변수 수정. 새 싱크는 **생성 이후** 로그만 라우팅합니다 |
-| Vertex AI 요청 수는 있는데 토큰·비용이 0 (`token_sources.gemini_platform = "requests_only"`, 경고 `inference_logs_missing`) | 추론 요청 메타데이터 로그 꺼짐, 또는 싱크 필터에 `aiplatform.googleapis.com/inference_request` 없음(1.1 이하에서 채택한 싱크) | readiness `logging.vertex_inference_logging`, `logging.sink.bigquery`의 `data.missing`, `GET /v1/projects/{id}/vertex-logging` | `POST /v1/projects/{id}/vertex-logging/enable` 또는 `prepare.sh` 재실행. 레거시 싱크는 readiness가 제시하는 `gcloud logging sinks update ... --log-filter=...`로 필터 보강. 켠 **이후** 요청부터 토큰이 집계됩니다 |
-| `telemetry.attribution.unattributed`가 큼 / `summary.unattributed_*` 증가 | 포털이 Vertex AI 호출에 헤더 라벨을 안 붙임, 헤더 값이 알 수 없는 uid, Data Access 감사 로그 꺼짐, 배치·서비스 계정 워크로드 | `telemetry.unattributed_projects`, `GET /v1/usage/models?group_by=project`의 `unattributed_*`, 차지백 `unattributed[].reasons` (`service_account` / `no_user_identity`) | §10.3 참고: 헤더 추가(이메일 권장), `--enable-data-access-logs`, 서비스 계정 워크로드는 프로젝트 비용으로 처리 |
+| 사용량이 0 / 특정 서피스 데이터 없음 | 싱크 없음·비활성·writer 권한 없음, `_Default` 제외 필터, Gemini Platform Data Access 로그 꺼짐, Antigravity Metadata logging 꺼짐, 서비스가 데이터세트를 잘못 가리킴 | readiness `logging.sink.bigquery`, `logging.sink.writer_access`, `logging.sink.disabled`, `logging.default_sink`, `logging.audit_config.aiplatform`, `surface.antigravity.metadata_logging`, `bq.freshness.*`; Cloud Run 환경변수 `AUDIT_PROJECT_ID`/`AUDIT_DATASET_ID` | `prepare.sh` 재실행(싱크·권한), `--enable-data-access-logs`, 콘솔에서 Metadata logging 켜기, 환경변수 수정. 새 싱크는 **생성 이후** 로그만 라우팅합니다 |
+| Gemini Platform 요청 수는 있는데 토큰·비용이 0 (`token_sources.gemini_platform = "requests_only"`, 경고 `inference_logs_missing`) | 추론 요청 메타데이터 로그 꺼짐, 또는 싱크 필터에 `aiplatform.googleapis.com/inference_request` 없음(1.1 이하에서 채택한 싱크) | readiness `logging.vertex_inference_logging`, `logging.sink.bigquery`의 `data.missing`, `GET /v1/projects/{id}/vertex-logging` | `POST /v1/projects/{id}/vertex-logging/enable` 또는 `prepare.sh` 재실행. 레거시 싱크는 readiness가 제시하는 `gcloud logging sinks update ... --log-filter=...`로 필터 보강. 켠 **이후** 요청부터 토큰이 집계됩니다 |
+| `telemetry.attribution.unattributed`가 큼 / `summary.unattributed_*` 증가 | 포털이 Gemini Platform 호출에 헤더 라벨을 안 붙임, 헤더 값이 알 수 없는 uid, Data Access 감사 로그 꺼짐, 배치·서비스 계정 워크로드 | `telemetry.unattributed_projects`, `GET /v1/usage/models?group_by=project`의 `unattributed_*`, 차지백 `unattributed[].reasons` (`service_account` / `no_user_identity`) | §10.3 참고: 헤더 추가(이메일 권장), `--enable-data-access-logs`, 서비스 계정 워크로드는 프로젝트 비용으로 처리 |
 | `estimated_cost`가 `null` / `cost_partial: true` / `cost_basis: "unpriced"` | 단가 동기화 안 됨, 해당 모델 SKU가 아직 Catalog에 없음, 모델 ID와 SKU 이름 불일치 | `GET /v1/pricing` (`catalog_synced_at`, `model_key` 목록), `GET /v1/pricing?model=<model-id>` | `POST /v1/internal/pricing/sync`(관리자 키) 실행, Scheduler `$SVC-pricing-sync` 확인. 불일치는 `pricing.model_aliases`, 계약 단가는 `pricing.model_overrides`. **추측 단가로 채우지 않습니다** |
 | `GET /v1/models`가 비어 있거나 Model Garden 모델이 없음 | Model Garden 조회 실패(권한·VPC-SC·네트워크), 아직 로그 관측 없음 — **내장 목록 없음**(정상 설계) | 응답 `catalog.errors`, `catalog.model_garden_models`, readiness `surface.gemini_platform.models` | 원인 해결 후 `POST /v1/models/sync`. 로그에서 모델이 사용되면 `source: observed`로 자동 등록 |
 | `vpcsc.denials` / API 호출이 `SECURITY_POLICY_VIOLATED`, "VPC Service Controls" 오류 | 허브와 관리 프로젝트가 다른 경계, 경계 밖 호출자(포털·설치 PC) | readiness `vpcsc.perimeter`, `vpcsc.cross_project`, `vpcsc.denials`의 `data.denials` | `vpcsc.cross_project`가 생성한 ingress/egress YAML을 기존 규칙과 병합 적용, 포털에는 액세스 수준/ingress 규칙 ([preflight-checklist.md §7](preflight-checklist.md#7-vpc-서비스-제어vpc-sc-경계-간-ingressegress-가이드)) |
@@ -200,6 +203,8 @@ done
 | Antigravity 모델 설정 쓰기 `409 console_required` | Google이 `UpdateDevToolsConfig`를 콘솔로 제한 | 응답의 `console_url` | 콘솔에서 변경 |
 | 웹훅 수신 측 서명 검증 실패 | 원문 바이트가 아닌 재직렬화 JSON으로 검증, 타임스탬프 미포함, 다른 웹훅의 시크릿 사용, 시크릿 분실 | 아래 §6 | §6 코드 사용. 시크릿은 생성 시 한 번만 반환되므로 분실 시 새 웹훅 생성 후 기존 삭제 |
 | 웹훅이 도착하지 않음 | 공개 HTTPS가 아님(사설/루프백/메타데이터 주소 거부), 5초 타임아웃, 비 2xx 응답, VPC egress에 Cloud NAT 없음 | API 로그 `webhook delivery failed id=... event=... error=...`, readiness `network.nat` | 2xx를 5초 안에 응답하고 처리는 비동기로. **재시도 없음(단발 전송)** 이므로 수신 측 가용성 확보 |
+| 그룹 해제 후에도 일부 멤버가 차단됨 | 개인 수동 차단, 개인 캡 초과 정지, 차단 규칙, 다른 그룹의 차단 | 해제 응답의 `members_still_blocked`, `GET /v1/caps/users/{email}`의 `block_source` | 개인 차단은 `POST /v1/users/{email}/unblock`. §11.1 |
+| Google Group 멤버가 그룹에 반영되지 않음 (`sync_error` 값 존재) | Cloud Identity API 비활성, 런타임 SA에 Groups Reader 관리자 역할 없음, 그룹 이메일 오타 | `GET /v1/groups/{id}`의 `sync_error`, `synced_at` | §11.3 |
 | `429 rate_limited` | 호출자별 토큰 버킷 초과 (`general` 300/분, `write` 60/분, `enforce` 20/분, `usage_event` 6000/분) | 응답 `Retry-After` 헤더 | 백오프 후 재시도, 호출자별 키 분리 |
 
 ## 6. 웹훅 서명 검증
@@ -307,7 +312,7 @@ gcloud run services update $SVC --region $REGION --project $HUB \
 | 문서 | 내용 |
 |---|---|
 | `policy.json` | 전역 지출 캡 정책 |
-| `user_caps.json` | 사용자별 캡 규칙, 차단/해제, 정지 기록, 마지막 실행 |
+| `user_caps.json` | 사용자별 캡 규칙, 차단/해제, 정지 기록, 마지막 실행, 그룹 캡 규칙(`group_rules`)·그룹 차단(`group_blocks`) |
 | `project_caps.json` | 프로젝트 지출 캡 |
 | `api_keys.json` | API 키 salt + 해시 |
 | `webhooks.json` | 웹훅 구독(시크릿 포함), 알림 dedupe 원장 |
@@ -315,6 +320,7 @@ gcloud run services update $SVC --region $REGION --project $HUB \
 | `audit_local.json` | 최근 감사 이벤트 2,000건 |
 | `model_policies.json`, `model_catalog.json`, `user_model_rules.json` | 모델 거버넌스 의도·카탈로그(Model Garden `models` + 로그 관측 `observed`)·사용자 모델 규칙 |
 | `user_directory.json` | 헤더 라벨 `uid` → 사용자 매핑 |
+| `groups.json` | 그룹 정의(`members`, `excluded`, `google_group`, `synced_members`, `sync_error`, `priority`) |
 | `quota_requests.json`, `operations.json`, `governance_cycle.json`, `readiness.json` | 쿼터 요청, 비동기 작업, 거버넌스 주기 상태, readiness 캐시 |
 
 ```bash
@@ -375,10 +381,10 @@ gcloud run jobs update $SVC-enforcer --region $REGION --project $HUB --image=<PR
 ### 9.4 1.1 → 1.2 업그레이드 체크리스트
 
 1. 환경변수 `BILLING_PROJECT_ID`/`BILLING_DATASET_ID`/`BILLING_TABLE_ID` 삭제(무시됨). Terraform `billing_project_id`/`billing_dataset_id`/`billing_table_id` 변수 삭제.
-2. `prepare.sh` 재실행 → Vertex AI 추론 요청 로그 활성화 + 싱크 필터에 `inference_request` 추가(채택 싱크는 readiness 안내 명령으로 수정).
+2. `prepare.sh` 재실행 → Gemini Platform 추론 요청 로그 활성화 + 싱크 필터에 `inference_request` 추가(채택 싱크는 readiness 안내 명령으로 수정).
 3. `deploy.sh` 재실행 → `$SVC-pricing-sync` 스케줄러, `gcpAiCapsVertexLoggingReader` 역할.
 4. `POST /v1/internal/pricing/sync` 1회 실행 후 `GET /v1/pricing` 확인.
-5. 포털: Vertex AI 호출에 사용자 헤더 라벨 추가, 하드코딩된 모델 ID 제거, `Model.source`(`model_garden`|`observed`) 처리 확인.
+5. 포털: Gemini Platform 호출에 사용자 헤더 라벨 추가, 하드코딩된 모델 ID 제거, `Model.source`(`model_garden`|`observed`) 처리 확인.
 
 ## 10. 비용·단가·사용자 귀속 운영
 
@@ -402,7 +408,7 @@ curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/pricing" | jq '.pricing_s
 
 계약 단가가 있으면 `config.local.yaml`의 `pricing.model_overrides`(1M 토큰당, 캡 통화)로 넣고 재배포합니다. 응답의 `cost_basis`가 `override`로 바뀝니다.
 
-### 10.2 Vertex AI 추론 요청 로그 켜기·확인
+### 10.2 Gemini Platform 추론 요청 로그 켜기·확인
 
 ```bash
 # 상태 (모든 관리 프로젝트)
@@ -425,14 +431,14 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: applicat
 | 키 | 의미 | 기대 |
 |---|---|---|
 | `log_identity` | 로그 자체에 사람이 기록된 요청 (Antigravity, 감사 로그, GE) | 대부분 |
-| `header_label` | 포털 헤더 `x-goog-agent-platform-observability-label-user`로 정확 귀속된 Vertex AI 요청 | Vertex AI의 대부분 |
+| `header_label` | 포털 헤더 `x-goog-agent-platform-observability-label-user`로 정확 귀속된 Gemini Platform 요청 | Gemini Platform의 대부분 |
 | `audit_correlated` | 헤더가 없어 같은 분(±1)의 Data Access 감사 호출자에게 비례 배분 | 적을수록 좋음 |
 | `unattributed` | 귀속 불가 → 프로젝트 `unattributed`로 보존 | 0에 가깝게 |
 
 처리 절차:
 
 1. **어디서 생기나**: `telemetry.unattributed_projects`, `GET /v1/usage/models?group_by=project`의 `unattributed_requests/tokens`, `GET /v1/billing/users?month=YYYY-MM`의 `unattributed[]`(`reasons`: `service_account` — 서비스 계정 호출, `no_user_identity` — 주체 정보 없음).
-2. **포털 호출이면**: Vertex AI 호출 코드에 헤더를 추가합니다(README §4 예시). 값은 이메일을 권장합니다(uid는 이 API가 이미 아는 사용자만 해석). 헤더 이름 접미사를 바꿨다면 `VERTEX_USER_HEADER_LABEL`과 일치시켜야 합니다.
+2. **포털 호출이면**: Gemini Platform 호출 코드에 헤더를 추가합니다(README §4 예시). 값은 이메일을 권장합니다(uid는 이 API가 이미 아는 사용자만 해석). 헤더 이름 접미사를 바꿨다면 `VERTEX_USER_HEADER_LABEL`과 일치시켜야 합니다.
 3. **감사 로그 상관을 쓰려면**: `logging.audit_config.aiplatform`이 `pass`인지 확인(`prepare.sh --enable-data-access-logs`). 같은 프로젝트·모델·분에 사람 호출자가 있어야 배분됩니다.
 4. **배치·파이프라인(서비스 계정)**: 사람에게 귀속할 수 없는 정상 사용입니다. 차지백에서는 프로젝트 비용으로 처리하고, 사용자 캡에는 포함되지 않음을 이해관계자에게 알립니다.
 5. **보고**: 프로젝트 합계 = 사용자 합계 + `unattributed`. 고객 보고서에는 두 값을 분리해 표기하세요.
@@ -443,6 +449,99 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: applicat
 * `GET /v1/models?source=observed` — Model Garden에 없지만 사용된 모델(프리뷰·파트너·튜닝 모델 등). publisher가 비어 있으면 정책 지정 시 `publisher/model-id`를 사용하세요.
 * `GET /v1/usage/models` 행의 `cost_basis: unpriced`이면 SKU가 아직 게시되지 않은 모델입니다 — 다음 단가 동기화에서 자동 반영되며, 급하면 `pricing.model_overrides`.
 * `model.catalog_changed`의 `delisted`는 Model Garden에서 사라진 모델입니다(카탈로그에는 `lifecycle.delisted_at`과 함께 유지, 패턴 확장에서는 제외).
+
+
+## 11. 그룹 운영
+
+그룹 동작 원리(해석 순서, 공유 풀, 복구 규칙)는 [enforcement-logic.md §9](enforcement-logic.md#9-그룹-groups)를 참고하세요. 아래 예시는 다음 변수를 가정합니다.
+
+```bash
+BASE=$API                      # API URL
+KEY=gcpai_xxxxxxxxxxxx_yyyy... # users:write, caps:read, caps:write 스코프 키 (또는 admin)
+```
+
+### 11.1 그룹 차단 해제
+
+```bash
+# 1) 그룹 차단 해제
+curl -s -X POST "$BASE/v1/groups/contractors/unblock" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" -d '{"reason":"review complete"}' \
+  | jq '{status, had_block, members_still_blocked, enforcement}'
+
+# 2) 여전히 차단된 멤버가 있으면 원인 확인
+curl -s "$BASE/v1/caps/users/erin%40example.com" -H "Authorization: Bearer $KEY" | jq '{status, block_source, rule_source, groups}'
+
+# 3) 개인 차단(block_source: manual / rule / auto_cap)은 사용자 단위로 해제
+curl -s -X POST "$BASE/v1/users/erin%40example.com/unblock" -H "Authorization: Bearer $KEY"
+```
+
+* 그룹 해제는 **그 그룹 때문에만** 존재하던 차단·정지를 제거합니다. 개인 수동 차단, 개인 캡 초과 정지, 다른 그룹(`block_source: group:<다른 id>`)의 차단은 남으며 `members_still_blocked`에 나열됩니다.
+* `type=block` 그룹 캡 규칙도 unblock으로 함께 제거됩니다. 공유 풀 캡으로 인한 정지를 풀려면 캡을 올리거나(`PUT /v1/caps/groups/{id}`) 삭제(`DELETE /v1/caps/groups/{id}`)합니다. 기간 리셋 시에는 자동 복구됩니다.
+* IAM Deny 전파에는 보통 1–2분이 걸립니다.
+
+### 11.2 특정 사람을 그룹 정책에서 빼기
+
+| 방법 | 효과 | 명령 |
+|---|---|---|
+| 그룹 예외(exclusion) | 그 그룹의 **모든 정책**(캡, 차단, 모델 규칙)이 그 사람에게 적용되지 않음. Google Group 동기화 멤버에도 유효 | `POST /v1/groups/{id}/exclusions {"add":[...]}` |
+| 사용자 수준 allow | 모든 그룹 차단보다 우선하고 캡 자동 정지·임계값 웹훅에서 제외. 다른 그룹 멤버십에도 적용 | `PUT /v1/caps/users/{email} {"type":"allow"}` |
+
+```bash
+# 예외 추가 (되돌리기: {"remove":[...]})
+curl -s -X POST "$BASE/v1/groups/contractors/exclusions" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" -d '{"add":["dave@example.com"]}' | jq '{effective_removed, enforcement}'
+
+# 사용자 수준 allow (caps:write)
+curl -s -X PUT "$BASE/v1/caps/users/dave%40example.com" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" -d '{"type":"allow","note":"break-glass for on-call"}'
+```
+
+그룹에 집행 중인 정책(그룹 차단, `block`/`allow` 규칙, 공유 풀 캡)이 있으면 예외·멤버 변경은 즉시 IAM Deny에 반영되고 `group.membership_changed` 웹훅이 발송됩니다. 자신의 수동 차단은 예외나 allow로 사라지지 않으니 필요하면 `POST /v1/users/{email}/unblock`도 실행하세요.
+
+### 11.3 Google Group 동기화 문제 해결
+
+```bash
+# 상태 확인: sync_error 가 null 이어야 정상
+curl -s "$BASE/v1/groups/data-science" -H "Authorization: Bearer $KEY" | jq '{google_group, synced_at, sync_error}'
+
+# 즉시 재동기화 (자동 동기화는 거버넌스 주기에서 1시간마다)
+curl -s -X POST "$BASE/v1/groups/data-science/sync" -H "Authorization: Bearer $KEY" | jq .
+# 성공: {"synced": true, "members": 42, "added": [...], "removed": [...]}
+# 실패: {"synced": false, "error": "...", "hint": "Enable the Cloud Identity API and grant ..."}
+```
+
+| 확인 항목 | 조치 |
+|---|---|
+| Cloud Identity API | 허브 프로젝트에서 `gcloud services enable cloudidentity.googleapis.com --project $HUB` |
+| Groups Reader 역할 | Google Admin 콘솔 > 계정 > 관리자 역할 > **Groups Reader** > 관리자 할당에서 런타임 SA(`ai-usage-caps-api@<HUB>.iam.gserviceaccount.com`) 지정 ([security.md §3.1](security.md#31-google-group-동기화-cloud-identity-api)) |
+| 그룹 이메일 | `PATCH /v1/groups/{id} {"google_group":"..."}`로 수정. 그룹을 찾을 수 없으면 `sync_error: not_found` |
+| 중첩 그룹 | `memberships:searchTransitiveMemberships`로 하위 그룹 멤버까지 가져옵니다. 이 호출이 실패하면 직접 멤버 목록으로 대체되어 **중첩 그룹 멤버가 빠질 수 있습니다** |
+| 빠진 멤버 | 서비스 계정(`*.gserviceaccount.com`)은 항상 제외됩니다. 그룹당 최대 5,000명 |
+
+동기화가 실패해도 마지막으로 성공한 `synced_members`는 유지됩니다. 실패는 감사 로그 `group.sync_failed`에 기록됩니다.
+
+### 11.4 누가/무엇이 이 사람을 차단했나
+
+```bash
+# 그룹 관점: 소속 그룹, 예외, 적용 중인 규칙 출처
+curl -s "$BASE/v1/users/erin%40example.com/groups" -H "Authorization: Bearer $KEY" \
+  | jq '{groups: [.groups[] | {id, priority, via, block: (.block != null)}], excluded_from,
+         effective_cap_rule_source, effective_block_source, effective_model_rule_source, shared_pools}'
+
+# 캡 관점: 상태와 출처
+curl -s "$BASE/v1/caps/users/erin%40example.com" -H "Authorization: Bearer $KEY" \
+  | jq '{status, status_scope, rule_source, block_source, groups, group_pools, blocked_services, blocked_projects}'
+```
+
+| 값 | 의미 | 해제 방법 |
+|---|---|---|
+| `block_source: manual` | 개인 수동 차단 | `POST /v1/users/{email}/unblock` |
+| `block_source: group:<id>` | 그룹 차단 또는 그룹 `type=block` 캡 규칙 상속 | `POST /v1/groups/{id}/unblock`, 예외 추가, 또는 사용자 수준 allow |
+| `block_source: rule` | 개인 `type=block` 캡 규칙 | 규칙 삭제/변경(`DELETE /v1/caps/users/{email}`) 또는 `POST /v1/users/{email}/unblock` |
+| `block_source: auto_cap` | 캡 초과 자동 정지(개인 캡 또는 공유 풀 그룹 캡) | 캡 상향, 기간 리셋 자동 복구, 또는 `POST /v1/users/{email}/unblock` |
+| `rule_source: user` / `policy` / `group:<id>` | 적용 중인 캡 규칙이 사용자 규칙 / 전역 정책 / 그룹 규칙 | 해당 위치의 규칙 수정 |
+
+모델 규칙 위반 차단은 `GET /v1/model-violations?email=...`와 `effective_model_rule_source`로 확인합니다([model-governance.md §4.1](model-governance.md#41-그룹-모델-규칙)).
 
 관련 문서: [preflight-checklist.md](preflight-checklist.md) · [multi-project-deployment.md](multi-project-deployment.md) ·
 [security.md](security.md) · [webhooks.md](webhooks.md) · [enforcement-logic.md](enforcement-logic.md) · [cost-methodology.md](cost-methodology.md)

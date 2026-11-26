@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="760" viewBox="0 0 1280 760" role="img" aria-labelledby="title desc" font-family="Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <title id="title">Policy resolution for one person</title>
+  <desc id="desc">The effective rule for a person is the user rule if present, otherwise the first group rule by priority (lowest first), otherwise the global policy or default rule. Exclusions remove a person from a group; a user-level allow overrides a group block. Shared pools are evaluated in addition to per-member caps.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#0B1F3A" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3C4A5E"/>
+    </marker>
+    <marker id="arrb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1A73E8"/>
+    </marker>
+    <marker id="arrr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#D93025"/>
+    </marker>
+    <marker id="arrg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#34A853"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="760" fill="#FFFFFF"/>
+  <text x="40" y="42" font-size="22" font-weight="700" fill="#0B1F3A">Policy resolution for one person</text>
+  <text x="40" y="66" font-size="14" fill="#5F6B7A">Most specific rule wins; group policies are derived on the fly, never copied</text>
+  <g filter="url(#shadow)"><rect x="40" y="120" width="260" height="92" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="40" y="130" width="4" height="72" rx="2" fill="#0B1F3A"/>
+  <text x="58" y="153.0" font-size="14" font-weight="700" fill="#1F2A3C">alice@company.com</text>
+  <text x="58" y="171.0" font-size="13" fill="#5F6B7A">Member of: eng, interns</text>
+  <text x="58" y="189.0" font-size="13" fill="#5F6B7A">Excluded from: contractors</text>
+  <rect x="40" y="250" width="260" height="330" rx="14" fill="#F8FAFD" stroke="#8A97A8" stroke-width="1.5"/>
+  <text x="56" y="272" font-size="12" font-weight="700" letter-spacing="1" fill="#8A97A8">EFFECTIVE MEMBERSHIP</text>
+  <text x="58" y="300" font-size="13" fill="#1F2A3C" text-anchor="start" font-weight="700">members</text>
+  <text x="58" y="320" font-size="13" fill="#1F2A3C" text-anchor="start" font-weight="700">+ synced Google Group</text>
+  <text x="58" y="340" font-size="13" fill="#D93025" text-anchor="start" font-weight="700">- excluded</text>
+  <path d="M58 354 H282" fill="none" stroke="#C9D4E3" stroke-width="1.5"/>
+  <rect x="58" y="372" width="224" height="30" rx="15.0" fill="#1A73E8" fill-opacity="0.12" stroke="#1A73E8" stroke-width="1.5"/>
+  <text x="170.0" y="391.7" font-size="13" font-weight="600" fill="#1F2A3C" text-anchor="middle">eng  (priority 10)</text>
+  <rect x="58" y="414" width="224" height="30" rx="15.0" fill="#1A73E8" fill-opacity="0.12" stroke="#1A73E8" stroke-width="1.5"/>
+  <text x="170.0" y="433.7" font-size="13" font-weight="600" fill="#1F2A3C" text-anchor="middle">interns  (priority 50)</text>
+  <rect x="58" y="456" width="224" height="30" rx="15" fill="#FFFFFF" stroke="#B0BAC8" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="170" y="476" font-size="13" fill="#8A97A8" text-anchor="middle">contractors  (excluded)</text>
+  <text x="58" y="516" font-size="12" fill="#5F6B7A" text-anchor="start">Exclusion removes the person</text>
+  <text x="58" y="534" font-size="12" fill="#5F6B7A" text-anchor="start">from that group only</text>
+  <text x="58" y="560" font-size="12" fill="#5F6B7A" text-anchor="start">Ordered by priority, then id</text>
+  <path d="M170 212 V246" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="340" y="100" width="560" height="620" rx="14" fill="#F3F7FE" stroke="#1A73E8" stroke-width="1.5"/>
+  <text x="356" y="122" font-size="12" font-weight="700" letter-spacing="1" fill="#1A73E8">RESOLUTION ORDER  (first match wins)</text>
+  <g filter="url(#shadow)"><rect x="370" y="140" width="500" height="92" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <circle cx="402" cy="186" r="11" fill="#0B1F3A" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="402" y="190.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+  <text x="430" y="172" font-size="15" font-weight="700" fill="#1F2A3C">User rule</text>
+  <text x="430" y="194" font-size="13" fill="#1F2A3C" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">PUT /v1/caps/users/{email}</text>
+  <text x="430" y="214" font-size="13" fill="#5F6B7A">limit, allow or block for this person</text>
+  <path d="M620 232 V256" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="632" y="248" font-size="11" fill="#5F6B7A" text-anchor="start">no rule</text>
+  <g filter="url(#shadow)"><rect x="370" y="258" width="500" height="92" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <circle cx="402" cy="304" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="402" y="308.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+  <text x="430" y="290" font-size="15" font-weight="700" fill="#1F2A3C">Group rule, lowest priority</text>
+  <text x="430" y="312" font-size="13" fill="#1F2A3C" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">PUT /v1/caps/groups/{id}</text>
+  <text x="430" y="332" font-size="13" fill="#5F6B7A">pool=per_member: copied per member</text>
+  <path d="M620 350 V374" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="632" y="366" font-size="11" fill="#5F6B7A" text-anchor="start">no rule</text>
+  <g filter="url(#shadow)"><rect x="370" y="376" width="500" height="92" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <circle cx="402" cy="422" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="402" y="426.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+  <text x="430" y="408" font-size="15" font-weight="700" fill="#1F2A3C">Next group by priority</text>
+  <text x="430" y="430" font-size="13" fill="#1F2A3C">Only if the first group has no rule</text>
+  <text x="430" y="450" font-size="13" fill="#5F6B7A">Ties broken by group id</text>
+  <path d="M620 468 V492" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="632" y="484" font-size="11" fill="#5F6B7A" text-anchor="start">no rule</text>
+  <g filter="url(#shadow)"><rect x="370" y="494" width="500" height="92" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <circle cx="402" cy="540" r="11" fill="#5F6B7A" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="402" y="544.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">4</text>
+  <text x="430" y="526" font-size="15" font-weight="700" fill="#1F2A3C">Global policy or default</text>
+  <text x="430" y="548" font-size="13" fill="#1F2A3C" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">PUT /v1/caps/policy</text>
+  <text x="430" y="568" font-size="13" fill="#5F6B7A">Applies to everyone else</text>
+  <text x="370" y="630" font-size="13" fill="#1F2A3C" text-anchor="start">Result: one effective cap rule per person, exposed as</text>
+  <text x="370" y="650" font-size="13" fill="#1F2A3C" text-anchor="start" font-weight="700">rule_source = user | group:&lt;id&gt; | policy</text>
+  <text x="370" y="676" font-size="12" fill="#5F6B7A" text-anchor="start">Group rules are never written into user records:</text>
+  <text x="370" y="694" font-size="12" fill="#5F6B7A" text-anchor="start">removing a member or rule takes effect immediately.</text>
+  <path d="M300 304 H366" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="940" y="120" font-size="12" fill="#5F6B7A" text-anchor="start" font-weight="700">OVERRIDES AND ADD-ONS</text>
+  <g filter="url(#shadow)"><rect x="940" y="140" width="300" height="112" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="940" y="150" width="4" height="92" rx="2" fill="#34A853"/>
+  <text x="958" y="174.0" font-size="14" font-weight="700" fill="#1F2A3C">User allow beats group block</text>
+  <text x="958" y="192.0" font-size="13" fill="#5F6B7A">type=allow on the user overrides</text>
+  <text x="958" y="210.0" font-size="13" fill="#5F6B7A">a group block and shared pools;</text>
+  <text x="958" y="228.0" font-size="13" fill="#5F6B7A">personal blocks always stay</text>
+  <g filter="url(#shadow)"><rect x="940" y="276" width="300" height="112" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="940" y="286" width="4" height="92" rx="2" fill="#FBBC04"/>
+  <text x="958" y="310.0" font-size="14" font-weight="700" fill="#1F2A3C">Shared pool (pool=shared)</text>
+  <text x="958" y="328.0" font-size="13" fill="#5F6B7A">Checked in addition to each</text>
+  <text x="958" y="346.0" font-size="13" fill="#5F6B7A">member's own cap; at 100% all</text>
+  <text x="958" y="364.0" font-size="13" fill="#5F6B7A">members without allow pause</text>
+  <g filter="url(#shadow)"><rect x="940" y="412" width="300" height="92" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="940" y="422" width="4" height="72" rx="2" fill="#1A73E8"/>
+  <text x="958" y="445.0" font-size="14" font-weight="700" fill="#1F2A3C">Per-member cap (pool=per_member)</text>
+  <text x="958" y="463.0" font-size="13" fill="#5F6B7A">Each member gets the group cap</text>
+  <text x="958" y="481.0" font-size="13" fill="#5F6B7A">as if it were a user rule</text>
+  <g filter="url(#shadow)"><rect x="940" y="528" width="300" height="92" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="940" y="538" width="4" height="72" rx="2" fill="#1A73E8"/>
+  <text x="958" y="561.0" font-size="14" font-weight="700" fill="#1F2A3C">Per-project scope</text>
+  <text x="958" y="579.0" font-size="13" fill="#5F6B7A">scope=per_project or project_caps:</text>
+  <text x="958" y="597.0" font-size="13" fill="#5F6B7A">only over-cap projects pause</text>
+  <g filter="url(#shadow)"><rect x="940" y="644" width="300" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="940" y="654" width="4" height="56" rx="2" fill="#0B1F3A"/>
+  <text x="958" y="678.0" font-size="14" font-weight="700" fill="#1F2A3C">Model rules use the same order</text>
+  <text x="958" y="696.0" font-size="13" fill="#5F6B7A">User &gt; group &gt; default rule</text>
+</svg>

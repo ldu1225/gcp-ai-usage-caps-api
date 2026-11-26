@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="700" viewBox="0 0 1280 700" role="img" aria-labelledby="title desc" font-family="Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <title id="title">One user across several projects</title>
+  <desc id="desc">Usage and caps are tracked per user and project. Exceeding a per-project cap suspends only that project's attachment point; exceeding the total cap suspends all managed projects.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#0B1F3A" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3C4A5E"/>
+    </marker>
+    <marker id="arrb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1A73E8"/>
+    </marker>
+    <marker id="arrr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#D93025"/>
+    </marker>
+    <marker id="arrg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#34A853"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="700" fill="#FFFFFF"/>
+  <text x="40" y="42" font-size="22" font-weight="700" fill="#0B1F3A">One user, several projects</text>
+  <text x="40" y="66" font-size="14" fill="#5F6B7A">Usage is tracked per (user, project); enforcement follows the cap that was exceeded</text>
+  <g filter="url(#shadow)"><rect x="40" y="250" width="240" height="120" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="40" y="260" width="4" height="100" rx="2" fill="#0B1F3A"/>
+  <text x="58" y="288.0" font-size="14" font-weight="700" fill="#1F2A3C">alice@company.com</text>
+  <text x="58" y="306.0" font-size="13" fill="#5F6B7A">Total cap: $200 / month</text>
+  <text x="58" y="324.0" font-size="13" fill="#5F6B7A">Used: $171.6 (86%)</text>
+  <text x="58" y="342.0" font-size="13" fill="#5F6B7A">Status: suspended in B</text>
+  <g filter="url(#shadow)"><rect x="380" y="100" width="520" height="124" rx="12" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <text x="404" y="130" font-size="15" fill="#1F2A3C" text-anchor="start" font-weight="700">Project A</text>
+  <text x="404" y="150" font-size="13" fill="#5F6B7A" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">projects/team-a-prod</text>
+  <rect x="760" y="116" width="120" height="26" rx="13.0" fill="#34A853" fill-opacity="0.12" stroke="#34A853" stroke-width="1.5"/>
+  <text x="820.0" y="133.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle">active</text>
+  <text x="404" y="180" font-size="13" fill="#1F2A3C" text-anchor="start">Project cap $150</text>
+  <text x="560" y="180" font-size="13" fill="#1F2A3C" text-anchor="start">Used $61.2</text>
+  <rect x="404" y="192" width="476" height="12" rx="6" fill="#EEF2F7"/>
+  <rect x="404" y="192" width="195.2" height="12" rx="6" fill="#1A73E8"/>
+  <text x="880" y="180" font-size="13" fill="#1F2A3C" text-anchor="end" font-weight="700">41%</text>
+  <path d="M280 310 C 330 310, 330 162, 376 162" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="380" y="250" width="520" height="124" rx="12" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <text x="404" y="280" font-size="15" fill="#1F2A3C" text-anchor="start" font-weight="700">Project B</text>
+  <text x="404" y="300" font-size="13" fill="#5F6B7A" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">projects/team-b-prod</text>
+  <rect x="760" y="266" width="120" height="26" rx="13.0" fill="#D93025" fill-opacity="0.12" stroke="#D93025" stroke-width="1.5"/>
+  <text x="820.0" y="283.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle">suspended</text>
+  <text x="404" y="330" font-size="13" fill="#1F2A3C" text-anchor="start">Project cap $50</text>
+  <text x="560" y="330" font-size="13" fill="#1F2A3C" text-anchor="start">Used $50.4</text>
+  <rect x="404" y="342" width="476" height="12" rx="6" fill="#EEF2F7"/>
+  <rect x="404" y="342" width="476.0" height="12" rx="6" fill="#D93025"/>
+  <text x="880" y="330" font-size="13" fill="#1F2A3C" text-anchor="end" font-weight="700">100%</text>
+  <path d="M280 310 C 330 310, 330 312, 376 312" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="380" y="400" width="520" height="124" rx="12" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <text x="404" y="430" font-size="15" fill="#1F2A3C" text-anchor="start" font-weight="700">Project C</text>
+  <text x="404" y="450" font-size="13" fill="#5F6B7A" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">projects/team-c-dev</text>
+  <rect x="760" y="416" width="120" height="26" rx="13.0" fill="#34A853" fill-opacity="0.12" stroke="#34A853" stroke-width="1.5"/>
+  <text x="820.0" y="433.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle">active</text>
+  <text x="404" y="480" font-size="13" fill="#1F2A3C" text-anchor="start">Project cap $100</text>
+  <text x="560" y="480" font-size="13" fill="#1F2A3C" text-anchor="start">Used $60.0</text>
+  <rect x="404" y="492" width="476" height="12" rx="6" fill="#EEF2F7"/>
+  <rect x="404" y="492" width="285.6" height="12" rx="6" fill="#1A73E8"/>
+  <text x="880" y="480" font-size="13" fill="#1F2A3C" text-anchor="end" font-weight="700">60%</text>
+  <path d="M280 310 C 330 310, 330 462, 376 462" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="960" y="92" font-size="12" fill="#5F6B7A" text-anchor="start" font-weight="700">IAM DENY V2 ATTACHMENT POINTS</text>
+  <g filter="url(#shadow)"><rect x="960" y="122" width="280" height="80" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <text x="980" y="152" font-size="13" fill="#1F2A3C" text-anchor="start" font-weight="700">projects/team-a-prod</text>
+  <text x="980" y="174" font-size="13" fill="#5F6B7A" text-anchor="start">No deny entry for alice</text>
+  <text x="980" y="192" font-size="12" fill="#5F6B7A" text-anchor="start">Requests allowed</text>
+  <path d="M900 162 H956" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="960" y="272" width="280" height="80" rx="10" fill="#FDF3F2" stroke="#D93025" stroke-width="1.5"/></g>
+  <text x="980" y="302" font-size="13" fill="#1F2A3C" text-anchor="start" font-weight="700">projects/team-b-prod</text>
+  <text x="980" y="324" font-size="13" fill="#D93025" text-anchor="start">alice denied: gemini_platform</text>
+  <text x="980" y="342" font-size="12" fill="#D93025" text-anchor="start">403 here only</text>
+  <path d="M900 312 H956" fill="none" stroke="#D93025" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arrr)"/>
+  <g filter="url(#shadow)"><rect x="960" y="422" width="280" height="80" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <text x="980" y="452" font-size="13" fill="#1F2A3C" text-anchor="start" font-weight="700">projects/team-c-dev</text>
+  <text x="980" y="474" font-size="13" fill="#5F6B7A" text-anchor="start">No deny entry for alice</text>
+  <text x="980" y="492" font-size="12" fill="#5F6B7A" text-anchor="start">Requests allowed</text>
+  <path d="M900 462 H956" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="40" y="560" width="1200" height="120" rx="14" fill="#F8FAFD" stroke="#8A97A8" stroke-width="1.5"/>
+  <text x="56" y="582" font-size="12" font-weight="700" letter-spacing="1" fill="#8A97A8">ENFORCEMENT RULES</text>
+  <circle cx="64" cy="606" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="64" y="610.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+  <text x="84" y="611" font-size="13" fill="#1F2A3C" text-anchor="start">Over a per-project cap: only that project is suspended (plan.suspend_projects).</text>
+  <circle cx="64" cy="638" r="11" fill="#D93025" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="64" y="642.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+  <text x="84" y="643" font-size="13" fill="#1F2A3C" text-anchor="start">Over the total cap, a global block or a total shared pool: every managed project is suspended.</text>
+  <text x="84" y="668" font-size="12" fill="#5F6B7A" text-anchor="start">Configure with cap_scope total | per_project, project_caps per user, or project_defaults in the policy.</text>
+</svg>

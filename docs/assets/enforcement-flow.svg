@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="860" viewBox="0 0 1280 860" role="img" aria-labelledby="title desc" font-family="Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <title id="title">Enforcement flow</title>
+  <desc id="desc">Inference logs are detected by Pub/Sub push within seconds or by a 5-minute scheduler sweep, priced with official SKU prices, resolved against user, group and global policy, checked by safety gates G1-G7 and enforced with IAM Deny v2. Webhooks fire at 80 and 100 percent and on block; access is restored automatically at period reset.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#0B1F3A" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3C4A5E"/>
+    </marker>
+    <marker id="arrb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1A73E8"/>
+    </marker>
+    <marker id="arrr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#D93025"/>
+    </marker>
+    <marker id="arrg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#34A853"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="860" fill="#FFFFFF"/>
+  <text x="40" y="42" font-size="22" font-weight="700" fill="#0B1F3A">Enforcement flow</text>
+  <text x="40" y="66" font-size="14" fill="#5F6B7A">From an inference log to a 403, and back at period reset</text>
+  <g filter="url(#shadow)"><rect x="420" y="100" width="440" height="66" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <circle cx="450" cy="133.0" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="450" y="137.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+  <text x="476" y="129.0" font-size="14" font-weight="700" fill="#1F2A3C">Inference request is logged</text>
+  <text x="476" y="148.0" font-size="13" fill="#5F6B7A">Antigravity, Gemini Platform, Gemini Enterprise</text>
+  <path d="M640.0 166 V190" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="420" y="192" width="440" height="66" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <circle cx="450" cy="225.0" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="450" y="229.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+  <text x="476" y="221.0" font-size="14" font-weight="700" fill="#1F2A3C">Usage event detected</text>
+  <text x="476" y="240.0" font-size="13" fill="#5F6B7A">Pub/Sub push in seconds, or 5-min sweep</text>
+  <path d="M640.0 258 V282" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="420" y="284" width="440" height="66" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <circle cx="450" cy="317.0" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="450" y="321.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+  <text x="476" y="313.0" font-size="14" font-weight="700" fill="#1F2A3C">Usage aggregated and priced</text>
+  <text x="476" y="332.0" font-size="13" fill="#5F6B7A">Tokens x official SKU price (Billing Catalog)</text>
+  <path d="M640.0 350 V374" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="420" y="376" width="440" height="66" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <circle cx="450" cy="409.0" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="450" y="413.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">4</text>
+  <text x="476" y="405.0" font-size="14" font-weight="700" fill="#1F2A3C">Effective policy resolved</text>
+  <text x="476" y="424.0" font-size="13" fill="#5F6B7A">User rule &gt; group rule &gt; global policy</text>
+  <path d="M640.0 442 V466" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="420" y="468" width="440" height="66" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <circle cx="450" cy="501.0" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="450" y="505.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">5</text>
+  <text x="476" y="497.0" font-size="14" font-weight="700" fill="#1F2A3C">Safety gates G1-G7</text>
+  <text x="476" y="516.0" font-size="13" fill="#5F6B7A">Readable deny, telemetry, budget, surge guard</text>
+  <path d="M640.0 534 V558" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="420" y="560" width="440" height="66" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <circle cx="450" cy="593.0" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="450" y="597.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">6</text>
+  <text x="476" y="589.0" font-size="14" font-weight="700" fill="#1F2A3C">IAM Deny v2 policy written</text>
+  <text x="476" y="608.0" font-size="13" fill="#5F6B7A">Per project, folder or org attachment point</text>
+  <path d="M640.0 626 V650" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="420" y="652" width="440" height="66" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <circle cx="450" cy="685.0" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="450" y="689.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">7</text>
+  <text x="476" y="681.0" font-size="14" font-weight="700" fill="#1F2A3C">Propagation</text>
+  <text x="476" y="700.0" font-size="13" fill="#5F6B7A">Typically 1-2 minutes; in-flight calls finish</text>
+  <path d="M640.0 718 V742" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="420" y="744" width="440" height="66" rx="10" fill="#FDF3F2" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <circle cx="450" cy="777.0" r="11" fill="#D93025" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="450" y="781.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">8</text>
+  <text x="476" y="773.0" font-size="14" font-weight="700" fill="#1F2A3C">Next request returns 403</text>
+  <text x="476" y="792.0" font-size="13" fill="#5F6B7A">Only for the blocked surfaces and projects</text>
+  <text x="40" y="92" font-size="12" fill="#5F6B7A" text-anchor="start" font-weight="700">INPUTS</text>
+  <g filter="url(#shadow)"><rect x="40" y="150" width="320" height="56" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="40" y="160" width="4" height="36" rx="2" fill="#34A853"/>
+  <text x="58" y="174.0" font-size="14" font-weight="700" fill="#1F2A3C">Pub/Sub push</text>
+  <text x="58" y="192.0" font-size="13" fill="#5F6B7A">Real-time, within seconds</text>
+  <g filter="url(#shadow)"><rect x="40" y="230" width="320" height="56" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="40" y="240" width="4" height="36" rx="2" fill="#34A853"/>
+  <text x="58" y="254.0" font-size="14" font-weight="700" fill="#1F2A3C">Cloud Scheduler</text>
+  <text x="58" y="272.0" font-size="13" fill="#5F6B7A">Safety net every 5 minutes</text>
+  <path d="M360 178 H390 V215" fill="none" stroke="#3C4A5E" stroke-width="1.5"/>
+  <path d="M390 215 H416" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M360 258 H390 V240" fill="none" stroke="#3C4A5E" stroke-width="1.5"/>
+  <path d="M390 240 H416" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="40" y="381" width="320" height="56" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="40" y="391" width="4" height="36" rx="2" fill="#1A73E8"/>
+  <text x="58" y="405.0" font-size="14" font-weight="700" fill="#1F2A3C">Groups and exclusions</text>
+  <text x="58" y="423.0" font-size="13" fill="#5F6B7A">Priority, Google Group sync</text>
+  <path d="M360 409 H416" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="40" y="565" width="320" height="56" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="40" y="575" width="4" height="36" rx="2" fill="#1A73E8"/>
+  <text x="58" y="589.0" font-size="14" font-weight="700" fill="#1F2A3C">Manual block via API</text>
+  <text x="58" y="607.0" font-size="13" fill="#5F6B7A">User or group block, until</text>
+  <path d="M360 593 H416" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="360" y="650" font-size="12" fill="#5F6B7A" text-anchor="end">auto mode blocks; manual mode queues for review</text>
+  <g filter="url(#shadow)"><rect x="40" y="730" width="320" height="96" rx="10" fill="#F3FAF5" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="40" y="740" width="4" height="76" rx="2" fill="#34A853"/>
+  <text x="58" y="756.0" font-size="14" font-weight="700" fill="#1F2A3C">Automatic restore</text>
+  <text x="58" y="774.0" font-size="13" fill="#5F6B7A">At period reset deny entries are</text>
+  <text x="58" y="792.0" font-size="13" fill="#5F6B7A">removed; user.unblocked is sent</text>
+  <text x="58" y="810.0" font-size="13" fill="#5F6B7A">Personal blocks are kept</text>
+  <path d="M360 760 H392 V612" fill="none" stroke="#34A853" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <path d="M392 612 H416" fill="none" stroke="#34A853" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arrg)"/>
+  <text x="920" y="92" font-size="12" fill="#5F6B7A" text-anchor="start" font-weight="700">WEBHOOKS  (HMAC-SHA256 signed)</text>
+  <g filter="url(#shadow)"><rect x="920" y="284" width="320" height="112" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="920" y="294" width="4" height="92" rx="2" fill="#FBBC04"/>
+  <text x="938" y="318.0" font-size="14" font-weight="700" fill="#1F2A3C">Threshold reached</text>
+  <text x="938" y="336.0" font-size="13" fill="#5F6B7A">80%: cap.threshold_reached</text>
+  <text x="938" y="354.0" font-size="13" fill="#5F6B7A">100%: cap.exceeded</text>
+  <text x="938" y="372.0" font-size="13" fill="#5F6B7A">Shared pools: group.cap_*</text>
+  <path d="M860 317 H916" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="920" y="565" width="320" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="920" y="575" width="4" height="56" rx="2" fill="#D93025"/>
+  <text x="938" y="590.0" font-size="14" font-weight="700" fill="#1F2A3C">Blocked</text>
+  <text x="938" y="608.0" font-size="13" fill="#5F6B7A">user.blocked, group.blocked</text>
+  <text x="938" y="626.0" font-size="13" fill="#5F6B7A">With projects and services</text>
+  <path d="M860 593 H916" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)"><rect x="920" y="748" width="320" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="920" y="758" width="4" height="56" rx="2" fill="#34A853"/>
+  <text x="938" y="773.0" font-size="14" font-weight="700" fill="#1F2A3C">Restored</text>
+  <text x="938" y="791.0" font-size="13" fill="#5F6B7A">user.unblocked, group.unblocked</text>
+  <text x="938" y="809.0" font-size="13" fill="#5F6B7A">Once per event, deduplicated</text>
+  <rect x="920" y="430" width="320" height="96" rx="10" fill="#F3F7FE" stroke="#1A73E8" stroke-width="1.5"/>
+  <text x="938" y="456" font-size="13" fill="#1F2A3C" text-anchor="start" font-weight="700">Typical end-to-end latency</text>
+  <text x="938" y="478" font-size="13" fill="#5F6B7A" text-anchor="start">Detection: seconds (push) or up to 5 min</text>
+  <text x="938" y="498" font-size="13" fill="#5F6B7A" text-anchor="start">Enforcement write: seconds</text>
+  <text x="938" y="518" font-size="13" fill="#5F6B7A" text-anchor="start">IAM Deny propagation: about 1-2 min</text>
+</svg>

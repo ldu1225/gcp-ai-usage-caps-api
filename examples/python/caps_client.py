@@ -20,7 +20,7 @@ wildcards (`google/*`, `anthropic/*`), family patterns (`<family>-*`) or IDs tak
     c.block_user("alice@company.com", services=["gemini_platform"], projects=["team-b-prod"])   # project-scoped
     c.enable_vertex_logging("team-a-prod", dry_run=True)  # Vertex AI token source (inference_request log)
 
-Errors raise CapsApiError(status, type, code, message) mirroring the OpenAI/Anthropic error envelope.
+Errors raise CapsApiError(status, type, code, message) mirroring the common AI admin API error envelope.
 429 responses are retried with the `Retry-After` header (bounded).
 """
 

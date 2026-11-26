@@ -99,12 +99,12 @@ flowchart TD
 
 | 스코프 | 대표 엔드포인트 |
 |---|---|
-| `usage:read` | `GET /v1/usage/users`, `/v1/usage/users/{email}`, `/v1/users/{email}/projects`, `/v1/billing/users`, `/v1/usage/models`(또는 `models:read`), `/v1/pricing`(또는 `models:read`), `/v1/projects/{id}/vertex-logging`(또는 `admin`) |
-| `caps:read` | `GET /v1/caps/policy`, `/v1/caps/users`, `/v1/caps/projects`, `/v1/audit-logs`(또는 `admin`), `/v1/operations` |
-| `caps:write` | `PUT /v1/caps/policy`, `PUT/DELETE /v1/caps/users/{email}`, `POST /v1/caps/enforce`, `PUT /v1/caps/projects/{id}`, `POST /v1/caps/projects/{id}/lift` |
-| `users:write` | `POST /v1/users/{email}/block`, `/unblock` (선택 `projects`) |
-| `models:read` | `GET /v1/models…`, `/v1/model-access…`, `/v1/gemini-enterprise/apps…`, `/v1/antigravity/models`, `/v1/model-rules…`, `/v1/model-violations`, 정책 미리보기 |
-| `models:write` | `POST /v1/models/sync`, `PUT/DELETE /v1/model-access/{scope_type}/{scope_id}`, `bulk-apply`, `reconcile`, GE 앱 모델 변경, 모델 규칙 쓰기·평가 |
+| `usage:read` | `GET /v1/usage/users`, `/v1/usage/users/{email}`, `/v1/usage/groups…`(그룹 사용량), `/v1/users/{email}/projects`, `/v1/billing/users`, `/v1/usage/models`(또는 `models:read`), `/v1/pricing`(또는 `models:read`), `/v1/projects/{id}/vertex-logging`(또는 `admin`) |
+| `caps:read` | `GET /v1/caps/policy`, `/v1/caps/users`, `/v1/caps/projects`, `/v1/caps/groups…`, `GET /v1/groups…`(또는 `users:write`), `GET /v1/users/{email}/groups`(또는 `usage:read`), `/v1/audit-logs`(또는 `admin`), `/v1/operations` |
+| `caps:write` | `PUT /v1/caps/policy`, `PUT/DELETE /v1/caps/users/{email}`, `PUT/DELETE /v1/caps/groups/{id}`(그룹 지출 캡), `POST /v1/caps/enforce`, `PUT /v1/caps/projects/{id}`, `POST /v1/caps/projects/{id}/lift` |
+| `users:write` | `POST /v1/users/{email}/block`, `/unblock` (선택 `projects`). 그룹 관리: `POST/PATCH/DELETE /v1/groups…`, `POST /v1/groups/{id}/members`, `/exclusions`, `/block`, `/unblock`, `/sync`. 그룹 조회 `GET /v1/groups…`(또는 `caps:read`) |
+| `models:read` | `GET /v1/models…`, `/v1/model-access…`, `/v1/gemini-enterprise/apps…`, `/v1/antigravity/models`, `/v1/model-rules…`, `/v1/model-violations`, `GET /v1/groups/{id}/model-rules`, 정책 미리보기 |
+| `models:write` | `POST /v1/models/sync`, `PUT/DELETE /v1/model-access/{scope_type}/{scope_id}`, `bulk-apply`, `reconcile`, GE 앱 모델 변경, 모델 규칙 쓰기·평가, `PUT/DELETE /v1/groups/{id}/model-rules` |
 | `quotas:read` | `GET /v1/rate-limits…`, `/v1/projects/{id}/rate-limits…`, `/v1/quota-requests…` |
 | `quotas:write` | `PATCH /v1/projects/{id}/rate-limits/{limit_id}`, `POST /v1/quota-requests`, `/cancel`, 사용자 레이트 리밋 쓰기 |
 | `admin` | 위 모든 스코프 포함 + `/v1/admin/api-keys`, `/v1/admin/webhooks`, `/v1/admin/readiness`, `POST /v1/projects/{id}/vertex-logging/enable`, `POST /v1/vertex-logging/enable` |
@@ -120,7 +120,7 @@ caps:write,users:write`, 모델 관리 도구 `models:read,models:write`.
 
 | 주체 | 핵심 권한 | 의도적으로 **없는** 권한 |
 |---|---|---|
-| 런타임 SA `ai-usage-caps-api` | 로그·BigQuery 읽기(`logging.viewer`, `privateLogViewer`, `bigquery.dataViewer`, `jobUser`), 감사 로그 쓰기(`logging.logWriter`), 쿼터(`cloudquotas.admin`), GE 앱(`discoveryengine.editor`), 조직 `iam.denyReviewer`(읽기만), 조직 `orgpolicy.policyAdmin`(모델 거버넌스), 1권한 커스텀 역할 `gcpAiCapsVertexLoggingReader`(`aiplatform.endpoints.fetchPublisherModelConfig`) | IAM Deny 정책 쓰기(`iam.denyAdmin`), 프로젝트 IAM 변경, SA 키, **결제 계정·Billing Export 데이터 읽기**(단가는 공개 Cloud Billing Catalog API), Vertex AI 로그 설정 쓰기(`setPublisherModelConfig` — 필요 시 별도 부여) |
+| 런타임 SA `ai-usage-caps-api` | 로그·BigQuery 읽기(`logging.viewer`, `privateLogViewer`, `bigquery.dataViewer`, `jobUser`), 감사 로그 쓰기(`logging.logWriter`), 쿼터(`cloudquotas.admin`), GE 앱(`discoveryengine.editor`), 조직 `iam.denyReviewer`(읽기만), 조직 `orgpolicy.policyAdmin`(모델 거버넌스), 1권한 커스텀 역할 `gcpAiCapsVertexLoggingReader`(`aiplatform.endpoints.fetchPublisherModelConfig`) | IAM Deny 정책 쓰기(`iam.denyAdmin`), 프로젝트 IAM 변경, SA 키, **결제 계정·Billing Export 데이터 읽기**(단가는 공개 Cloud Billing Catalog API), Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI) 로그 설정 쓰기(`setPublisherModelConfig` — 필요 시 별도 부여), Google Admin의 그룹 쓰기 권한 |
 | 집행 SA `ai-usage-caps-enforcer` | 조직 `iam.denyAdmin`, 로그·BigQuery 읽기 | 조직 정책 쓰기, 쿼터, Discovery Engine |
 | 싱크 writer identity | 감사 **데이터세트에만** WRITER, 허브 토픽에만 publisher | 프로젝트 수준 BigQuery 권한 |
 | Pub/Sub 서비스 에이전트 | 런타임 SA에 대한 `iam.serviceAccountTokenCreator`(푸시 OIDC) | — |
@@ -132,13 +132,29 @@ caps:write,users:write`, 모델 관리 도구 `models:read,models:write`.
   (`businessaicode.googleapis.com/locations.generateContent`, `aiplatform.googleapis.com/endpoints.predict`,
   `discoveryengine.googleapis.com/assistants.assist`)로 한정됩니다.
 
+### 3.1 Google Group 동기화 (Cloud Identity API)
+
+그룹에 `google_group`(그룹 이메일)을 지정하면 멤버를 Google Group에서 가져옵니다(수동 `POST /v1/groups/{id}/sync`, 거버넌스 주기에서 시간 단위 자동 동기화).
+
+| 항목 | 내용 |
+|---|---|
+| 필요 API | 허브 프로젝트에서 **Cloud Identity API**(`cloudidentity.googleapis.com`) 사용 설정 |
+| 필요 권한 | 런타임 SA에 Google Admin 콘솔의 **Groups Reader** 관리자 역할 부여 (Admin 콘솔 > 계정 > 관리자 역할 > Groups Reader > 관리자 할당 > 서비스 계정) |
+| 접근 범위 | **읽기 전용**. `groups:lookup`, `memberships:searchTransitiveMemberships`(중첩 그룹 포함), 실패 시 직접 멤버십 목록으로 대체. 그룹을 만들거나 수정하지 않음 |
+| 가져오는 데이터 | 멤버의 이메일(`preferredMemberKey`)만. 이름·프로필 등 다른 디렉터리 속성은 읽지 않음 |
+| 필터 | 서비스 계정(`*.gserviceaccount.com`)과 그룹 자신은 제외, 그룹당 최대 5,000명 |
+| 저장 | `groups.json`의 `synced_members`, `synced_at`, `sync_error` |
+
+> [!NOTE]
+> Google Group 동기화를 쓰지 않으면(명시적 `members`만 사용) Cloud Identity API와 Groups Reader 역할은 필요 없습니다. 권한이 없으면 동기화는 실패하고 `sync_error`에 오류가 기록되며, 기존 동기화 멤버는 그대로 유지됩니다.
+
 ## 4. 처리하는 데이터
 
 ### 4.1 제품이 읽고 저장하는 것
 
 | 데이터 | 출처 | 저장 위치 |
 |---|---|---|
-| 사용자 주체(이메일/워크포스 주체), 모델 ID, 서피스, 요청 수, 토큰 수(`promptTokenCount`, `candidatesTokenCount`, 캐시 토큰 등), 트래픽 유형, 타임스탬프, 추정 비용 | Cloud Logging / BigQuery 로그의 **메타데이터 필드** (Vertex AI는 추론 요청 메타데이터 로그 `usageMetadata`·`trafficType`·커스텀 헤더 라벨) | 응답 시 계산. 정지·위반 기록(사용량 수치 포함)은 `user_caps.json`, `user_model_rules.json` |
+| 사용자 주체(이메일/워크포스 주체), 모델 ID, 서피스, 요청 수, 토큰 수(`promptTokenCount`, `candidatesTokenCount`, 캐시 토큰 등), 트래픽 유형, 타임스탬프, 추정 비용 | Cloud Logging / BigQuery 로그의 **메타데이터 필드** (Gemini Platform은 추론 요청 메타데이터 로그 `usageMetadata`·`trafficType`·커스텀 헤더 라벨) | 응답 시 계산. 정지·위반 기록(사용량 수치 포함)은 `user_caps.json`, `user_model_rules.json` |
 | `uid` → 사용자 매핑 (헤더 라벨에 이메일 대신 `uid`를 보낼 때 해석용) | 사용량·캡 규칙에서 관측된 사용자 | `user_directory.json` |
 | 공식 SKU 단가·환율 | 공개 Cloud Billing Catalog API | `pricing.json` |
 | 캡 정책, 차단/해제, 모델 정책 의도, 쿼터 요청, 작업 | API 호출 | GCS 상태 버킷 |
@@ -148,7 +164,7 @@ caps:write,users:write`, 모델 관리 도구 `models:read,models:write`.
 > [!IMPORTANT]
 > 제품 코드는 **프롬프트·응답 본문을 읽거나 저장하지 않습니다**. 사용량 파서는 `usageMetadata`의 토큰 수와 모델·주체
 > 같은 메타데이터만 추출합니다(`services/usage.py`, `services/usage_events.py`). 실시간 푸시 메시지도 처리 후 저장하지
-> 않으며 메모리 트래커에만 잠시 유지됩니다. Vertex AI 추론 요청 **메타데이터** 로그는 요청/응답 본문을 기록하지 않습니다.
+> 않으며 메모리 트래커에만 잠시 유지됩니다. Gemini Platform 추론 요청 **메타데이터** 로그는 요청/응답 본문을 기록하지 않습니다.
 > 결제 계정 데이터(Billing Export)는 읽지 않습니다.
 
 > [!NOTE]
@@ -161,8 +177,8 @@ caps:write,users:write`, 모델 관리 도구 `models:read,models:write`.
   어떤 필드가 포함되는지는 Google 로그 스키마에 따릅니다(예: `discoveryengine.googleapis.com/gen_ai_user_message`,
   `cloudaudit.googleapis.com/data_access`, `aiplatform.googleapis.com/inference_request`). 이 데이터세트는 민감 데이터로
   취급하고 접근을 제한하세요(런타임/집행 SA는 `bigquery.dataViewer`만 보유).
-- Pub/Sub 토픽에는 Antigravity `inference_response`와 Vertex AI `inference_request` 로그 항목이 흐릅니다. Terraform 구독은 메시지 보존 600초입니다.
-- Vertex AI 추론 요청 메타데이터 로깅은 teardown 후에도 켜진 상태로 남습니다(Cloud Logging 요금 지속 — 필요 시 프로젝트별로 끄기).
+- Pub/Sub 토픽에는 Antigravity `inference_response`와 Gemini Platform `inference_request` 로그 항목이 흐릅니다. Terraform 구독은 메시지 보존 600초입니다.
+- Gemini Platform 추론 요청 메타데이터 로깅은 teardown 후에도 켜진 상태로 남습니다(Cloud Logging 요금 지속 — 필요 시 프로젝트별로 끄기).
 - Enforcer Job 표준 출력 요약은 이메일을 `<email>`로 치환합니다.
 
 ## 5. 감사 로깅
@@ -174,7 +190,9 @@ caps:write,users:write`, 모델 관리 도구 `models:read,models:write`.
 - 대표 액션: `api_key.created`, `api_key.revoked`, `webhook.created`, `webhook.deleted`, `user.blocked`,
   `user.unblocked`, `caps.enforce`, `caps.project.lifted`, `model_policy.updated`, `ge_models.updated`,
   `ge_models.bulk_updated`, `user_model_rule.violation`, `quota_request.created`, `quota_request.status_changed`,
-  `quota_request.cancelled`.
+  `quota_request.cancelled`, `group.created`, `group.deleted`, `group.members.updated`, `group.exclusions.updated`,
+  `group.synced`, `group.sync_failed`, `group.blocked`, `group.unblocked`, `caps.group.updated`, `caps.group.deleted`,
+  `group_model_rule.updated`, `group_model_rule.deleted`.
 - 조회: `GET /v1/audit-logs`(`caps:read` 또는 `admin`). 장기 보관은 Cloud Logging 버킷 보존 기간/싱크로 설정하세요.
 - 추가로 Google Cloud 자체 감사 로그(Admin Activity)에 IAM Deny·조직 정책·쿼터 변경이 런타임/집행 SA 이름으로 남습니다.
 
@@ -226,6 +244,7 @@ caps:write,users:write`, 모델 관리 도구 `models:read,models:write`.
 | OIDC 위조/오용 | 다른 audience용 토큰 재사용, 허용되지 않은 SA, 외부 SA의 내부 엔드포인트 호출(가짜 사용 이벤트 주입) | RS256·발급자·`email_verified`·audience·허용 목록 검증. `internal:pubsub`은 런타임 SA와 `auth.oidc_internal_service_accounts`에만 부여 | 허용 SA도 `oidc_default_scopes`(기본 `caps:write` 포함)를 받음 → 신뢰 워크로드만 등록하고, 필요 시 `auth.oidc_default_scopes`를 축소. `RUNTIME_SERVICE_ACCOUNT` 미설정(레거시) 배포는 모든 허용 SA에 `internal:pubsub`이 부여되므로 반드시 설정 |
 | 대량 오차단 (가용성) | 텔레메트리·가격 급변으로 다수 사용자 자동 정지 | 안전 게이트 G1–G7(서지 가드, 변경 예산), 기본 `manual` 모드, 드라이런 | Break-glass 절차 숙지 ([operations-runbook.md §4](operations-runbook.md#4-긴급-해제--break-glass)) |
 | 권한 남용 (집행 SA) | 집행 SA 탈취 시 조직 전체 deny 정책 변경 | `iam.denyAdmin`은 집행 SA만, SA 키 없음, Job 실행은 런타임 SA·스케줄러만 | 조직 정책/감사 로그로 SA 사용 모니터링 |
+| 그룹을 통한 대량 차단 | `users:write` 키로 대규모 그룹 차단, 또는 Google Group 멤버 변경으로 그룹 정책 대상이 갑자기 확대 | 그룹 차단·멤버십 변경 감사 로그, `group.blocked`·`group.membership_changed` 웹훅, 사용자 수준 `allow`가 그룹 차단보다 우선, 그룹 해제는 그룹 때문에 생긴 차단만 제거 | `users:write` 키 최소화, Google Group 관리 권한자 관리, 웹훅으로 멤버십 변경 모니터링 |
 | 조직 정책 오변경 | 모델 거버넌스 API로 잘못된 `vertexai.allowedModels` 적용 | 미리보기(`/preview`), `dryRun`, 감사 로그, 의도(intent) 저장·재조정 | `models:write` 키 최소화, `ALLOW_ORG_POLICY_WRITES=false`로 쓰기 차단 가능 |
 | SSRF (웹훅) | 내부 주소로 웹훅 등록 | HTTPS·호스트·IP·DNS 검사 | 리디렉션·DNS 리바인딩 → VPC egress + 방화벽 |
 | 로그 데이터 노출 | 감사 데이터세트에 로그 전체 복사 | 데이터세트 수준 writer 권한, SA는 읽기만 | 데이터세트 IAM 최소화, 보존 기간·CMEK 고려 |

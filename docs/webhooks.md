@@ -6,11 +6,13 @@
 > `X-Signature-256: sha256=HMAC_SHA256(secret, "{timestamp}.{body}")`. This page lists every event in
 > `SUPPORTED_EVENTS` (`services/webhooks.py`), when it fires, and an example `data` payload taken from the emitting code
 > (`caps.py`, `usage_events.py`, `spend_caps.py`, `model_access.py`, `surface_models.py`, `user_model_rules.py`,
-> `quotas.py`, `governance_cycle.py`, `model_registry.py`, `app.py`). All 15 events are emitted. Threshold, rate-limit,
+> `quotas.py`, `governance_cycle.py`, `model_registry.py`, `groups.py`, `app.py`). All 20 events are emitted. Threshold, rate-limit,
 > project-cap, model-lifecycle and readiness events are de-duplicated server-side; receivers should still de-duplicate
 > on the envelope `id`. Since 1.2.0, `cap.*` carry `scope`/`project` (per-project caps), `user.blocked` carries
 > `projects` (list or `"all"`), and `model.first_seen` / `model.catalog_changed` report new models from logs and Model
-> Garden. Model IDs in the examples are placeholders — there is no built-in model list.
+> Garden. The `group.*` events (`group.cap_threshold_reached`, `group.cap_exceeded`, `group.blocked`, `group.unblocked`,
+> `group.membership_changed`) cover user groups and shared-pool group caps. Model IDs in the examples are placeholders —
+> there is no built-in model list.
 
 ---
 
@@ -107,6 +109,7 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 | `model.lifecycle_notice` | 예 — `notify_once` | `model.lifecycle_notice\|<model_id>\|<deprecation_date 또는 shutdown_date>\|<날짜 값>` — 모델·필드·날짜별 1회 (날짜가 바뀌면 다시 발송) |
 | `readiness.degraded` | 예 — `notify_once` | `readiness.degraded\|<overall>\|<UTC 날짜>` — 상태(`blocked`/`ready_with_warnings`)별 하루 1회 (프로젝트 구분 없음) |
 | `model.first_seen` | 예 — 카탈로그 원장 | 모델 ID별 **최초 1회**(상태 문서 `model_catalog.observed`에 없을 때만). 한 번에 최대 50건 |
+| `group.cap_threshold_reached`, `group.cap_exceeded` | 예 — `notify_once` | `<group_id>\|<기간 시작 또는 all>\|<임계값 %>` — 그룹·기간·임계값별 1회 |
 | `model.catalog_changed` | 부분 — 변경이 있을 때만 | Model Garden 동기화 결과에 `added`/`delisted`가 있을 때 1회(최초 동기화는 발송 안 함) |
 | 그 외 모든 이벤트 | 아니오 | 상태 변경이 일어날 때마다 1회 디스패치 |
 
@@ -128,7 +131,7 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 | `user.unblocked` | 수동 해제, 기간 리셋 자동 복구 | `caps.unblock_user`, `caps.enforce_cycle` | 발송 |
 | `project_cap.enforced` | 프로젝트 지출 캡(Billing Budget `spendCap.outputState`)이 `ENFORCED`인 동안, 거버넌스 주기마다 확인 — 프로젝트별 하루 1회. `SPEND_CAPS_ENABLED=true`일 때만 | `governance_cycle.notify_enforced_project_caps` | 발송 |
 | `project_cap.lifted` | `POST /v1/caps/projects/{project_id}/lift` 성공 | `spend_caps.lift_project_cap` | 발송 |
-| `model.access_changed` | Vertex AI 모델 접근 정책 적용, Gemini Enterprise 앱 모델 변경(단건/일괄) | `model_access`(정책 적용), `surface_models.patch_app_models`, `surface_models.bulk_patch_app_models` | 발송 |
+| `model.access_changed` | Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI) 모델 접근 정책 적용, Gemini Enterprise 앱 모델 변경(단건/일괄) | `model_access`(정책 적용), `surface_models.patch_app_models`, `surface_models.bulk_patch_app_models` | 발송 |
 | `model.lifecycle_notice` | 카탈로그 모델의 `deprecation_date` 또는 `shutdown_date`가 90일 이내(이미 지난 날짜 포함) — 거버넌스 주기마다 확인, 모델·필드·날짜별 1회 | `governance_cycle.notify_model_lifecycle` | 발송 |
 | `user.model_violation` | 사용자별 모델 규칙 위반 탐지(허용되지 않은 모델, 한도 초과) — `models.violation_notify`가 `true`일 때 | `user_model_rules.apply_violations` | 발송 |
 | `rate_limit.threshold_reached` | 프로젝트 쿼터 사용률 ≥ `quotas.headroom_warn_pct`(기본 80%) — 거버넌스 주기(시간 단위) | `quotas` 임계값 점검 → `webhooks.notify_once` | 발송 |
@@ -137,9 +140,14 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 | `readiness.degraded` | `GET /v1/admin/readiness`(캐시 미사용 실행) 또는 `POST /v1/admin/readiness/run` 결과의 `overall`이 `blocked`/`ready_with_warnings` — 상태별 하루 1회 | `app._notify_readiness` | 발송 |
 | `model.first_seen` | 어떤 서비스 로그에서든 **처음 사용된** 모델 (내장 목록 없이 로그 관측으로 추적) | `model_registry.record_observed` (사용량 수집 시) | 발송 (1.2.0) |
 | `model.catalog_changed` | Model Garden 동기화에서 신규 모델(`added`) 또는 사라진 모델(`delisted`) 발견 | `model_registry.discover` (카탈로그 TTL 만료·`POST /v1/models/sync`) | 발송 (1.2.0) |
+| `group.cap_threshold_reached` | 공유 풀(`pool: shared`) 그룹 캡의 합산 사용률이 임계값(< 100%) 이상 | `caps.enforce_cycle` → `webhooks.notify_once` | 발송 |
+| `group.cap_exceeded` | 공유 풀 그룹 캡의 합산 사용률이 100% 이상인 임계값 도달 | 위와 동일 | 발송 |
+| `group.blocked` | `POST /v1/groups/{group_id}/block` 성공 | `groups.block_group` | 발송 |
+| `group.unblocked` | `POST /v1/groups/{group_id}/unblock` 성공 | `groups.unblock_group` | 발송 |
+| `group.membership_changed` | 멤버 추가·제거, 예외 추가·제거, Google Group 동기화로 그룹의 **유효 멤버**가 바뀜 | `groups._edit_list`, `groups._sync_one` | 발송 |
 
 > [!NOTE]
-> `events`를 생략하고 구독하면 위 15개 이벤트를 모두 받습니다. `readiness.degraded`는 API로 readiness를 실행할 때만
+> `events`를 생략하고 구독하면 위 20개 이벤트를 모두 받습니다. `readiness.degraded`는 API로 readiness를 실행할 때만
 > 평가되며(캐시 응답은 제외), 사전 점검 CLI(`scripts/preflight.sh`)나 스케줄러는 이 이벤트를 발생시키지 않습니다.
 
 ## 6. 이벤트별 페이로드
@@ -203,7 +211,7 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 | `trigger` | 발생 | 추가 필드 |
 |---|---|---|
 | `manual` | `POST /v1/users/{email}/block` (`projects` 지정 시 해당 프로젝트만) | `reason`, `until`(RFC 3339 또는 `null`), `actor` |
-| `auto_cap` | 자동 모드 캡 초과 정지(집행 주기에서 IAM 적용 성공 시). 일부 프로젝트만 초과하면 그 프로젝트만 | `until`(다음 기간 리셋), `reasons`(`over_cap_reasons`) |
+| `auto_cap` | 자동 모드 캡 초과 정지(집행 주기에서 IAM 적용 성공 시). 일부 프로젝트만 초과하면 그 프로젝트만 | `until`(다음 기간 리셋), `reasons`(`over_cap_reasons`; 공유 풀 그룹 캡으로 인한 정지는 `group:<id>` 포함) |
 | `model_policy` | 모델 규칙 위반 차단 (기본 `violation_block_scope=project` → 위반 프로젝트만) | `until`, `reasons`(위반 유형 목록: `model_not_allowed`, `model_denied`, `limit_exceeded`) |
 
 ### 6.3 `user.unblocked`
@@ -235,7 +243,7 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 
 > 아래 `<model-a>`, `<model-b>` 등은 자리표시자입니다. 실제 값은 실시간 카탈로그(`GET /v1/models`)의 모델 ID입니다.
 
-Vertex AI 조직 정책(`constraints/vertexai.allowedModels`) 적용:
+Gemini Platform 조직 정책(`constraints/vertexai.allowedModels`) 적용:
 
 ```json
 {"surface": "gemini_platform", "scope": "projects/team-a", "mode": "allow_list",
@@ -295,7 +303,7 @@ Gemini Enterprise 앱 모델 변경(단건 `PATCH /v1/gemini-enterprise/apps/{ap
 | `model` / `publisher` | 로그에 기록된 모델 ID와 publisher(Model Garden·로그 리소스 기준, 이름으로 추측하지 않음) |
 | `projects` | 위반 요청이 실행된 관리 프로젝트 |
 | `metric` | `limit_exceeded`일 때 `rpm`, `tpm`, `daily_requests`, `daily_tokens`, `monthly_requests`, `monthly_tokens`, `monthly_cost` |
-| `rule_source` | `user`, `user+default`, `default` |
+| `rule_source` | `user`, `user+default`, `default`, `group:<id>`, `group:<id>+default`, `user+group:<id>+default` 등 (그룹 모델 규칙 상속 시) |
 | `action` | `block_service`, `notify`, `deferred`(변경 예산 G4 도달) — `already_blocked`인 위반은 발송하지 않음 |
 | `action_note` | `notify`로 바뀐 사유(`enforcement_backend=notify_only`, `protected principal / allow override`) 등 |
 | `trigger` | `scheduler`(거버넌스 주기), `api`(`POST /v1/model-rules/evaluate`), `usage_event`(실시간) |
@@ -423,7 +431,7 @@ Gemini Enterprise 앱 모델 변경(단건 `PATCH /v1/gemini-enterprise/apps/{ap
 로그(어떤 서비스든)에서 **처음 사용된** 모델. 내장 모델 목록 없이 신규 모델을 사용 당일 추적합니다.
 
 ```json
-{"model": "<model-id>", "publisher": "anthropic", "surfaces": ["gemini_platform"], "projects": ["team-a-prod"],
+{"model": "<model-id>", "publisher": "partner-publisher", "surfaces": ["gemini_platform"], "projects": ["team-a-prod"],
  "users": 3, "first_seen": "2026-11-26T09:12:44Z", "in_model_garden": true}
 ```
 
@@ -450,6 +458,105 @@ Model Garden 동기화(카탈로그 TTL 만료 또는 `POST /v1/models/sync`)에
 - `added`: 새로 나타났거나 다시 게시된 모델(최대 200개), `delisted`: 조회에 성공한 publisher에서 사라진 모델(최대 200개).
 - 제외된 모델은 카탈로그에서 삭제되지 않고 `lifecycle.delisted_at`과 함께 유지되며, 정책 패턴 확장에서는 빠집니다.
 - 최초 동기화(이전 카탈로그 없음)에서는 발송하지 않습니다.
+
+### 6.14 `group.cap_threshold_reached` / `group.cap_exceeded`
+
+공유 풀(`pool: shared`) 그룹 캡(`PUT /v1/caps/groups/{group_id}`)의 **유효 멤버 합산 사용량**이 임계값(캡 정책 `webhook_thresholds`, 기본 `[80, 100]`)에 도달하면 발송합니다. 100 이상은 `group.cap_exceeded`, 미만은 `group.cap_threshold_reached`. 그룹·기간·임계값별로 **한 번만** 발송되며 `manual` 모드에서도 평가됩니다.
+
+```json
+{
+  "id": "evt_3c2b1a0f9e8d7c6b",
+  "event": "group.cap_exceeded",
+  "timestamp": "2026-11-26T11:40:58Z",
+  "data": {
+    "group": "data-science",
+    "threshold_pct": 100,
+    "utilization_pct": 104.2,
+    "usage": {"requests": 5120, "total_tokens": 48200000, "estimated_cost": 1042.5, "currency": "USD"},
+    "limit": {"cost_cap": 1000.0, "token_cap": null, "request_cap": null, "currency": "USD", "pool": "shared", "scope": "total"},
+    "over_projects": [],
+    "member_count": 18,
+    "period_start": "2026-11-01T00:00:00Z"
+  }
+}
+```
+
+| 필드 | 값 |
+|---|---|
+| `group` | 그룹 ID |
+| `threshold_pct` / `utilization_pct` | 도달한 임계값 / 현재 사용률(가장 높은 합산·프로젝트별 비율, 소수 둘째 자리) |
+| `usage` | 유효 멤버 합산 `requests`, `total_tokens`, `estimated_cost`, `currency` |
+| `limit` | `cost_cap`, `token_cap`, `request_cap`(비어 있으면 `null`), `currency`, `pool: "shared"`, `scope`(`total` / `per_project`) |
+| `over_projects` | 프로젝트별 캡(`scope: per_project` 또는 `project_caps`)을 초과한 프로젝트 목록 |
+| `member_count` | 그룹 유효 멤버 수 |
+| `period_start` | 캡 기간 시작(기간이 없으면 `null`) |
+
+`auto` 모드에서는 이어서 사용자 수준 `allow`가 없는 멤버가 정지되며, 멤버마다 `user.blocked`(`trigger: "auto_cap"`, `reasons`에 `group:<id>`)가 발송됩니다.
+
+### 6.15 `group.blocked`
+
+```json
+{
+  "id": "evt_4d3c2b1a0f9e8d7c",
+  "event": "group.blocked",
+  "timestamp": "2026-11-26T11:40:58Z",
+  "data": {
+    "group": "contractors",
+    "services": ["gemini_platform"],
+    "projects": ["team-b-prod"],
+    "reason": "security review",
+    "until": "2026-12-01T00:00:00Z",
+    "members": ["dave@example.com", "erin@example.com"],
+    "actor": "key:1a2b3c4d5e6f"
+  }
+}
+```
+
+- `projects`: 프로젝트 목록 또는 전체면 `"all"`. `until`은 RFC 3339 또는 `null`.
+- `members`: 그룹 차단이 실제로 적용된 멤버. 사용자 수준 `allow`가 있거나 자신의 수동 차단이 이미 있는 멤버는 제외됩니다.
+
+### 6.16 `group.unblocked`
+
+```json
+{
+  "id": "evt_5e4d3c2b1a0f9e8d",
+  "event": "group.unblocked",
+  "timestamp": "2026-11-26T12:10:03Z",
+  "data": {
+    "group": "contractors",
+    "reason": "review complete",
+    "actor": "key:1a2b3c4d5e6f",
+    "members_still_blocked": ["erin@example.com"]
+  }
+}
+```
+
+- 그룹 해제는 **그 그룹 때문에만** 존재하던 차단·정지를 제거합니다. `members_still_blocked`의 멤버는 개인 수동 차단, 차단 규칙, 다른 그룹의 차단 등으로 여전히 차단 상태입니다(개인 차단은 `POST /v1/users/{email}/unblock`).
+
+### 6.17 `group.membership_changed`
+
+```json
+{
+  "id": "evt_6f5e4d3c2b1a0f9e",
+  "event": "group.membership_changed",
+  "timestamp": "2026-11-26T13:00:00Z",
+  "data": {
+    "group": "data-science",
+    "added": ["frank@example.com"],
+    "removed": ["grace@example.com"],
+    "trigger": "members",
+    "actor": "key:1a2b3c4d5e6f"
+  }
+}
+```
+
+| 필드 | 값 |
+|---|---|
+| `added` / `removed` | 유효 멤버(`members` + 동기화 멤버 − `excluded`) 기준으로 추가·제거된 사람 |
+| `trigger` | `members`(`POST /v1/groups/{id}/members`), `excluded`(`POST /v1/groups/{id}/exclusions`), `google_group_sync`(수동 `POST /v1/groups/{id}/sync` 또는 시간 단위 자동 동기화) |
+| `actor` | 변경한 호출자. `google_group_sync`일 때는 **없음** |
+
+유효 멤버가 실제로 바뀐 경우에만 발송됩니다. 그룹에 집행 중인 정책(그룹 차단, `block`/`allow` 규칙, 공유 풀 캡)이 있으면 변경은 즉시 IAM Deny에 반영됩니다.
 
 ## 7. 수신 측 구현 권장사항
 

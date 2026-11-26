@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="920" viewBox="0 0 1280 920" role="img" aria-labelledby="title desc" font-family="Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <title id="title">Architecture: hub-and-spoke</title>
+  <desc id="desc">One hub project hosts the API. Managed projects emit Antigravity, Gemini Platform and Gemini Enterprise logs to an aggregated sink feeding BigQuery and Pub/Sub. The API and enforcer price usage with the Cloud Billing Catalog and enforce with IAM Deny v2, Org Policy and Cloud Quotas.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#0B1F3A" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3C4A5E"/>
+    </marker>
+    <marker id="arrb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1A73E8"/>
+    </marker>
+    <marker id="arrr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#D93025"/>
+    </marker>
+    <marker id="arrg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#34A853"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="920" fill="#FFFFFF"/>
+  <text x="30" y="42" font-size="22" font-weight="700" fill="#0B1F3A">Architecture: hub-and-spoke</text>
+  <text x="30" y="66" font-size="14" fill="#5F6B7A">One installation in the hub project governs every managed project</text>
+  <g filter="url(#shadow)"><rect x="30" y="110" width="220" height="120" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="30" y="120" width="4" height="100" rx="2" fill="#1A73E8"/>
+  <text x="48" y="148.0" font-size="14" font-weight="700" fill="#1F2A3C">Customer AI portal</text>
+  <text x="48" y="166.0" font-size="13" fill="#5F6B7A">Calls REST /v1</text>
+  <text x="48" y="184.0" font-size="13" fill="#5F6B7A">API key or OIDC token</text>
+  <text x="48" y="202.0" font-size="13" fill="#5F6B7A">Receives webhooks</text>
+  <g filter="url(#shadow)"><rect x="30" y="262" width="220" height="96" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="30" y="272" width="4" height="76" rx="2" fill="#5F6B7A"/>
+  <text x="48" y="297.0" font-size="14" font-weight="700" fill="#1F2A3C">Operators</text>
+  <text x="48" y="315.0" font-size="13" fill="#5F6B7A">install.sh or Terraform</text>
+  <text x="48" y="333.0" font-size="13" fill="#5F6B7A">Preflight, curl, Python</text>
+  <rect x="30" y="392" width="220" height="300" rx="14" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/>
+  <text x="46" y="414" font-size="12" font-weight="700" letter-spacing="1" fill="#5F6B7A">FLOW</text>
+  <circle cx="56" cy="434" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="56" y="438.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+  <text x="76" y="438.5" font-size="13" fill="#1F2A3C" text-anchor="start">Portal calls REST /v1</text>
+  <circle cx="56" cy="466" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="56" y="470.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+  <text x="76" y="470.5" font-size="13" fill="#1F2A3C" text-anchor="start">Surfaces emit logs</text>
+  <circle cx="56" cy="498" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="56" y="502.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+  <text x="76" y="502.5" font-size="13" fill="#1F2A3C" text-anchor="start">Sink to BigQuery, Pub/Sub</text>
+  <circle cx="56" cy="530" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="56" y="534.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">4</text>
+  <text x="76" y="534.5" font-size="13" fill="#1F2A3C" text-anchor="start">Real-time usage push</text>
+  <circle cx="56" cy="562" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="56" y="566.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">5</text>
+  <text x="76" y="566.5" font-size="13" fill="#1F2A3C" text-anchor="start">5-min safety net</text>
+  <circle cx="56" cy="594" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="56" y="598.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">6</text>
+  <text x="76" y="598.5" font-size="13" fill="#1F2A3C" text-anchor="start">Price, deny, policy APIs</text>
+  <circle cx="56" cy="626" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="56" y="630.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">7</text>
+  <text x="76" y="630.5" font-size="13" fill="#1F2A3C" text-anchor="start">Deny applied to projects</text>
+  <circle cx="56" cy="658" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="56" y="662.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">8</text>
+  <text x="76" y="662.5" font-size="13" fill="#1F2A3C" text-anchor="start">Signed webhooks</text>
+  <rect x="30" y="712" width="220" height="180" rx="14" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/>
+  <text x="46" y="734" font-size="12" font-weight="700" letter-spacing="1" fill="#5F6B7A">LEGEND</text>
+  <path d="M48 752 H92" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="102" y="756" font-size="12" fill="#1F2A3C" text-anchor="start">Data or API call</text>
+  <path d="M48 782 H92" fill="none" stroke="#1A73E8" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arrb)"/>
+  <text x="102" y="786" font-size="12" fill="#1F2A3C" text-anchor="start">Enforcement</text>
+  <rect x="48" y="802" width="44" height="18" rx="5" fill="#F3F7FE" stroke="#1A73E8" stroke-width="1.5"/>
+  <text x="102" y="816" font-size="12" fill="#1F2A3C" text-anchor="start">Hub project</text>
+  <rect x="48" y="830" width="44" height="18" rx="5" fill="#F7F9FB" stroke="#8A97A8" stroke-width="1.5"/>
+  <text x="102" y="844" font-size="12" fill="#1F2A3C" text-anchor="start">Managed project</text>
+  <rect x="48" y="858" width="44" height="18" rx="9.0" fill="#34A853" fill-opacity="0.12" stroke="#34A853" stroke-width="1.5"/>
+  <text x="70.0" y="871.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle"></text>
+  <text x="102" y="872" font-size="12" fill="#1F2A3C" text-anchor="start">AI surface</text>
+  <rect x="280" y="90" width="620" height="470" rx="14" fill="#F3F7FE" stroke="#1A73E8" stroke-width="1.5"/>
+  <text x="296" y="112" font-size="12" font-weight="700" letter-spacing="1" fill="#1A73E8">HUB PROJECT  (single installation)</text>
+  <g filter="url(#shadow)"><rect x="310" y="130" width="270" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="310" y="140" width="4" height="56" rx="2" fill="#1A73E8"/>
+  <text x="328" y="155.0" font-size="14" font-weight="700" fill="#1F2A3C">Cloud Run API</text>
+  <text x="328" y="173.0" font-size="13" fill="#5F6B7A">REST /v1, OpenAPI 3.1</text>
+  <text x="328" y="191.0" font-size="13" fill="#5F6B7A">Usage, caps, groups, models</text>
+  <g filter="url(#shadow)"><rect x="610" y="130" width="260" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="610" y="140" width="4" height="56" rx="2" fill="#1A73E8"/>
+  <text x="628" y="164.0" font-size="14" font-weight="700" fill="#1F2A3C">Enforcer (Cloud Run Job)</text>
+  <text x="628" y="182.0" font-size="13" fill="#5F6B7A">Caps, gates G1-G7, group sync</text>
+  <g filter="url(#shadow)"><rect x="310" y="240" width="270" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="310" y="250" width="4" height="56" rx="2" fill="#1A73E8"/>
+  <text x="328" y="274.0" font-size="14" font-weight="700" fill="#1F2A3C">Pub/Sub</text>
+  <text x="328" y="292.0" font-size="13" fill="#5F6B7A">Real-time usage events</text>
+  <g filter="url(#shadow)"><rect x="610" y="240" width="260" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="610" y="250" width="4" height="56" rx="2" fill="#1A73E8"/>
+  <text x="628" y="265.0" font-size="14" font-weight="700" fill="#1F2A3C">Cloud Scheduler</text>
+  <text x="628" y="283.0" font-size="13" fill="#5F6B7A">Enforce every 5 min</text>
+  <text x="628" y="301.0" font-size="13" fill="#5F6B7A">Daily price sync (OIDC)</text>
+  <g filter="url(#shadow)"><rect x="310" y="350" width="270" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="310" y="360" width="4" height="56" rx="2" fill="#1A73E8"/>
+  <text x="328" y="384.0" font-size="14" font-weight="700" fill="#1F2A3C">BigQuery</text>
+  <text x="328" y="402.0" font-size="13" fill="#5F6B7A">Central usage dataset</text>
+  <rect x="600" y="340" width="280" height="206" rx="12" fill="none" stroke="#C9D4E3" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <g filter="url(#shadow)"><rect x="610" y="350" width="260" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="610" y="360" width="4" height="56" rx="2" fill="#5F6B7A"/>
+  <text x="628" y="384.0" font-size="14" font-weight="700" fill="#1F2A3C">Cloud Storage state</text>
+  <text x="628" y="402.0" font-size="13" fill="#5F6B7A">Caps, groups, rules, audit</text>
+  <g filter="url(#shadow)"><rect x="610" y="460" width="260" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="610" y="470" width="4" height="56" rx="2" fill="#5F6B7A"/>
+  <text x="628" y="494.0" font-size="14" font-weight="700" fill="#1F2A3C">Secret Manager</text>
+  <text x="628" y="512.0" font-size="13" fill="#5F6B7A">Bootstrap admin API key</text>
+  <text x="604" y="334" font-size="11" fill="#5F6B7A" text-anchor="start">Shared state for API and enforcer</text>
+  <path d="M250 150 H306" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <circle cx="278" cy="150" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="278" y="154.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+  <path d="M310 190 H254" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <circle cx="282" cy="190" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="282" y="194.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">8</text>
+  <path d="M445 240 V210" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <circle cx="445" cy="225" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="445" y="229.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">4</text>
+  <text x="462" y="229" font-size="12" fill="#5F6B7A" text-anchor="start">push /v1/internal/usage-event</text>
+  <path d="M580 388 H595 V180" fill="none" stroke="#3C4A5E" stroke-width="1.5"/>
+  <path d="M595 180 H584" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M740 240 V210" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <circle cx="740" cy="225" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="740" y="229.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">5</text>
+  <text x="757" y="229" font-size="12" fill="#5F6B7A" text-anchor="start">every 5 min</text>
+  <g filter="url(#shadow)"><rect x="310" y="592" width="270" height="62" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="310" y="602" width="4" height="42" rx="2" fill="#34A853"/>
+  <text x="328" y="619.0" font-size="14" font-weight="700" fill="#1F2A3C">Aggregated log sink</text>
+  <text x="328" y="637.0" font-size="13" fill="#5F6B7A">Log Router: project, folder or org</text>
+  <path d="M445 592 V430" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <circle cx="445" cy="560" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="445" y="564.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+  <path d="M310 623 H295 V388" fill="none" stroke="#3C4A5E" stroke-width="1.5"/>
+  <path d="M295 388 H306" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="280" y="690" width="620" height="210" rx="14" fill="#F7F9FB" stroke="#8A97A8" stroke-width="1.5"/>
+  <text x="296" y="712" font-size="12" font-weight="700" letter-spacing="1" fill="#8A97A8">MANAGED PROJECTS  (1..N)</text>
+  <g filter="url(#shadow)"><rect x="302" y="722" width="180" height="162" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <text x="392" y="746" font-size="14" fill="#1F2A3C" text-anchor="middle" font-weight="700">Project A</text>
+  <rect x="316" y="760" width="152" height="28" rx="14.0" fill="#34A853" fill-opacity="0.12" stroke="#34A853" stroke-width="1.5"/>
+  <text x="392.0" y="778.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle">Antigravity</text>
+  <rect x="316" y="798" width="152" height="28" rx="14.0" fill="#34A853" fill-opacity="0.12" stroke="#34A853" stroke-width="1.5"/>
+  <text x="392.0" y="816.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle">Gemini Platform</text>
+  <rect x="316" y="836" width="152" height="28" rx="14.0" fill="#34A853" fill-opacity="0.12" stroke="#34A853" stroke-width="1.5"/>
+  <text x="392.0" y="854.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle">Gemini Enterprise</text>
+  <g filter="url(#shadow)"><rect x="502" y="722" width="180" height="162" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <text x="592" y="746" font-size="14" fill="#1F2A3C" text-anchor="middle" font-weight="700">Project B</text>
+  <rect x="516" y="760" width="152" height="28" rx="14.0" fill="#34A853" fill-opacity="0.12" stroke="#34A853" stroke-width="1.5"/>
+  <text x="592.0" y="778.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle">Antigravity</text>
+  <rect x="516" y="798" width="152" height="28" rx="14.0" fill="#34A853" fill-opacity="0.12" stroke="#34A853" stroke-width="1.5"/>
+  <text x="592.0" y="816.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle">Gemini Platform</text>
+  <rect x="516" y="836" width="152" height="28" rx="14.0" fill="#34A853" fill-opacity="0.12" stroke="#34A853" stroke-width="1.5"/>
+  <text x="592.0" y="854.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle">Gemini Enterprise</text>
+  <g filter="url(#shadow)"><rect x="702" y="722" width="180" height="162" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <text x="792" y="746" font-size="14" fill="#1F2A3C" text-anchor="middle" font-weight="700">Project C</text>
+  <rect x="716" y="760" width="152" height="28" rx="14.0" fill="#34A853" fill-opacity="0.12" stroke="#34A853" stroke-width="1.5"/>
+  <text x="792.0" y="778.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle">Antigravity</text>
+  <rect x="716" y="798" width="152" height="28" rx="14.0" fill="#34A853" fill-opacity="0.12" stroke="#34A853" stroke-width="1.5"/>
+  <text x="792.0" y="816.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle">Gemini Platform</text>
+  <rect x="716" y="836" width="152" height="28" rx="14.0" fill="#34A853" fill-opacity="0.12" stroke="#34A853" stroke-width="1.5"/>
+  <text x="792.0" y="854.3" font-size="12" font-weight="600" fill="#1F2A3C" text-anchor="middle">Gemini Enterprise</text>
+  <path d="M540 722 V658" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <circle cx="540" cy="690" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="540" y="694.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+  <text x="557" y="680" font-size="12" fill="#5F6B7A" text-anchor="start">inference and audit logs</text>
+  <rect x="930" y="90" width="320" height="690" rx="14" fill="#F8FAFD" stroke="#8A97A8" stroke-width="1.5"/>
+  <text x="946" y="112" font-size="12" font-weight="700" letter-spacing="1" fill="#8A97A8">GOOGLE CLOUD APIS</text>
+  <g filter="url(#shadow)"><rect x="952" y="130" width="276" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="952" y="140" width="4" height="56" rx="2" fill="#FBBC04"/>
+  <text x="970" y="155.0" font-size="14" font-weight="700" fill="#1F2A3C">Cloud Billing Catalog API</text>
+  <text x="970" y="173.0" font-size="13" fill="#5F6B7A">Official SKU list prices, daily</text>
+  <text x="970" y="191.0" font-size="13" fill="#5F6B7A">Billing Export not used</text>
+  <g filter="url(#shadow)"><rect x="952" y="238" width="276" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="952" y="248" width="4" height="56" rx="2" fill="#1A73E8"/>
+  <text x="970" y="263.0" font-size="14" font-weight="700" fill="#1F2A3C">IAM Deny v2</text>
+  <text x="970" y="281.0" font-size="13" fill="#5F6B7A">Deny policies per project,</text>
+  <text x="970" y="299.0" font-size="13" fill="#5F6B7A">folder or organization</text>
+  <g filter="url(#shadow)"><rect x="952" y="346" width="276" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="952" y="356" width="4" height="56" rx="2" fill="#1A73E8"/>
+  <text x="970" y="380.0" font-size="14" font-weight="700" fill="#1F2A3C">Org Policy</text>
+  <text x="970" y="398.0" font-size="13" fill="#5F6B7A">vertexai.allowedModels</text>
+  <g filter="url(#shadow)"><rect x="952" y="454" width="276" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="952" y="464" width="4" height="56" rx="2" fill="#1A73E8"/>
+  <text x="970" y="488.0" font-size="14" font-weight="700" fill="#1F2A3C">Cloud Quotas API</text>
+  <text x="970" y="506.0" font-size="13" fill="#5F6B7A">Limits, increase requests</text>
+  <g filter="url(#shadow)"><rect x="952" y="562" width="276" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="952" y="572" width="4" height="56" rx="2" fill="#34A853"/>
+  <text x="970" y="596.0" font-size="14" font-weight="700" fill="#1F2A3C">Cloud Identity</text>
+  <text x="970" y="614.0" font-size="13" fill="#5F6B7A">Google Group membership sync</text>
+  <g filter="url(#shadow)"><rect x="952" y="670" width="276" height="76" rx="10" fill="#FFFFFF" stroke="#C9D4E3" stroke-width="1.5"/></g>
+  <rect x="952" y="680" width="4" height="56" rx="2" fill="#34A853"/>
+  <text x="970" y="704.0" font-size="14" font-weight="700" fill="#1F2A3C">Model Garden</text>
+  <text x="970" y="722.0" font-size="13" fill="#5F6B7A">Live publisher model catalog</text>
+  <path d="M870 168 H915" fill="none" stroke="#3C4A5E" stroke-width="1.5"/>
+  <path d="M915 168 V708" fill="none" stroke="#3C4A5E" stroke-width="1.5"/>
+  <path d="M915 168 H948" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M915 276 H948" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M915 384 H948" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M915 492 H948" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M915 600 H948" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M915 708 H948" fill="none" stroke="#3C4A5E" stroke-width="1.5" marker-end="url(#arr)"/>
+  <circle cx="892" cy="168" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="892" y="172.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">6</text>
+  <path d="M1228 276 H1262 V820" fill="none" stroke="#1A73E8" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <path d="M1228 384 H1262" fill="none" stroke="#1A73E8" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <path d="M1262 820 H904" fill="none" stroke="#1A73E8" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arrb)"/>
+  <circle cx="1090" cy="820" r="11" fill="#1A73E8" stroke="#FFFFFF" stroke-width="2"/>
+  <text x="1090" y="824.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">7</text>
+  <text x="1076" y="846" font-size="12" fill="#5F6B7A" text-anchor="middle">IAM Deny, Org Policy and quotas applied</text>
+  <text x="1076" y="864" font-size="12" fill="#5F6B7A" text-anchor="middle">per project, folder or org; 403 in 1-2 min</text>
+</svg>

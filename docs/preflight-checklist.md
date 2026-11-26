@@ -409,10 +409,10 @@ curl -s -H "Authorization: Bearer $KEY" "$API/v1/projects/team-a/capabilities" \
 
 사용 API: Cloud Logging v2 `sinks.list`(프로젝트 + `includeChildren`인 상위 폴더/조직 싱크), `exclusions.list`,
 CRM `getIamPolicy`(프로젝트/폴더/조직의 `auditConfigs`), BigQuery `datasets.get`(접근 목록), Pub/Sub
-`topics.getIamPolicy`, Vertex AI v1beta1 `projects/P:fetchPublisherModelConfig`.
+`topics.getIamPolicy`, Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI) v1beta1 `projects/P:fetchPublisherModelConfig`.
 
 필요 로그(`NEEDED_LOGS`): `businessaicode.googleapis.com/inference_response`,
-**`aiplatform.googleapis.com/inference_request`**(Vertex AI 토큰 출처), `cloudaudit.googleapis.com/data_access`,
+**`aiplatform.googleapis.com/inference_request`**(Gemini Platform 토큰 출처), `cloudaudit.googleapis.com/data_access`,
 `discoveryengine.googleapis.com/gen_ai_user_message`, `discoveryengine.googleapis.com/gemini_enterprise_user_activity`.
 기존 싱크를 채택할 때는 싱크 필터에 `log_id("aiplatform.googleapis.com/inference_request")`가 포함되어 있는지 반드시
 확인하세요(없으면 `logging.sink.bigquery`의 `data.missing`에 표시).
@@ -421,18 +421,18 @@ CRM `getIamPolicy`(프로젝트/폴더/조직의 `auditConfigs`), BigQuery `data
 |---|---|---|---|---|---|---|---|
 | `logging.sinks` | H, M | 싱크 목록 읽기 | `skip` | — | — | `logging.sinks.list` 권한 | — |
 | `logging.sink.bigquery` | H, M | 필요 로그(`inference_request` 포함)가 기대 목적지(`bigquery.googleapis.com/projects/<데이터세트 프로젝트>/datasets/<D>`)로 라우팅되는지 (제외 필터 반영) | `pass` / `info`(다른 목적지로 이미 라우팅 → 채택 권장) / `warn`(누락) | — | usage + 누락 서피스 | `prepare.sh`가 `<service>-ai-logs` 싱크 생성. 채택은 `--reuse-sinks` | 예 |
-| `logging.sink.pubsub` | H, M | 추론 로그(Antigravity `inference_response`, Vertex AI `inference_request`) Pub/Sub 싱크 존재 | `pass` / `info` | — | realtime (없으면 5분 스케줄러 폴백) | `deploy.sh`가 `<service>-usage-events` 싱크 → 허브 토픽 생성 | 예 |
+| `logging.sink.pubsub` | H, M | 추론 로그(Antigravity `inference_response`, Gemini Platform `inference_request`) Pub/Sub 싱크 존재 | `pass` / `info` | — | realtime (없으면 5분 스케줄러 폴백) | `deploy.sh`가 `<service>-usage-events` 싱크 → 허브 토픽 생성 | 예 |
 | `logging.sink.disabled` | H, M | AI 로그를 라우팅할 싱크가 비활성화됨 | `warn` | — | usage | `gcloud logging sinks update S --no-disabled --project=P` | 아니오 |
 | `logging.sink.writer_access` | H, M | 싱크 writer identity가 목적지에 쓰기 권한 보유(BQ: 데이터세트 WRITER/OWNER/dataEditor/dataOwner/admin 또는 프로젝트 역할, Pub/Sub: publisher/editor/admin), 최대 10개 | `pass` / `warn` / `skip`(전부 읽기 불가) | — | usage, realtime (로그가 조용히 유실) | `bq add-iam-policy-binding --member=W --role=roles/bigquery.dataEditor P:D` / `gcloud pubsub topics add-iam-policy-binding ...` | 예 |
 | `logging.default_sink` | H, M | `_Default` 싱크 존재·활성, 제외 필터·프로젝트 제외가 AI 로그를 버리지 않는지 | `pass` / `warn`(`usage_source`=auto/logging) / `info`(bigquery) | — | usage (Cloud Logging 읽기 누락, BigQuery 싱크는 무관) | 제외 필터 수정 | 아니오 |
-| `logging.audit_config.aiplatform` | H, M | Vertex AI `DATA_READ`+`DATA_WRITE` 감사 로그(프로젝트 → 폴더/조직 상속까지 확인) | `pass` / `warn` / `info`(aiplatform 미활성) / `skip` | — | gemini_platform, usage (헤더 라벨 없는 호출의 사용자 귀속·추론 로그 미활성 시 요청 수 집계 불가) | `scripts/prepare.sh --project HUB [--managed-projects P] --enable-data-access-logs` (기존 auditConfigs 보존 병합) | 예 |
-| `logging.vertex_inference_logging` | H, M | Vertex AI **추론 요청 메타데이터 로그**(`inferenceEventLoggingConfig.state`, v1beta1 `fetchPublisherModelConfig`) 활성 여부. 설정이 한 번도 없으면(NOT_FOUND) 꺼짐으로 판정 | `pass`(ENABLED) / `warn`(꺼짐 → `PREFLIGHT_VERTEX_LOGGING_DISABLED`) / `info`(aiplatform 미활성 → 해당 없음) / `skip`(읽기 불가 — 런타임 SA에 1권한 커스텀 역할 `gcpAiCapsVertexLoggingReader` = `aiplatform.endpoints.fetchPublisherModelConfig` 부여 명령 제시) | — (경고만, 실패 아님) | gemini_platform, usage — 꺼져 있으면 Vertex AI 토큰·비용·캡을 측정할 수 없음(요청 수만, `token_sources.gemini_platform=requests_only`). Antigravity·Gemini Enterprise는 영향 없음 | `prepare.sh`가 기본으로 활성화(`ENABLE_VERTEX_INFERENCE_LOGGING=true`, 끄려면 `--no-vertex-inference-logging`). 수동: `setPublisherModelConfig` curl(제시됨) 또는 `POST /v1/projects/P/vertex-logging/enable`(런타임 SA에 `aiplatform.endpoints.setPublisherModelConfig` 필요). Cloud Logging 수집·보관 요금 발생 | 예 |
+| `logging.audit_config.aiplatform` | H, M | Gemini Platform `DATA_READ`+`DATA_WRITE` 감사 로그(프로젝트 → 폴더/조직 상속까지 확인) | `pass` / `warn` / `info`(aiplatform 미활성) / `skip` | — | gemini_platform, usage (헤더 라벨 없는 호출의 사용자 귀속·추론 로그 미활성 시 요청 수 집계 불가) | `scripts/prepare.sh --project HUB [--managed-projects P] --enable-data-access-logs` (기존 auditConfigs 보존 병합) | 예 |
+| `logging.vertex_inference_logging` | H, M | Gemini Platform **추론 요청 메타데이터 로그**(`inferenceEventLoggingConfig.state`, v1beta1 `fetchPublisherModelConfig`) 활성 여부. 설정이 한 번도 없으면(NOT_FOUND) 꺼짐으로 판정 | `pass`(ENABLED) / `warn`(꺼짐 → `PREFLIGHT_VERTEX_LOGGING_DISABLED`) / `info`(aiplatform 미활성 → 해당 없음) / `skip`(읽기 불가 — 런타임 SA에 1권한 커스텀 역할 `gcpAiCapsVertexLoggingReader` = `aiplatform.endpoints.fetchPublisherModelConfig` 부여 명령 제시) | — (경고만, 실패 아님) | gemini_platform, usage — 꺼져 있으면 Gemini Platform 토큰·비용·캡을 측정할 수 없음(요청 수만, `token_sources.gemini_platform=requests_only`). Antigravity·Gemini Enterprise는 영향 없음 | `prepare.sh`가 기본으로 활성화(`ENABLE_VERTEX_INFERENCE_LOGGING=true`, 끄려면 `--no-vertex-inference-logging`). 수동: `setPublisherModelConfig` curl(제시됨) 또는 `POST /v1/projects/P/vertex-logging/enable`(런타임 SA에 `aiplatform.endpoints.setPublisherModelConfig` 필요). Cloud Logging 수집·보관 요금 발생 | 예 |
 
 ### 3.8 `surfaces` — AI 서피스 존재 여부
 
 사용 API: Discovery Engine v1 `collections/default_collection/engines`(로케이션 `global`, `us`, `eu` +
 `workspace.discovery_engine_locations`), v1alpha `devToolsConfig`, Cloud Logging `entries.list`(최근 7일),
-Vertex AI v1beta1 `publishers/google/models`(글로벌, 실패 시 허브 리전 엔드포인트).
+Gemini Platform v1beta1 `publishers/google/models`(글로벌, 실패 시 허브 리전 엔드포인트).
 
 | ID | 범위 | 점검 내용 | 결과 | 차단 | 영향 |
 |---|---|---|---|---|---|
@@ -715,7 +715,7 @@ Gemini Enterprise 앱이 없는 것은 **오류가 아닙니다**.
 - 앱을 쓰려면 콘솔에서 앱을 만든 뒤 `?refresh=true`로 다시 점검하세요. 앱 조회에는 런타임 SA의
   `roles/discoveryengine.viewer`(배포 시 `roles/discoveryengine.editor` 부여)가 필요합니다.
 
-Vertex AI(`aiplatform` 비활성)와 Antigravity(미사용)도 같은 원칙으로 `info`/`not_applicable` 처리됩니다.
+Gemini Platform(`aiplatform` 비활성)과 Antigravity(미사용)도 같은 원칙으로 `info`/`not_applicable` 처리됩니다.
 
 ## 9. Antigravity 설정은 콘솔 전용
 

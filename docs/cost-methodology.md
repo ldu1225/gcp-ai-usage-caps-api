@@ -10,7 +10,7 @@
 
 | 항목 | 내용 |
 |---|---|
-| 사용량(토큰 수) 출처 | **Cloud Logging 로그만** 사용 — Antigravity 추론 로그, Vertex AI 추론 요청 로그(`aiplatform.googleapis.com/inference_request`), Data Access 감사 로그(요청 수·사용자 귀속), Gemini Enterprise 활동 로그 |
+| 사용량(토큰 수) 출처 | **Cloud Logging 로그만** 사용 — Antigravity 추론 로그, Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI) 추론 요청 로그(`aiplatform.googleapis.com/inference_request`), Data Access 감사 로그(요청 수·사용자 귀속), Gemini Enterprise 활동 로그 |
 | 단가 출처 | **공식 Cloud Billing Catalog API의 SKU 목록가**(`cloudbilling.googleapis.com/v1/services/{id}/skus`), 매일 동기화 · 또는 계약 단가 override |
 | Cloud Billing Export | **사용하지 않음 · 필요 없음** (BigQuery 결제 내보내기 테이블을 읽지 않으며 설정 항목도 없음) |
 | 결과의 성격 | **목록가 기준 추정액** — 크레딧·약정 사용 할인(CUD)·협상 할인(override 미입력 시)·세금 **미반영** |
@@ -21,7 +21,7 @@
 flowchart LR
     subgraph LOGS["Cloud Logging (관리 대상 프로젝트)"]
         AGY["Antigravity<br/>inference_response"]
-        VXI["Vertex AI<br/>inference_request"]
+        VXI["Gemini Platform<br/>inference_request"]
         AUD["Data Access 감사 로그"]
         GE["Gemini Enterprise 활동 로그"]
     end
@@ -43,9 +43,9 @@ flowchart LR
 | 서비스 | 로그 | 입력 토큰 `I` | 캐시 읽기 `C` | 캐시 쓰기 `W` | 출력 토큰 `O` | 트래픽 유형 |
 |---|---|---|---|---|---|---|
 | Antigravity | `businessaicode.googleapis.com/inference_response` | `promptTokenCount` (+`toolUsePromptTokenCount`) | `cachedContentTokenCount` | – | `max(total − I, candidates + thoughts)` | 표준(on-demand) |
-| Vertex AI — Gemini `generateContent` / `streamGenerateContent` | `aiplatform.googleapis.com/inference_request` → `generateContentDetails.usageMetadata` | `promptTokenCount + toolUsePromptTokenCount` | `cachedContentTokenCount` | – | `max(totalTokenCount − I, candidatesTokenCount + thoughtsTokenCount)` | `trafficType` |
-| Vertex AI — Claude `rawPredict` / `streamRawPredict` | 같은 로그 → `rawPredictDetails.usageMetadata` | `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` | `cache_read_input_tokens` | `cache_creation_input_tokens` | `output_tokens` | `trafficType` |
-| Vertex AI (추론 로그 미활성) | Data Access 감사 로그 | 없음 → **요청 수만** (`token_sources.gemini_platform = requests_only`) | – | – | – | – |
+| Gemini Platform — Gemini `generateContent` / `streamGenerateContent` | `aiplatform.googleapis.com/inference_request` → `generateContentDetails.usageMetadata` | `promptTokenCount + toolUsePromptTokenCount` | `cachedContentTokenCount` | – | `max(totalTokenCount − I, candidatesTokenCount + thoughtsTokenCount)` | `trafficType` |
+| Gemini Platform — 파트너 모델 `rawPredict` / `streamRawPredict` | 같은 로그 → `rawPredictDetails.usageMetadata` | `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` | `cache_read_input_tokens` | `cache_creation_input_tokens` | `output_tokens` | `trafficType` |
+| Gemini Platform (추론 로그 미활성) | Data Access 감사 로그 | 없음 → **요청 수만** (`token_sources.gemini_platform = requests_only`) | – | – | – | – |
 | Gemini Enterprise | 사용자 활동 로그 | 없음 — **좌석(라이선스) 과금 제품**, 요청 수만 집계 (`cost_basis = license`) | – | – | – | – |
 
 * **사고(thinking) 토큰은 출력 단가로 과금**되므로 출력 토큰에 포함합니다(`thoughts_tokens`로 별도 표시).
@@ -67,7 +67,7 @@ flowchart LR
 | `input` | 표준 입력 | `I − C − W` | 미가격(`cost_partial=true`) |
 | `output` | 표준 출력 (**사고 토큰 포함**) | `O` | 미가격 |
 | `cached` | 컨텍스트 캐시 읽기 | `C` | `input` 단가(보수적) |
-| `cache_write` | 프롬프트 캐시 쓰기(Claude) | `W` | `input` 단가 |
+| `cache_write` | 프롬프트 캐시 쓰기(파트너 모델) | `W` | `input` 단가 |
 | `tiers.long_context` | 장문 컨텍스트 티어(입력·출력·캐시) | 프롬프트가 임계값 초과인 요청의 토큰 | 표준 단가 |
 | `tiers.flex` / `tiers.priority` / `tiers.batch` | 트래픽 티어 | `trafficType`가 해당 티어인 요청의 토큰 | 표준 단가 |
 | `tiers.<variant>_long_context` | 티어 × 장문 조합(SKU가 있으면 표에 표시) | 참고용 | – |
@@ -134,25 +134,25 @@ $$
 | `<model-A>` (Gemini 계열) | 표준 | 1.00 | 0.10 | – | 8.00 |
 | `<model-A>` | long_context | 2.00 | 0.20 | – | 12.00 |
 | `<model-A>` | flex | 0.50 | 0.05 | – | 4.00 |
-| `<model-B>` (Claude 계열) | 표준 | 3.00 | 0.30 | 3.75 | 15.00 |
+| `<model-B>` (파트너 모델 계열) | 표준 | 3.00 | 0.30 | 3.75 | 15.00 |
 
 **사용자 alice@company.com, 한 달 사용량 (로그 집계 결과)**
 
 | # | 모델 · 티어 | 입력 `I` | 캐시 읽기 `C` | 캐시 쓰기 `W` | 출력 `O` (사고 포함) |
 |---|---|---|---|---|---|
-| ① | `<model-A>` 표준 (장문 제외) | 10,000,000 | 4,000,000 | 0 | 2,000,000 |
-| ② | `<model-A>` 장문(프롬프트 > 200K, 20건) | 5,000,000 | 1,000,000 | 0 | 200,000 |
-| ③ | `<model-A>` flex | 3,000,000 | 0 | 0 | 1,000,000 |
-| ④ | `<model-B>` 표준 | 2,000,000 | 1,000,000 | 200,000 | 300,000 |
+| 1 | `<model-A>` 표준 (장문 제외) | 10,000,000 | 4,000,000 | 0 | 2,000,000 |
+| 2 | `<model-A>` 장문(프롬프트 > 200K, 20건) | 5,000,000 | 1,000,000 | 0 | 200,000 |
+| 3 | `<model-A>` flex | 3,000,000 | 0 | 0 | 1,000,000 |
+| 4 | `<model-B>` 표준 | 2,000,000 | 1,000,000 | 200,000 | 300,000 |
 
 **계산**
 
 | # | 식 | 금액 (USD) |
 |---|---|---|
-| ① | (10,000,000 − 4,000,000)×1.00 + 4,000,000×0.10 + 2,000,000×8.00 = 6.00 + 0.40 + 16.00 | **22.40** |
-| ② | (5,000,000 − 1,000,000)×2.00 + 1,000,000×0.20 + 200,000×12.00 = 8.00 + 0.20 + 2.40 | **10.60** |
-| ③ | 3,000,000×0.50 + 1,000,000×4.00 = 1.50 + 4.00 | **5.50** |
-| ④ | (2,000,000 − 1,000,000 − 200,000)×3.00 + 1,000,000×0.30 + 200,000×3.75 + 300,000×15.00 = 2.40 + 0.30 + 0.75 + 4.50 | **7.95** |
+| 1 | (10,000,000 − 4,000,000)×1.00 + 4,000,000×0.10 + 2,000,000×8.00 = 6.00 + 0.40 + 16.00 | **22.40** |
+| 2 | (5,000,000 − 1,000,000)×2.00 + 1,000,000×0.20 + 200,000×12.00 = 8.00 + 0.20 + 2.40 | **10.60** |
+| 3 | 3,000,000×0.50 + 1,000,000×4.00 = 1.50 + 4.00 | **5.50** |
+| 4 | (2,000,000 − 1,000,000 − 200,000)×3.00 + 1,000,000×0.30 + 200,000×3.75 + 300,000×15.00 = 2.40 + 0.30 + 0.75 + 4.50 | **7.95** |
 | | (각 항목은 ÷ 1,000,000 후 값) **합계** | **46.45** |
 
 * 캡 통화가 KRW이고 동기화된 환율이 1 USD = 1,400 KRW라면 → **65,030 KRW** (응답의 `fx.rate`, `fx.as_of`로 근거 제시).
@@ -170,10 +170,10 @@ $$
 | 모달리티별 단가 | 멀티모달(이미지·오디오·비디오) **입력 토큰도 텍스트 입력 단가로 계산**될 수 있음 |
 | 좌석 라이선스 | Gemini Enterprise는 좌석 과금 — 요청 수만 집계 |
 | 부대 인프라 | Cloud Logging 수집·보관, BigQuery 쿼리/저장, 이 API의 Cloud Run 비용 |
-| 귀속 불가 사용량 | 사용자에게 귀속하지 못한 Vertex AI 사용량은 사용자 합계가 아닌 프로젝트별 `unattributed`에 표시(합계에는 포함 가능) |
+| 귀속 불가 사용량 | 사용자에게 귀속하지 못한 Gemini Platform 사용량은 사용자 합계가 아닌 프로젝트별 `unattributed`에 표시(합계에는 포함 가능) |
 
 > [!TIP]
-> 월말에 Cloud Console 결제 보고서(프로젝트·SKU별)와 이 API의 프로젝트 합계(사용자 합계 + `unattributed`)를 비교하면 차이의 대부분은 위 미포함 항목으로 설명됩니다. 차이가 크면 Vertex AI 추론 로그 활성 여부(`GET /v1/projects/{id}/vertex-logging`)와 `telemetry.token_sources`를 먼저 확인하세요.
+> 월말에 Cloud Console 결제 보고서(프로젝트·SKU별)와 이 API의 프로젝트 합계(사용자 합계 + `unattributed`)를 비교하면 차이의 대부분은 위 미포함 항목으로 설명됩니다. 차이가 크면 Gemini Platform 추론 로그 활성 여부(`GET /v1/projects/{id}/vertex-logging`)와 `telemetry.token_sources`를 먼저 확인하세요.
 
 ## 8. API로 확인하기
 
