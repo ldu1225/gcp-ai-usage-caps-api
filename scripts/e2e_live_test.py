@@ -28,6 +28,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -145,43 +146,87 @@ class Run:
             return
         st, page = self.api("GET", "/v1/models?publisher=google&limit=500")
         rows = page.get("data") or [] if st == 200 else []
-        skip_primary = ("image", "tts", "audio", "live", "embedding", "omni", "preview", "exp", "lite",
-                        "nano", "veo", "imagen", "chirp", "lyria", "code", "computer", "robotics")
-        skip_fallback = ("image", "tts", "audio", "live", "embedding", "omni", "veo", "imagen", "chirp", "lyria")
-        tier_rank = {"carbon": 60, "argon": 50, "neon": 40, "hydrogen": 30, "pro": 20, "flash": 10}
+        # Exclude endpoints that do not support text generateContent (by modality, never by tier/brand name).
+        non_text = frozenset(("image", "tts", "audio", "live", "embedding", "transcribe", "translate",
+                              "omni", "veo", "imagen", "chirp", "lyria", "robotics"))
+        non_ga = frozenset(("preview", "exp", "experimental"))
 
-        def _stage(m) -> str:
-            lc = m.get("lifecycle") if isinstance(m.get("lifecycle"), dict) else {}
-            return str(lc.get("stage") or m.get("launch_stage") or "").upper()
+        def _lc(m) -> dict:
+            return m.get("lifecycle") if isinstance(m.get("lifecycle"), dict) else {}
 
-        def _score(m) -> tuple[int, int, int, str]:
+        def _tokens(mid: str) -> set[str]:
+            return set(re.split(r"[-_./@]+", mid.lower()))
+
+        def _is_active_ga(m) -> bool:
+            lc = _lc(m)
+            if lc.get("delisted_at") or lc.get("deprecation_date") or lc.get("shutdown_date"):
+                return False
+            stage = str(lc.get("stage") or m.get("launch_stage") or "").upper()
+            return stage in ("GA", "")
+
+        def _has_text_token_pricing(m) -> bool:
+            pr = m.get("pricing") if isinstance(m.get("pricing"), dict) else None
+            if not pr:
+                return False
+            pin, pout = pr.get("input_per_1m_tokens"), pr.get("output_per_1m_tokens")
+            return isinstance(pin, (int, float)) and pin > 0 and isinstance(pout, (int, float)) and pout > 0
+
+        def _release_date(m) -> str:
+            lc = _lc(m)
+            for key in ("release_date", "ga_date", "released_at", "create_time"):
+                val = lc.get(key) or m.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()[:10]
             mid = str(m.get("id") or "").lower()
-            parts = mid.split("-")
-            major, minor = 0, 0
-            for token in parts[1:]:
-                if token and token[0].isdigit():
-                    nums = token.split(".")
-                    if nums[0].isdigit():
-                        major = int(nums[0])
-                        minor = int(nums[1]) if len(nums) > 1 and nums[1].isdigit() else 0
-                    break
-            tr = max((score for name, score in tier_rank.items() if name in parts), default=0)
-            return (major, minor, tr, mid)
+            match = re.search(r"(?:^|-)(\d{4})-?(\d{2})(?:-?(\d{2}))?(?=$|-)", mid)
+            if match:
+                return "%s-%s-%s" % (match.group(1), match.group(2), match.group(3) or "01")
+            return ""
 
-        def ok(m):
+        def _version_tuple(m) -> tuple[int, ...]:
             mid = str(m.get("id") or "").lower()
-            return (mid.startswith("gemini-")
-                    and not any(x in mid for x in skip_primary)
-                    and _stage(m) in ("GA", ""))
+            for token in mid.split("-")[1:]:
+                if token and token[0].isdigit() and len(token.split(".")[0]) <= 2:
+                    parts = [int(p) for p in token.split(".") if p.isdigit()]
+                    if parts:
+                        return tuple(parts)
+            return (0,)
+
+        def _observed_meta(m) -> tuple[int, str]:
+            obs = m.get("observed") if isinstance(m.get("observed"), dict) else None
+            if not obs:
+                return (0, "")
+            surfaces = obs.get("surfaces") or []
+            on_gp = 1 if ("gemini_platform" in surfaces or not surfaces) else 0
+            return (on_gp, str(obs.get("last_seen") or ""))
+
+        def _score(m) -> tuple:
+            lc = _lc(m)
+            on_gp, last_seen = _observed_meta(m)
+            # Zero hardcoded model or tier names:
+            # 1) Live text-token pricing metadata (both input & output > 0)
+            # 2) Explicit release / GA date (lifecycle metadata or date suffix in id)
+            # 3) Parsed semantic generation version tuple (e.g. (5, 0) > (4, 0) > (3, 8))
+            # 4) Most recently listed in Model Garden catalog (lifecycle.first_listed)
+            # 5) Most recently observed live in this project (observed.last_seen)
+            return (
+                1 if _has_text_token_pricing(m) else 0,
+                _release_date(m),
+                _version_tuple(m),
+                str(lc.get("first_listed") or ""),
+                on_gp,
+                last_seen,
+                str(m.get("id") or ""),
+            )
+
+        def ok(m) -> bool:
+            mid = str(m.get("id") or "").strip().lower()
+            if not mid or not _is_active_ga(m):
+                return False
+            toks = _tokens(mid)
+            return not (toks & non_text) and not (toks & non_ga)
 
         cands = sorted((m for m in rows if ok(m)), key=_score, reverse=True)
-        if not cands:
-            def fallback_ok(m):
-                mid = str(m.get("id") or "").lower()
-                return (mid.startswith("gemini-")
-                        and not any(x in mid for x in skip_fallback)
-                        and _stage(m) in ("GA", ""))
-            cands = sorted((m for m in rows if fallback_ok(m)), key=_score, reverse=True)
         if not cands:
             raise SystemExit("Could not pick a model from GET /v1/models; pass --model <model-id>.")
         self.model = cands[0]["id"]
@@ -324,7 +369,8 @@ def main() -> int:
     p.add_argument("--project", default=os.environ.get("PROJECT_ID", "duleetest"))
     p.add_argument("--location", default=os.environ.get("E2E_LOCATION", "global"))
     p.add_argument("--test-sa", default=os.environ.get("E2E_TEST_SA"))
-    p.add_argument("--model", default=os.environ.get("E2E_MODEL"), help="model id; default = newest GA flash model from GET /v1/models")
+    p.add_argument("--model", default=os.environ.get("E2E_MODEL"),
+                   help="model id; default = newest active GA text model from GET /v1/models (by lifecycle/observation metadata)")
     p.add_argument("--cap", type=int, default=3, help="requests allowed before the cap is exceeded")
     p.add_argument("--log-wait", type=int, default=900, help="max seconds to wait for usage to appear in logs")
     p.add_argument("--propagation-wait", type=int, default=600, help="max seconds to wait for IAM Deny changes")

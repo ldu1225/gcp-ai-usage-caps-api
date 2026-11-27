@@ -211,7 +211,7 @@ class CompatibilityRegressionTests(unittest.TestCase):
         self.assertEqual(len(da_filters), 1)
         self.assertIn("protoPayload.methodName=~", da_filters[0])
 
-    def test_e2e_pick_model_prefers_latest_gemini4_and_skips_preview_omni(self):
+    def test_e2e_pick_model_uses_release_and_observation_metadata_without_hardcoded_tiers(self):
         mod = _load_e2e_module()
         def _run_with(models):
             args = argparse.Namespace(api_url="http://127.0.0.1:0", admin_key="k", project="p",
@@ -221,36 +221,36 @@ class CompatibilityRegressionTests(unittest.TestCase):
                 r.pick_model()
             return r.model
 
-        # 1) Modern catalog: prefers gemini-4-carbon over argon/neon/3.8-flash/2.5-flash and skips preview/omni/image
+        priced = {"input_per_1m_tokens": 2.0, "output_per_1m_tokens": 10.0}
+
+        # 1) Explicit release_date wins for any future/unknown model name (zero hardcoded tier/family words)
         picked = _run_with([
-            {"id": "gemini-omni-1.2-flash", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-4-carbon-preview", "lifecycle": {"stage": "preview"}},
-            {"id": "gemini-4-argon", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-4-carbon", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-4-neon", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-3.8-flash", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-2.5-flash", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-nano-banana-2.1", "lifecycle": {"stage": "ga"}},
+            {"id": "gemini-4-carbon", "lifecycle": {"stage": "ga", "release_date": "2026-10-01"}, "pricing": priced},
+            {"id": "aurora-5-quantum", "lifecycle": {"stage": "ga", "release_date": "2027-04-15"}, "pricing": priced},
+            {"id": "aurora-6-preview", "lifecycle": {"stage": "preview", "release_date": "2027-09-01"}, "pricing": priced},
+            {"id": "aurora-5-retired", "lifecycle": {"stage": "ga", "release_date": "2027-05-01", "deprecation_date": "2027-12-01"}, "pricing": priced},
         ])
-        self.assertEqual(picked, "gemini-4-carbon")
+        self.assertEqual(picked, "aurora-5-quantum")
 
-        # 2) When carbon is absent, prefers gemini-4-argon over 3.8-flash
+        # 2) Without explicit release_date: newest first_listed / observed.last_seen within latest priced GA generation wins
         picked2 = _run_with([
-            {"id": "gemini-3.8-flash", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-4-argon", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-4-neon", "lifecycle": {"stage": "ga"}},
+            {"id": "gemini-4-alpha", "lifecycle": {"stage": "ga", "first_listed": "2026-11-26T00:00:00Z"},
+             "observed": {"surfaces": ["gemini_platform"], "last_seen": "2026-11-26T10:00:00Z"}, "pricing": priced},
+            {"id": "gemini-4-zeta", "lifecycle": {"stage": "ga", "first_listed": "2026-11-26T00:00:00Z"},
+             "observed": {"surfaces": ["gemini_platform"], "last_seen": "2026-11-27T01:00:00Z"}, "pricing": priced},
+            {"id": "gemini-4-tts", "lifecycle": {"stage": "ga", "first_listed": "2026-11-27T00:00:00Z"},
+             "pricing": {"input_per_1m_tokens": 1.0, "output_per_1m_tokens": 0.0}},
+            {"id": "gemini-3.8-beta", "lifecycle": {"stage": "ga", "first_listed": "2026-11-26T00:00:00Z"},
+             "observed": {"surfaces": ["gemini_platform"], "last_seen": "2026-11-27T02:00:00Z"}, "pricing": priced},
         ])
-        self.assertEqual(picked2, "gemini-4-argon")
+        self.assertEqual(picked2, "gemini-4-zeta")
 
-        # 3) Legacy catalog without Gemini 4 still skips preview/omni/lite cleanly
+        # 3) Newly listed model (newer first_listed) beats older listing in the same generation
         picked3 = _run_with([
-            {"id": "gemini-omni-1.2-flash", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-3.8-flash-preview", "lifecycle": {"stage": "preview"}},
-            {"id": "gemini-3.8-flash-lite", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-3.8-flash", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-2.5-flash", "lifecycle": {"stage": "ga"}},
+            {"id": "gemini-4-old", "lifecycle": {"stage": "ga", "first_listed": "2026-11-01T00:00:00Z"}, "pricing": priced},
+            {"id": "gemini-4-new", "lifecycle": {"stage": "ga", "first_listed": "2027-02-01T00:00:00Z"}, "pricing": priced},
         ])
-        self.assertEqual(picked3, "gemini-3.8-flash")
+        self.assertEqual(picked3, "gemini-4-new")
 
     def test_deny_policy_client_caches_reads_and_invalidates_on_write(self):
         app, gcp = build_test_app()
