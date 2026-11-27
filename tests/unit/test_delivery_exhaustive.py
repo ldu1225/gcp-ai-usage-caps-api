@@ -691,6 +691,126 @@ class DeliveryWorkforceCurrencyAndEventsTests(unittest.TestCase):
                 self.assertTrue(body["acknowledged"])
                 self.assertEqual(body["action"], "ignored")
 
+    def test_live_catalog_prices_high_fx_currencies_and_policy_fx_sync(self):
+        from usage_caps_api.services import base as svc_base, pricing_sync
+
+        rate_krw = 1343.255
+        services_resp = {"services": [{"serviceId": "svc-ai", "displayName": "Gemini Platform"}]}
+
+        def _sku(desc: str, usd_per_m: float, cur: str):
+            mult = rate_krw if cur == "KRW" else 1.0
+            per_m = usd_per_m * mult
+            units = int(per_m)
+            nanos = int(round((per_m - units) * 1e9))
+            return {
+                "name": "services/svc-ai/skus/" + desc.replace(" ", "_").lower(),
+                "description": desc,
+                "pricingInfo": [{
+                    "effectiveTime": "2026-11-26T08:00:00Z",
+                    "currencyConversionRate": mult,
+                    "pricingExpression": {
+                        "usageUnit": "count",
+                        "usageUnitDescription": "1000000 tokens",
+                        "baseUnitConversionFactor": 1_000_000,
+                        "tieredRates": [{"startUsageAmount": 0, "unitPrice": {"units": str(units), "nanos": nanos}}],
+                    },
+                }],
+            }
+
+        class CatalogFakeGcp(GovernanceFakeGcp):
+            def request(self, method, url, *, quota_project=None, params=None, json_body=None, data=None,
+                        headers=None, timeout=30, expect_json=True):
+                if url.endswith("/v1/services"):
+                    return services_resp, {}
+                if "/v1/services/svc-ai/skus" in url:
+                    cur = (params or {}).get("currencyCode") or "USD"
+                    return {"skus": [
+                        _sku("Gemini Test Pro Input Token Count", 3.0, cur),
+                        _sku("Gemini Test Pro Output Token Count", 15.0, cur),
+                        _sku("Gemini Bogus Huge Input Token Count", 800.0, cur),
+                    ]}, {}
+                return super().request(method, url, quota_project=quota_project, params=params,
+                                       json_body=json_body, data=data, headers=headers,
+                                       timeout=timeout, expect_json=expect_json)
+
+        gcp = CatalogFakeGcp()
+        cfg = make_test_config(pricing={"source": "auto", "currency": "USD", "model_overrides": []})
+        app = _make_app(gcp=gcp, cfg=cfg)
+        app.store.mutate("model_catalog", lambda d: d.setdefault("models", {}).update({
+            "gemini-test-pro": {}, "gemini-bogus-huge": {},
+        }))
+        caller = auth.Caller("admin", "admin", "api_key", frozenset(["*"]), "test")
+        ctx = svc_base.Ctx(app, app.config, caller)
+
+        # 1) Direct live_catalog_prices(KRW) must keep $3/$15 models (> 500 KRW/1M) while rejecting $800/1M bogus SKU.
+        prices_krw, usd_rate, _eff = pricing_sync.live_catalog_prices(ctx, "KRW")
+        self.assertAlmostEqual(usd_rate, rate_krw, places=3)
+        self.assertIn("gemini-test-pro", prices_krw)
+        self.assertAlmostEqual(prices_krw["gemini-test-pro"]["input"], 3.0 * rate_krw, delta=1.0)
+        self.assertAlmostEqual(prices_krw["gemini-test-pro"]["output"], 15.0 * rate_krw, delta=1.0)
+        self.assertNotIn("gemini-bogus-huge", prices_krw)
+
+        # 2) Policy currency KRW + POST /v1/internal/pricing/sync persists KRW FX and serves KRW prices via /v1/pricing.
+        with LiveTestServer(app) as srv:
+            st, pol, _ = srv.request("PUT", "/v1/caps/policy", token=ADMIN, body={"currency": "KRW"})
+            self.assertEqual(st, 200, pol)
+            st, syn, _ = srv.request("POST", "/v1/internal/pricing/sync", token=ADMIN, body={})
+            self.assertEqual(st, 200, syn)
+            self.assertIn("KRW", syn["currencies_synced"])
+            st, pr, _ = srv.request("GET", "/v1/pricing", token=ADMIN)
+            self.assertEqual(st, 200, pr)
+            self.assertEqual(pr["currency"], "KRW")
+            row = next((r for r in pr["data"] if r["model_key"] == "gemini-test-pro"), None)
+            self.assertIsNotNone(row, pr)
+            self.assertAlmostEqual(row["input"], 3.0 * rate_krw, delta=1.0)
+            self.assertAlmostEqual(row["output"], 15.0 * rate_krw, delta=1.0)
+
+    def test_bulk_result_preserves_boolean_dry_run_and_planned_count(self):
+        gcp = GovernanceFakeGcp()
+        app = _make_app(gcp=gcp)
+        with LiveTestServer(app) as srv:
+            # 1) model-access bulk-apply with dryRun=True (when scopes change -> planned >= 1, dry_run is strict bool True)
+            st, res, _ = srv.request("POST", "/v1/model-access/bulk-apply", token=ADMIN, body={
+                "scopes": ["projects/*"], "mode": "deny_list", "models": ["claude-test-sonnet"], "dryRun": True,
+            })
+            self.assertEqual(st, 200, res)
+            self.assertIs(res["dry_run"], True)
+            self.assertEqual(res["planned"], 2)
+            self.assertEqual(res["applied"], 0)
+
+            # 2) model-access bulk-apply with dryRun=True when scopes are unchanged (planned == 0, dry_run STILL True!)
+            st, res2, _ = srv.request("POST", "/v1/model-access/bulk-apply", token=ADMIN, body={
+                "scopes": ["projects/*"], "mode": "inherit", "dryRun": True,
+            })
+            self.assertEqual(st, 200, res2)
+            self.assertIs(res2["dry_run"], True)
+            self.assertIsInstance(res2["planned"], int)
+
+            # 3) GE apps bulk-models with dryRun=True
+            st, ge_res, _ = srv.request("POST", "/v1/gemini-enterprise/apps/bulk-models", token=ADMIN, body={
+                "apps": ["*"], "models": {"gemini-test-pro": "off"}, "dryRun": True,
+            })
+            self.assertEqual(st, 200, ge_res)
+            self.assertIs(ge_res["dry_run"], True)
+            self.assertIsInstance(ge_res["planned"], int)
+
+            # 4) Bulk quota-requests with dryRun=True and bad dryRun type -> 400
+            st, bad_q, _ = srv.request("POST", "/v1/quota-requests", token=ADMIN, body={
+                "projects": ["*"], "quota_id": "q1", "requested_value": 100,
+                "justification": "test", "contact_email": "ops@company.com", "dryRun": "yes",
+            })
+            self.assertEqual(st, 400, bad_q)
+            st, q_res, _ = srv.request("POST", "/v1/quota-requests", token=ADMIN, body={
+                "projects": ["*"],
+                "quota_id": "GenerateContentRequestsPerMinutePerProjectPerRegionPerBaseModel",
+                "model": "gemini-test-pro", "location": "us-central1",
+                "requested_value": 100, "justification": "test", "contact_email": "ops@company.com",
+                "dryRun": True,
+            })
+            self.assertEqual(st, 200, q_res)
+            self.assertIs(q_res["dry_run"], True)
+            self.assertIsInstance(q_res["planned"], int)
+
 
 if __name__ == "__main__":
     unittest.main()

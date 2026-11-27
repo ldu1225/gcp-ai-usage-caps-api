@@ -532,6 +532,9 @@ def create_request(ctx) -> dict:
     """POST /v1/quota-requests {project_id | projects[], limit_id | quota_id+model+location, requested_value |
     increase_pct, justification, contact_email, dryRun?, force?}"""
     body = ctx.body or {}
+    dry_run = body.get("dryRun", body.get("dry_run", False))
+    if not isinstance(dry_run, bool):
+        raise ApiError("bad_request", "Field 'dryRun' must be a boolean.")
     projects = body.get("projects")
     if projects is not None:
         if not isinstance(projects, list) or not projects:
@@ -546,7 +549,9 @@ def create_request(ctx) -> dict:
                 results.append(_submit(ctx, row, dict(body)))
             except ApiError as err:
                 results.append({"project_id": p, "status": "failed", "error": err.code, "message": err.message[:300]})
-        return {"object": "bulk_result", "results": results,
+        return {"object": "bulk_result", "dry_run": dry_run,
+                "planned": sum(1 for r in results if r.get("status") == "dry_run"),
+                "results": results,
                 "submitted": sum(1 for r in results if r.get("status") not in ("failed", "dry_run")),
                 "failed": sum(1 for r in results if r.get("status") == "failed")}
     project = _require_managed(ctx, body.get("project_id"))

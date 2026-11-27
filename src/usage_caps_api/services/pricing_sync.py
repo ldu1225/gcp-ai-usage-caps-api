@@ -112,14 +112,16 @@ def catalog_entries(skus, service: str | None = None, excluded=()):
         yield key, direction, tier, threshold, rank, price, rate, eff, sku.get("name") or sku.get("skuId")
 
 
-def _collapse(candidates: dict, scale: float = 1e6) -> dict:
+def _collapse(candidates: dict, scale: float = 1e6, fx_rate: float = 1.0) -> dict:
     """{(key, tier, direction): [(rank, price, threshold, sku)]} -> {key: {input,..., tiers: {...}, skus: {...}}}."""
     out: dict = {}
+    fx = float(fx_rate) if fx_rate and fx_rate > 0 else 1.0
+    max_per_m = MAX_TOKEN_USD_PER_MILLION * (scale / 1e6) * fx
     for (key, tier, direction), items in candidates.items():
         best = min(r for r, _, _, _ in items)
         chosen = [it for it in items if it[0] == best]
         per_m = round(statistics.median(sorted(p for _, p, _, _ in chosen)) * scale, 6)
-        if not 0 < per_m <= MAX_TOKEN_USD_PER_MILLION * (scale / 1e6):
+        if not 0 < per_m <= max_per_m:
             continue
         entry = out.setdefault(key, {"source": "cloud_billing_catalog"})
         sku = next((s for _, _, _, s in chosen if s), None)
@@ -146,7 +148,7 @@ def _scan(ctx, services, currency: str):
         try:
             for key, direction, tier, threshold, rank, price, rate, eff, sku in catalog_entries(
                     _service_skus(ctx, svc["id"], currency), svc["name"], excluded):
-                if usd_rate is None and rate:
+                if usd_rate is None and rate and rate > 0:
                     usd_rate, effective = rate, eff
                 if key and price and price > 0:
                     candidates.setdefault((key, tier, direction), []).append((rank, price, threshold, sku))
@@ -159,47 +161,55 @@ def live_catalog_prices(ctx, currency: str = "USD"):
     learn_families(ctx)
     services = select_model_services(list_catalog_services(ctx), ctx.config)
     candidates, usd_rate, effective = _scan(ctx, services, currency)
-    return _collapse(candidates), usd_rate, effective
+    fx_rate = usd_rate if (str(currency or "USD").upper() != "USD" and usd_rate and usd_rate > 0) else 1.0
+    return _collapse(candidates, fx_rate=fx_rate), usd_rate, effective
 
 
 def sync_pricing(ctx) -> dict:
     """POST /v1/internal/pricing/sync: refreshes official Cloud Billing Catalog SKU prices & FX in `pricing`."""
+    from . import caps as caps_svc
     now = now_iso()
     learned = learn_families(ctx)
     services = select_model_services(list_catalog_services(ctx), ctx.config)
     candidates, _rate, _eff = _scan(ctx, services, "USD")
     models_out = _collapse(candidates)
 
-    # Fetch FX for configured non-USD currencies
-    cur = ((ctx.config.get("pricing") or {}).get("currency") or "USD").upper()
+    # Fetch FX for configured and active-policy non-USD currencies
+    currencies: list[str] = []
+    for raw_cur in ((ctx.config.get("pricing") or {}).get("currency"), caps_svc.effective_policy(ctx).get("currency")):
+        c = str(raw_cur or "USD").strip().upper()
+        if c and c != "USD" and c not in currencies:
+            currencies.append(c)
     rates: dict = {}
-    if cur != "USD" and services:
-        try:
-            data = ctx.rest("GET", "%s/services/%s/skus" % (pricing.CATALOG_V1, services[0]["id"]),
-                            params={"currencyCode": cur, "pageSize": 5}, timeout=30)
-            for sku in (data or {}).get("skus") or []:
-                info = ((sku.get("pricingInfo") or [None])[0]) or {}
-                r = to_float(info.get("currencyConversionRate"))
-                if r and r > 0:
-                    rates[cur] = {"rate": round(r, 6), "source": "cloud_billing_catalog", "as_of": info.get("effectiveTime") or now}
-                    break
-        except GcpError:
-            pass
-    if cur != "USD" and cur not in rates:
-        from . import webhooks as _wh
-        for url in (ctx.config.get("pricing") or {}).get("fx_sources") or []:
-            if not config.valid_https_url(url, check_dns=True):
-                continue
+    for cur in currencies:
+        if services:
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "GcpAiUsageCapsApi/1.2"})
-                with _wh._NO_REDIRECT_OPENER.open(req, timeout=10) as resp:  # pylint: disable=protected-access
-                    payload = json.loads(resp.read(512 * 1024).decode("utf-8"))
-                r = to_float((payload.get("rates") or {}).get(cur))
-                if r and r > 0:
-                    rates[cur] = {"rate": round(r, 6), "source": url, "as_of": now}
-                    break
-            except Exception:
-                continue
+                data = ctx.rest("GET", "%s/services/%s/skus" % (pricing.CATALOG_V1, services[0]["id"]),
+                                params={"currencyCode": cur, "pageSize": 5}, timeout=30)
+                for sku in (data or {}).get("skus") or []:
+                    info = ((sku.get("pricingInfo") or [None])[0]) or {}
+                    r = to_float(info.get("currencyConversionRate"))
+                    if r and r > 0:
+                        rates[cur] = {"rate": round(r, 6), "source": "cloud_billing_catalog",
+                                      "as_of": info.get("effectiveTime") or now}
+                        break
+            except GcpError:
+                pass
+        if cur not in rates:
+            from . import webhooks as _wh
+            for url in (ctx.config.get("pricing") or {}).get("fx_sources") or []:
+                if not config.valid_https_url(url, check_dns=True):
+                    continue
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "GcpAiUsageCapsApi/1.2"})
+                    with _wh._NO_REDIRECT_OPENER.open(req, timeout=10) as resp:  # pylint: disable=protected-access
+                        payload = json.loads(resp.read(512 * 1024).decode("utf-8"))
+                    r = to_float((payload.get("rates") or {}).get(cur))
+                    if r and r > 0:
+                        rates[cur] = {"rate": round(r, 6), "source": url, "as_of": now}
+                        break
+                except Exception:
+                    continue
 
     def save(doc):
         doc["synced_at"] = now

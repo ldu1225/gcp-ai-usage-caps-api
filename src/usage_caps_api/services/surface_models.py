@@ -284,16 +284,18 @@ def bulk_patch_app_models(ctx) -> dict:
         else:
             results.append({"app_id": "/".join(i), "status": "failed",
                             "error": getattr(val, "code", getattr(val, "kind", "error"))})
-    counts = {s: sum(1 for r in results if r.get("status") == s) for s in ("updated", "unchanged", "dry_run", "failed")}
+    counts = {s: sum(1 for r in results if r.get("status") == s) for s in ("updated", "unchanged", "failed")}
+    planned = sum(1 for r in results if r.get("status") == "dry_run")
     if counts["updated"]:
         if getattr(ctx.app, "cache", None) is not None:
             ctx.app.cache.clear("ge_models")
-        audit.write_audit(ctx, "ge_models.bulk_updated", target="*", details={"changes": updates, **counts})
+        audit.write_audit(ctx, "ge_models.bulk_updated", target="*",
+                          details={"changes": updates, "dry_run": dry_run, "planned": planned, **counts})
         webhooks.dispatch_event(ctx, "model.access_changed", {
             "surface": "gemini_enterprise", "target": "bulk", "changes": updates, "apps": counts["updated"],
             "actor": ctx.caller.id,
         })
-    return {"object": "bulk_result", "results": results, **counts}
+    return {"object": "bulk_result", "dry_run": dry_run, "planned": planned, "results": results, **counts}
 
 
 # ---------------------------------------------------------------------------

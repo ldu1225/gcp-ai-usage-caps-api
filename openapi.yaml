@@ -2462,8 +2462,10 @@ components:
         results: { type: array, items: { type: object } }
         applied: { type: integer }
         updated: { type: integer }
+        submitted: { type: integer }
         unchanged: { type: integer }
-        dry_run: { type: [integer, boolean] }
+        planned: { type: integer }
+        dry_run: { type: boolean }
         failed: { type: integer }
 
     ReadinessCheck:

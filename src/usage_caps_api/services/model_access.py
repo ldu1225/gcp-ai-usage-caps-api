@@ -761,10 +761,12 @@ def bulk_apply(ctx) -> dict:
         else:
             results.append({"scope": s, "status": "failed", "error": getattr(val, "code", getattr(val, "kind", "error")),
                             "message": getattr(val, "message", "")[:300]})
-    counts = {k: sum(1 for r in results if r["status"] == k) for k in ("applied", "unchanged", "dry_run", "failed")}
+    counts = {k: sum(1 for r in results if r["status"] == k) for k in ("applied", "unchanged", "failed")}
+    planned = sum(1 for r in results if r["status"] == "dry_run")
     audit.write_audit(ctx, "model_policy.bulk_applied", target="bulk",
-                      details={"scopes": len(scopes), "mode": req["mode"], "models": req["models"], **counts})
-    return {"object": "bulk_result", "dry_run": dry_run, "results": results, **counts}
+                      details={"scopes": len(scopes), "mode": req["mode"], "models": req["models"],
+                               "dry_run": dry_run, "planned": planned, **counts})
+    return {"object": "bulk_result", "dry_run": dry_run, "planned": planned, "results": results, **counts}
 
 
 def reconcile(ctx, *, dry_run: bool = False) -> dict:
