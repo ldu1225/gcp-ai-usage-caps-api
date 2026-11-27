@@ -305,6 +305,7 @@ def update_policy(ctx) -> dict:
 def _invalidate_caps_caches(ctx):
     if getattr(ctx.app, "cache", None) is not None:
         ctx.app.cache.clear("caps_status")
+        ctx.app.cache.clear("deny_policy")
     try:
         from . import usage_events
         usage_events.TRACKER.drop_snapshot()
@@ -656,7 +657,7 @@ def _compute_caps_status_uncached(ctx, *, fresh: bool = False, now: dt.datetime 
         "pricing": lambda: pricing_svc.resolve_pricing(ctx, policy),
     }
     if backend == "iam_deny":
-        tasks["deny"] = lambda: enforcers.read_state(ctx, client=deny_client)
+        tasks["deny"] = lambda: enforcers.read_state(ctx, client=deny_client, fresh=fresh)
     res = ctx.run(tasks)
 
     usage_res = res["usage"][1] if res["usage"][0] else usage_svc.UsageResult("unavailable")
@@ -664,7 +665,7 @@ def _compute_caps_status_uncached(ctx, *, fresh: bool = False, now: dt.datetime 
     deny_state = res["deny"][1] if ("deny" in res and res["deny"][0]) else enforcers.DenyState([])
     if backend == "iam_deny" and deny_state.attachments:
         extra = [enforcers.project_attachment(p) for p in _scoped_projects(state)]
-        deny_state = enforcers.extend_state(ctx, deny_state, [ap for ap in extra if ap], client=deny_client)
+        deny_state = enforcers.extend_state(ctx, deny_state, [ap for ap in extra if ap], client=deny_client, fresh=fresh)
 
     deny_by_person = deny_state.services_by_person if backend == "iam_deny" else {}
     deny_projects = deny_state.projects_by_person() if backend == "iam_deny" else {}

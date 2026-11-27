@@ -418,20 +418,20 @@ def _error_kind(err) -> str:
     return "internal_error"
 
 
-def _read_one(client: DenyPolicyClient, ap: str, pid: str) -> AttachmentState:
+def _read_one(client: DenyPolicyClient, ap: str, pid: str, *, fresh: bool = False) -> AttachmentState:
     try:
-        pol = client.get(ap, pid)
+        pol = client.get(ap, pid, fresh=fresh)
     except (GcpError, ValueError) as err:
         return AttachmentState(ap, error=_error_kind(err))
     return AttachmentState(ap) if pol is None else _state_of(ap, pol)
 
 
-def read_state(ctx, *, attachments=None, client: DenyPolicyClient | None = None) -> DenyState:
+def read_state(ctx, *, attachments=None, client: DenyPolicyClient | None = None, fresh: bool = False) -> DenyState:
     try:
         points = list(dict.fromkeys(attachments if attachments is not None else attachment_points(ctx)))
         client = client or DenyPolicyClient(ctx)
         pid = policy_id(ctx.config)
-        tasks = {ap: (lambda ap=ap: _read_one(client, ap, pid)) for ap in points}
+        tasks = {ap: (lambda ap=ap: _read_one(client, ap, pid, fresh=fresh)) for ap in points}
         results = ctx.run(tasks) if tasks else {}
     except Exception:  # pylint: disable=broad-except
         LOG.exception("deny policy state read failed")
@@ -472,13 +472,14 @@ def build_policy(desired_by_principal: dict[str, frozenset[str]], etag: str | No
     return pol
 
 
-def extend_state(ctx, state: DenyState, extra_points, *, client: DenyPolicyClient | None = None) -> DenyState:
+def extend_state(ctx, state: DenyState, extra_points, *, client: DenyPolicyClient | None = None,
+                 fresh: bool = False) -> DenyState:
     """Reads additional attachment points (e.g. project points for project-scoped blocks in folder mode)."""
     have = {st.attachment for st in state.attachments}
     missing = [ap for ap in dict.fromkeys(extra_points or ()) if ap not in have]
     if not missing:
         return state
-    more = read_state(ctx, attachments=missing, client=client)
+    more = read_state(ctx, attachments=missing, client=client, fresh=fresh)
     return DenyState(list(state.attachments) + list(more.attachments))
 
 

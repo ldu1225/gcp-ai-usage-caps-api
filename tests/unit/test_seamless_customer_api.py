@@ -132,12 +132,16 @@ class SeamlessCustomerApiTests(unittest.TestCase):
             payload, _ = caps_svc.compute_caps_status(ctx, fresh=True)
             self.assertIn("alice@company.com", payload["plan"]["block"])
 
-            # 4) Simulate Enforcer Job completing (direct IAM Deny apply)
-            enf = caps_svc.enforce_cycle(ctx, trigger="job", dry_run=False, use_job_if_configured=False)
+            # 4) Simulate an EXTERNAL Cloud Run Enforcer Job process writing IAM Deny directly in GCP
+            # (without touching this API server's in-memory cache!)
+            job_app, _ = build_test_app(cfg=cfg, gcp=fake_gcp)
+            job_app.store = app.store
+            job_ctx = svc_base.Ctx(job_app, job_app.config, caller)
+            enf = caps_svc.enforce_cycle(job_ctx, trigger="job", dry_run=False, use_job_if_configured=False)
             self.assertEqual(enf["result"], "success")
 
-            # 5) Now GET /v1/caps/users/{email} transitions cleanly from propagating -> enforced!
-            st, cap_after, _ = srv.request("GET", "/v1/caps/users/alice%40company.com", token=ADMIN)
+            # 5) ?fresh=true bypasses both caps_status AND deny_policy caches -> transitions propagating -> enforced!
+            st, cap_after, _ = srv.request("GET", "/v1/caps/users/alice%40company.com?fresh=true", token=ADMIN)
             self.assertEqual(st, 200)
             self.assertEqual(cap_after["blocked_projects"], {TEAM_B: ["gemini_platform"]})
             self.assertEqual(cap_after["enforcement_status"], "enforced")
