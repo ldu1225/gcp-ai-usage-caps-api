@@ -36,8 +36,8 @@ ENFORCEMENT_JOB_RE = re.compile(
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 VALID_SERVICES = ("antigravity", "gemini_platform", "gemini_enterprise")
-# `gemini_platform` = Gemini Platform (formerly Vertex AI / Agent Platform). The legacy surface id
-# `vertex_ai` is still accepted on input and in stored documents and is normalized to `gemini_platform`.
+# `gemini_platform` = Gemini Platform. Legacy surface ids (`vertex_ai`, `agent_platform`)
+# are still accepted on input and in stored documents and are normalized to `gemini_platform`.
 SERVICE_ALIASES = {"vertex_ai": "gemini_platform", "vertex": "gemini_platform", "agent_platform": "gemini_platform"}
 
 
