@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="openapi.yaml"><img alt="OpenAPI 3.1" src="https://img.shields.io/badge/OpenAPI-3.1-0B1F3A"></a>
-  <img alt="API 1.3.0" src="https://img.shields.io/badge/API-1.3.0-1A73E8">
+  <img alt="API 1.3.1" src="https://img.shields.io/badge/API-1.3.1-1A73E8">
   <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-0B1F3A">
   <img alt="Cloud Run" src="https://img.shields.io/badge/runtime-Cloud%20Run-1A73E8">
   <img alt="Terraform" src="https://img.shields.io/badge/IaC-Terraform-0B1F3A">
@@ -460,7 +460,7 @@ Error format: `{"error": {"type": "invalid_request_error", "code": "lockout_prev
 
 ## 14. Full endpoint reference
 
-Full specification: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API version 1.3.0, also served at `GET /v1/openapi.yaml`)
+Full specification: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API version 1.3.1, also served at `GET /v1/openapi.yaml`)
 
 | Area | Method | Path | Scope |
 |---|---|---|---|

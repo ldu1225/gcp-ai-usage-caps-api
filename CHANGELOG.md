@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.3.1] - 2026-11-27
+*고객사 포털 연동 마찰 제거 · 즉시 반영되는 차단 상태 · 정규화된 단가 · 응답 속도 개선*
+*Seamless customer-portal integration: immediate block visibility, canonical pricing, structured billing sync, faster reads*
+
+### 추가 (Added)
+- **차단 전파 상태**: 사용자 캡 응답(`GET /v1/caps/users`, `GET /v1/caps/users/{email}`, block/unblock)에 `enforcement_status`(`none` | `propagating` | `enforced`), `pending_blocked_services`, `pending_blocked_projects`, `projects[].enforcement_status` 추가. Enforcer Job이 IAM Deny v2를 쓰기 전에도 `blocked_services`/`blocked_projects`가 즉시 유효 값으로 반환됩니다.
+  *Effective block state is returned immediately while the Enforcer Job rolls out IAM Deny v2.*
+- **`billing_sync`**: `GET /v1/caps/projects`에 구조화된 결제 동기화 상태(`status`: `ok` | `disabled` | `not_configured` | `permission_required` | `error`, `message`, `billing_account`, `required_role`, `remediation`). 기존 `sync_error`는 유지.
+- **`/v1/pricing` 정규 필드**: 행마다 `model`(카탈로그 정규 id), `model_ids`, `input_per_1m_tokens`, `output_per_1m_tokens`, `cached_input_per_1m_tokens`, `cache_write_per_1m_tokens`. `?model=`은 하이픈/점 표기 id와 SKU 키를 모두 허용. 기존 짧은 키는 유지.
+- **OpenAPI 3.1 보강**: `POST /v1/admin/api-keys` 9개 scope 전체, `SafetyGate`, `EnforcePlan`, `EnforceResult`, `UserBlockResponse`, `UserUnblockResponse`, `PricingRow`, `BillingSync`, `ProjectSpendCapRow` 스키마, `?fresh` 파라미터.
+
+### 변경 (Changed)
+- **응답 속도**: 3개 서피스 사용량 병렬 수집 + 스탬피드 방지 TTL 캐시(`usage`, `caps_status`, 프로젝트 캡, Org Policy 원본). 모든 쓰기 작업에서 자동 무효화되며 `?fresh=true`로 우회. 실측(warm): `/v1/usage/users` 5.50s → 0.09s, `/v1/caps/users` 3.80s → 0.15s, `/v1/model-access` 1.13s → 0.07s, `/v1/caps/projects` 1.23s → 0.07s.
+- **`?fresh=true`의 IAM Deny 직접 재조회**: 별도 컨테이너인 Enforcer Job이 쓴 Deny 정책을 API가 즉시 읽도록 `fresh`를 `DenyPolicyClient`까지 전달하고, 캡 변경 시 `deny_policy` 캐시를 비웁니다.
+- **`scripts/deploy.sh`**: `gcloud billing accounts add-iam-policy-binding`이 IAM 정책 버전 불일치로 실패하면 Cloud Billing v1 REST `getIamPolicy`/`setIamPolicy`로 `roles/billing.costsManager`를 부여합니다.
+
+### 테스트 (Tests)
+- `tests/unit/test_seamless_customer_api.py` 추가. 오프라인 테스트 163개 통과.
+
 ## [1.3.0] - 2026-11-26
 *그룹을 일급 정책 주체로 · Gemini Platform 명칭 변경 · 문서와 다이어그램 재설계*
 *Groups as first-class policy subjects · Gemini Platform naming · redesigned docs and diagrams*

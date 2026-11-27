@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="openapi.yaml"><img alt="OpenAPI 3.1" src="https://img.shields.io/badge/OpenAPI-3.1-0B1F3A"></a>
-  <img alt="API 1.3.0" src="https://img.shields.io/badge/API-1.3.0-1A73E8">
+  <img alt="API 1.3.1" src="https://img.shields.io/badge/API-1.3.1-1A73E8">
   <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-0B1F3A">
   <img alt="Cloud Run" src="https://img.shields.io/badge/runtime-Cloud%20Run-1A73E8">
   <img alt="Terraform" src="https://img.shields.io/badge/IaC-Terraform-0B1F3A">
@@ -460,7 +460,7 @@ print(c.request("GET", "/v1/users/alice%40company.com/groups")["effective_cap_ru
 
 ## 14. API 엔드포인트 전체 목록
 
-전체 스펙: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API 버전 1.3.0, `GET /v1/openapi.yaml`로도 제공)
+전체 스펙: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API 버전 1.3.1, `GET /v1/openapi.yaml`로도 제공)
 
 | 영역 | 메서드 | 경로 | Scope |
 |---|---|---|---|

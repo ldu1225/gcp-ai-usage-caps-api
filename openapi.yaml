@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: GCP AI Usage & Spend Caps API
-  version: 1.3.0
+  version: 1.3.1
   description: |
     Headless M2M REST API for enterprise AI management portals to query per-user Google Cloud AI
     usage & estimated costs (Antigravity, Gemini Platform,
