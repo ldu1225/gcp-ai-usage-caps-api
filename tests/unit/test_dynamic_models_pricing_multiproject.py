@@ -128,7 +128,7 @@ class ObservationBaselineTests(_Base):
         self.assertEqual(self.events("model.first_seen"), [])
         self.assertIn("gemini-test-ultra", self.app.store.load("model_catalog")[0]["observed"])
         self.gcp.log_entries.append(make_inference_entry("erin@company.com", model="gemini-test-mega"))
-        usage.collect_usage(ctx, now - dt.timedelta(hours=1), now + dt.timedelta(minutes=1))
+        usage.collect_usage(ctx, now - dt.timedelta(hours=1), now + dt.timedelta(minutes=1), fresh=True)
         self.assertEqual([e["data"]["model"] for e in self.events("model.first_seen")], ["gemini-test-mega"])
 
 

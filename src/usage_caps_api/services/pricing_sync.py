@@ -233,23 +233,103 @@ def sync_pricing(ctx) -> dict:
     }
 
 
+def _catalog_model_ids_by_key(ctx) -> dict[str, list[str]]:
+    """Maps normalized SKU `model_key` -> matching live catalog / observed model IDs (canonical active ID first)."""
+    try:
+        doc, _ = ctx.store.load("model_catalog")
+    except Exception:  # pylint: disable=broad-except
+        return {}
+    buckets: dict[str, list[tuple[int, str]]] = {}
+    for mid, entry in (doc.get("models") or {}).items():
+        if not isinstance(mid, str) or not mid:
+            continue
+        k = mc.normalize_model_id(mid)
+        if not k:
+            continue
+        rank = 2 if (isinstance(entry, dict) and entry.get("delisted_at")) else 0
+        buckets.setdefault(k, []).append((rank, mid))
+    for mid in (doc.get("observed") or {}):
+        if not isinstance(mid, str) or not mid:
+            continue
+        k = mc.normalize_model_id(mid)
+        if not k:
+            continue
+        buckets.setdefault(k, []).append((1, mid))
+    out: dict[str, list[str]] = {}
+    for k, items in buckets.items():
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for _rank, mid in sorted(items, key=lambda x: (x[0], len(x[1]), x[1])):
+            if mid not in seen:
+                seen.add(mid)
+                ordered.append(mid)
+        out[k] = ordered
+    return out
+
+
+def _matches_model_query(want: str, want_norm: str, key: str, model_ids: list[str]) -> bool:
+    if not want:
+        return True
+    if want in key:
+        return True
+    if want_norm and (want_norm == key or want_norm in key):
+        return True
+    for mid in model_ids:
+        low = mid.lower()
+        if want in low or (want_norm and mc.normalize_model_id(low) == want_norm):
+            return True
+    return False
+
+
+def _pricing_row(key: str, *, source, model_ids: list[str], pin, pout, pcached, pcache_write,
+                 tiers: dict, skus: dict) -> dict:
+    return {
+        "model": model_ids[0] if model_ids else key,
+        "model_key": key,
+        "model_ids": list(model_ids),
+        "source": source,
+        "input": pin,
+        "output": pout,
+        "cached": pcached,
+        "cache_write": pcache_write,
+        "input_per_1m_tokens": pin,
+        "output_per_1m_tokens": pout,
+        "cached_input_per_1m_tokens": pcached,
+        "cache_write_per_1m_tokens": pcache_write,
+        "tiers": tiers,
+        "skus": skus,
+    }
+
+
 def get_pricing(ctx) -> dict:
     """GET /v1/pricing?model=: the official SKU price table actually used for cost estimates."""
     from . import caps as caps_svc
     pr = pricing.resolve_pricing(ctx, caps_svc.effective_policy(ctx))
     want = (ctx.params.get("model") or "").strip().lower()
+    want_norm = mc.normalize_model_id(want) if want else ""
+    by_key = _catalog_model_ids_by_key(ctx)
     rows = []
     table = pr.table
     for key, entry in sorted(((table.prices if table else {}) or {}).items()):
-        if want and want not in key and mc.normalize_model_id(want) != key:
+        mids = by_key.get(key) or []
+        if not _matches_model_query(want, want_norm, key, mids):
             continue
-        rows.append({"model_key": key, "source": entry.get("source"),
-                     **{d: entry.get(d) for d in pricing.DIRECTIONS},
-                     "tiers": entry.get("tiers") or {}, "skus": entry.get("skus") or {}})
+        rows.append(_pricing_row(
+            key, source=entry.get("source"), model_ids=mids,
+            pin=entry.get("input"), pout=entry.get("output"),
+            pcached=entry.get("cached"), pcache_write=entry.get("cache_write"),
+            tiers=entry.get("tiers") or {}, skus=entry.get("skus") or {},
+        ))
     for prefix, pin, pout in pr.models:
-        if not want or want in prefix:
-            rows.append({"model_key": prefix, "source": "override", "input": pin, "output": pout,
-                         "cached": next((c for p, c in pr.cached_models if p == prefix), None),
-                         "cache_write": None, "tiers": {}, "skus": {}})
+        okey = mc.normalize_model_id(prefix)
+        mids = by_key.get(okey) or []
+        if not _matches_model_query(want, want_norm, prefix, mids):
+            continue
+        pcached = next((c for p, c in pr.cached_models if p == prefix), None)
+        rows.append(_pricing_row(
+            prefix, source="override", model_ids=mids,
+            pin=pin, pout=pout, pcached=pcached, pcache_write=None,
+            tiers={}, skus={},
+        ))
     return {"object": "pricing_table", "currency": pr.currency, "unit": "per_1m_tokens",
             "pricing_source": pricing.source_summary(pr), "fx": table.fx if table else None, "data": rows}

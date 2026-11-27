@@ -121,9 +121,7 @@ else
   done
 fi
 if [[ "$SPEND_CAPS" == "true" && -n "$BILLING_ACCOUNT" ]]; then
-  run_quiet gcloud billing accounts add-iam-policy-binding "$BILLING_ACCOUNT" \
-    --member="$API_MEMBER" --role="roles/billing.costsManager" --quiet 2>/dev/null || \
-    warn "Could not grant roles/billing.costsManager on billing account ${BILLING_ACCOUNT}; grant it manually for /v1/caps/projects"
+  grant_billing_account_role "$BILLING_ACCOUNT" "$API_MEMBER" "roles/billing.costsManager" || true
 fi
 
 log "5/9 GCS state bucket & bootstrap Admin API key"

@@ -421,6 +421,58 @@ grant_folder_role() {  # grant_folder_role FOLDER MEMBER ROLE
     --quiet || warn "could not grant $3 to $2 on folder $1"
 }
 
+grant_billing_account_role() {  # grant_billing_account_role BILLING_ACCOUNT MEMBER ROLE
+  local acct="$1" member="$2" role="$3"
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    echo "[dry-run] grant ${role} to ${member} on billingAccounts/${acct}"
+    return 0
+  fi
+  if gcloud billing accounts add-iam-policy-binding "$acct" --member="$member" --role="$role" --quiet >/dev/null 2>&1; then
+    return 0
+  fi
+  # Newer gcloud versions send IAM policy version 3, which Cloud Billing v1 rejects with INVALID_ARGUMENT.
+  # Fall back to the Cloud Billing v1 REST :getIamPolicy / :setIamPolicy endpoints directly.
+  if command -v python3 >/dev/null; then
+    local token
+    token="$(gcloud auth print-access-token 2>/dev/null || true)"
+    if [[ -n "$token" ]] && BILLING_ACCESS_TOKEN="$token" python3 - "$acct" "$member" "$role" <<'PY'
+import json, os, sys, urllib.error, urllib.request
+acct, member, role = sys.argv[1], sys.argv[2], sys.argv[3]
+base = "https://cloudbilling.googleapis.com/v1/billingAccounts/" + acct
+hdrs = {"Authorization": "Bearer " + os.environ["BILLING_ACCESS_TOKEN"], "Content-Type": "application/json"}
+try:
+    with urllib.request.urlopen(urllib.request.Request(base + ":getIamPolicy", headers=hdrs), timeout=20) as r:
+        pol = json.loads(r.read().decode("utf-8"))
+except urllib.error.URLError:
+    sys.exit(1)
+bindings = list(pol.get("bindings") or [])
+for b in bindings:
+    if b.get("role") == role:
+        members = list(b.get("members") or [])
+        if member in members:
+            sys.exit(0)
+        members.append(member)
+        b["members"] = members
+        break
+else:
+    bindings.append({"role": role, "members": [member]})
+pol["bindings"] = bindings
+body = json.dumps({"policy": pol}).encode("utf-8")
+try:
+    req = urllib.request.Request(base + ":setIamPolicy", data=body, headers=hdrs, method="POST")
+    with urllib.request.urlopen(req, timeout=20):
+        sys.exit(0)
+except urllib.error.URLError:
+    sys.exit(1)
+PY
+    then
+      return 0
+    fi
+  fi
+  warn "Could not grant ${role} on billing account ${acct}; grant it manually (requires Billing Account Admin) for /v1/caps/projects"
+  return 1
+}
+
 detect_org_id() {
   [[ -n "$ORG_ID" ]] && return 0
   if [[ -n "${PREFLIGHT_ORG_ID:-}" ]]; then

@@ -23,7 +23,7 @@ info:
       Cloud Billing Catalog SKU prices (input / output incl. thinking / cached / cache-write, long-context,
       Flex / Priority / Batch tiers) or contract overrides. The Cloud Billing export is never read; amounts
       are list-price estimates (credits, CUDs and taxes excluded). See `GET /v1/pricing`.
-    - **Gemini Platform per-user attribution**: Gemini Platform (formerly Gemini Platform) inference logs carry only a service-account principal.
+    - **Gemini Platform per-user attribution**: Gemini Platform inference logs carry only a service-account principal.
       Portals should send the header `x-goog-agent-platform-observability-label-user: <email|uid>`; otherwise
       tokens are split across same-minute Data Access audit callers, and anything left is reported as
       project-level `unattributed` usage (never dropped).
@@ -443,6 +443,9 @@ paths:
       responses:
         "200":
           description: User block recorded and enforced
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserBlockResponse" }
 
   /v1/users/{email}/unblock:
     post:
@@ -472,6 +475,9 @@ paths:
       responses:
         "200":
           description: User unblocked
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserUnblockResponse" }
 
   /v1/caps/enforce:
     post:
@@ -488,6 +494,9 @@ paths:
       responses:
         "200":
           description: Enforcement run outcome including safety gates G1-G7 and execution plan
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EnforceResult" }
 
   # ---------------------------------------------------------------------------
   # Groups: first-class policy subjects (same capabilities as users)
@@ -803,9 +812,28 @@ paths:
       tags: [Project Spend Caps]
       summary: List project-level spend cap configs and Cloud Billing Spend Cap states
       description: Requires scope `caps:read`.
+      parameters:
+        - name: fresh
+          in: query
+          schema: { type: boolean, default: false, description: "Bypass cached Cloud Billing budget state and read live" }
       responses:
         "200":
           description: Project spend cap status list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [list] }
+                  spend_caps_enabled: { type: boolean }
+                  billing_account_configured: { type: boolean }
+                  billing_currency: { type: ["string", "null"] }
+                  sync_error: { type: ["string", "null"] }
+                  billing_sync: { $ref: "#/components/schemas/BillingSync" }
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/ProjectSpendCapRow" }
+                  total: { type: integer }
 
   /v1/caps/projects/{project_id}:
     put:
@@ -927,7 +955,7 @@ paths:
                 name: { type: string, maxLength: 120 }
                 scopes:
                   type: array
-                  items: { type: string, enum: [usage:read, caps:read, caps:write, users:write, admin] }
+                  items: { type: string, enum: [usage:read, caps:read, caps:write, users:write, models:read, models:write, quotas:read, quotas:write, admin] }
                 expires_at: { type: ["string", "null"], format: date-time }
       responses:
         "201":
@@ -1121,6 +1149,7 @@ paths:
       description: Requires `models:read`. One entry per managed project (+ configured folders/organization).
       parameters:
         - { name: scope_type, in: query, schema: { type: string, enum: [projects, folders, organizations] } }
+        - { name: fresh, in: query, schema: { type: boolean, default: false }, description: Bypass cached Org Policy reads }
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Cursor"
       responses:
@@ -1659,9 +1688,11 @@ paths:
       tags: [Usage & Billing]
       summary: Official SKU price table used for cost estimates (no Billing Export)
       description: |
-        Requires `usage:read` or `models:read`. Per model key: input / output / cached / cache_write prices per 1M tokens,
-        long-context / flex / priority / batch tiers and the Cloud Billing Catalog SKU names they come from, plus
-        contract overrides. Refreshed daily by `POST /v1/internal/pricing/sync`.
+        Requires `usage:read` or `models:read`. Per model: canonical `model` ID (matching `GET /v1/models`),
+        `model_ids` (all catalog/observed IDs sharing this SKU key), normalized `model_key`, input / output / cached /
+        cache_write prices per 1M tokens (both `*_per_1m_tokens` and legacy short keys), long-context / flex / priority
+        / batch tiers and Cloud Billing Catalog SKU names, plus contract overrides. `?model=` accepts canonical catalog
+        IDs (with hyphens or dots) or normalized SKU keys. Refreshed daily by `POST /v1/internal/pricing/sync`.
       parameters:
         - { name: model, in: query, schema: { type: string } }
       responses:
@@ -1677,7 +1708,7 @@ paths:
                   unit: { type: string, enum: [per_1m_tokens] }
                   pricing_source: { $ref: "#/components/schemas/PricingSource" }
                   fx: { type: ["object", "null"] }
-                  data: { type: array, items: { type: object } }
+                  data: { type: array, items: { $ref: "#/components/schemas/PricingRow" } }
 
   /v1/projects/{project_id}/vertex-logging:
     get:
@@ -1960,6 +1991,10 @@ components:
         usage: { type: object }
         remaining: { type: ["object", "null"] }
         blocked_services: { type: array, items: { type: string } }
+        enforcement_status:
+          type: string
+          enum: [none, propagating, enforced]
+          description: "none = not blocked; propagating = block saved and IAM Deny v2 rollout in progress; enforced = live in IAM Deny v2"
 
     PricingSource:
       type: object
@@ -1972,6 +2007,47 @@ components:
         override_models: { type: integer }
         provisioned_throughput: { type: ["string", "null"], enum: [on_demand, zero, null] }
         currency: { type: ["string", "null"] }
+
+    PricingRow:
+      type: object
+      properties:
+        model: { type: string, description: "Canonical model ID matching GET /v1/models (falls back to model_key when unobserved)" }
+        model_key: { type: string, description: "Normalized Cloud Billing SKU model key" }
+        model_ids: { type: array, items: { type: string }, description: "All catalog and observed model IDs mapped to this SKU key" }
+        source: { type: ["string", "null"], description: "cloud_billing_catalog | override" }
+        input: { type: ["number", "null"] }
+        output: { type: ["number", "null"] }
+        cached: { type: ["number", "null"] }
+        cache_write: { type: ["number", "null"] }
+        input_per_1m_tokens: { type: ["number", "null"] }
+        output_per_1m_tokens: { type: ["number", "null"] }
+        cached_input_per_1m_tokens: { type: ["number", "null"] }
+        cache_write_per_1m_tokens: { type: ["number", "null"] }
+        tiers: { type: object, description: "long_context / flex / priority / batch official SKU prices" }
+        skus: { type: object, description: "Official Cloud Billing Catalog SKU names used" }
+
+    BillingSync:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, disabled, not_configured, permission_required, error] }
+        message: { type: ["string", "null"] }
+        billing_account: { type: ["string", "null"] }
+        required_role: { type: ["string", "null"], example: roles/billing.costsManager }
+        remediation: { type: ["string", "null"] }
+
+    ProjectSpendCapRow:
+      type: object
+      properties:
+        project_id: { type: string }
+        in_workspace: { type: boolean }
+        configured: { type: ["object", "null"] }
+        cloud_billing_spend_cap:
+          type: ["object", "null"]
+          properties:
+            budget: { type: string }
+            amount: { type: ["number", "null"] }
+            currency: { type: ["string", "null"] }
+            state: { type: ["string", "null"], enum: [STATE_UNSPECIFIED, CONFIGURED, ENFORCED, AWAITING_NEXT_PERIOD, null] }
 
     Telemetry:
       type: object
@@ -2091,7 +2167,19 @@ components:
           items: { type: string, enum: [antigravity, gemini_platform, gemini_enterprise] }
         blocked_projects:
           type: object
-          description: "Project-scoped IAM Deny entries {project_id: [services]}"
+          description: "Effective project-scoped blocks {project_id: [services]} (includes blocks currently propagating to IAM Deny v2)"
+          additionalProperties: { type: array, items: { type: string } }
+        enforcement_status:
+          type: string
+          enum: [none, propagating, enforced]
+          description: "none = not blocked; propagating = block saved and IAM Deny v2 rollout in progress; enforced = live in IAM Deny v2"
+        pending_blocked_services:
+          type: array
+          items: { type: string, enum: [antigravity, gemini_platform, gemini_enterprise] }
+          description: "Global service blocks not yet reflected in live IAM Deny v2"
+        pending_blocked_projects:
+          type: object
+          description: "Project-scoped service blocks not yet reflected in live IAM Deny v2 {project_id: [services]}"
           additionalProperties: { type: array, items: { type: string } }
         over_cap: { type: ["boolean", "null"] }
         over_scope:
@@ -2123,6 +2211,79 @@ components:
         remaining: { type: object }
         restore_at: { type: ["string", "null"], format: date-time }
         rule: { type: ["object", "null"] }
+
+    UserBlockResponse:
+      type: object
+      properties:
+        object: { type: string, enum: [user_block] }
+        email: { type: string }
+        status: { type: string, enum: [blocked] }
+        blocked_services: { type: array, items: { $ref: "#/components/schemas/Surface" } }
+        projects: { type: ["array", "null"], items: { type: string } }
+        scope: { type: string, enum: [all, projects] }
+        reason: { type: ["string", "null"] }
+        until: { type: ["string", "null"], format: date-time }
+        enforcement: { type: object }
+
+    UserUnblockResponse:
+      type: object
+      properties:
+        object: { type: string, enum: [user_unblock] }
+        email: { type: string }
+        status: { type: string, enum: [active, blocked] }
+        blocked_services: { type: array, items: { $ref: "#/components/schemas/Surface" } }
+        blocked_projects: { type: ["array", "null"], items: { type: string } }
+        unblocked_projects: { type: ["array", "null"], items: { type: string } }
+        remaining_group_blocks: { type: array, items: { type: string } }
+        hint: { type: ["string", "null"] }
+        reason: { type: ["string", "null"] }
+        enforcement: { type: object }
+
+    SafetyGate:
+      type: object
+      properties:
+        id:
+          type: string
+          example: G1_POLICY_READABLE
+          description: "Safety gate identifier (G1_POLICY_READABLE .. G7_SURGE_GUARD)"
+        status: { type: string, enum: [pass, warn, fail] }
+        detail: { type: string }
+
+    EnforcePlan:
+      type: object
+      properties:
+        suspend: { type: array, items: { type: string } }
+        suspend_projects:
+          type: object
+          additionalProperties: { type: array, items: { type: string } }
+        block: { type: array, items: { type: string } }
+        restore: { type: array, items: { type: string } }
+        review: { type: array, items: { type: string } }
+        deferred: { type: array, items: { type: string } }
+        capacity_held: { type: array, items: { type: string } }
+        withheld_restores: { type: boolean }
+        change_budget: { type: integer }
+        aborted: { type: boolean }
+        abort_reason: { type: ["string", "null"] }
+
+    EnforceResult:
+      type: object
+      properties:
+        object: { type: string, enum: [enforcement_run] }
+        trigger: { type: string }
+        mode: { type: string, enum: [dry_run, apply] }
+        backend: { type: string, enum: [iam_deny, notify_only] }
+        enforcement_mode: { type: string, enum: [manual, auto] }
+        executed: { type: boolean }
+        result: { type: string, description: "dry_run | aborted | notify_only | job_started | success | failed | breakglass_restored" }
+        job: { type: ["object", "null"] }
+        gates:
+          type: array
+          items: { $ref: "#/components/schemas/SafetyGate" }
+        plan: { $ref: "#/components/schemas/EnforcePlan" }
+        changes: { type: array, items: { type: object } }
+        deny_apply: { type: ["object", "null"] }
+        governance: { type: ["object", "null"] }
 
     ListEnvelope:
       type: object

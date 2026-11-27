@@ -470,6 +470,7 @@ def apply_violations(ctx, found: list[dict], *, trigger: str, dry_run: bool = Fa
                 enforcement = caps_svc._reconcile_direct_change(ctx, policy, doc)  # pylint: disable=protected-access
             except Exception as err:  # pylint: disable=broad-except
                 enforcement = {"applied": False, "error": type(err).__name__}
+            caps_svc._invalidate_caps_caches(ctx)  # pylint: disable=protected-access
     result["enforcement"] = enforcement
     for _, _, rec in records:
         if rec["action"] == "already_blocked":
@@ -513,7 +514,7 @@ def evaluate_all(ctx, *, dry_run: bool = False, now: dt.datetime | None = None, 
     need_month = any(any(k.startswith("monthly") for lim in (r or {}).get("limits") or [] for k in lim)
                      for r in [state["default"], *state["rules"].values(), *state["group_rules"].values()] if r)
     day_usage = usage_svc.collect_usage(ctx.child(params={}), day_start, now, fresh=True)
-    month_usage = usage_svc.collect_usage(ctx.child(params={}), period["start"], now) if need_month else None
+    month_usage = usage_svc.collect_usage(ctx.child(params={}), period["start"], now, fresh=True) if need_month else None
     pricing = pricing_svc.resolve_pricing(ctx, policy) if need_month else None
     people = set(day_usage.users) | set((month_usage.users if month_usage else {}))
     found = []

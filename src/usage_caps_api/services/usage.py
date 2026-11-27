@@ -24,6 +24,7 @@ they are used, without any built-in model list.
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import logging
 import re
@@ -1128,9 +1129,9 @@ def _vertex_audit_only(ctx, audit_rows: list[dict], *, email: str | None, rng) -
     return usage
 
 
-def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None = None, rng=None,
-                 fresh: bool = False, directory: dict | None = None) -> UsageResult:
-    """Gemini Platform usage with tokens from inference request logs and per-user attribution (see module docstring)."""
+def _fetch_vertex_raw(ctx, start: dt.datetime, end: dt.datetime, *,
+                      fresh: bool = False) -> tuple[list[dict] | None, list[dict] | None, bool]:
+    """Fetches raw Gemini Platform inference request rows and Data Access audit rows (I/O only)."""
     mode = (ctx.config.get("caps") or {}).get("usage_source") or "auto"
     inf_rows = audit_rows = None
     truncated = False
@@ -1204,6 +1205,12 @@ def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None
                 truncated = truncated or tail_trunc
             except GcpError:
                 pass
+    return inf_rows, audit_rows, truncated
+
+
+def _build_vertex_usage(ctx, inf_rows: list[dict] | None, audit_rows: list[dict] | None, truncated: bool, *,
+                        email: str | None = None, rng=None, directory: dict | None = None) -> UsageResult:
+    """Attributes raw Gemini Platform inference/audit rows into a UsageResult (CPU-only)."""
     if not inf_rows:
         # No inference request entries while audit logs show Gemini Platform calls -> logging is not enabled / routed.
         if audit_rows:
@@ -1242,6 +1249,13 @@ def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None
     usage.token_sources["gemini_platform"] = "logs"
     usage.ok = True
     return usage
+
+
+def vertex_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None = None, rng=None,
+                 fresh: bool = False, directory: dict | None = None) -> UsageResult:
+    """Gemini Platform usage with tokens from inference request logs and per-user attribution (see module docstring)."""
+    inf_rows, audit_rows, truncated = _fetch_vertex_raw(ctx, start, end, fresh=fresh)
+    return _build_vertex_usage(ctx, inf_rows, audit_rows, truncated, email=email, rng=rng, directory=directory)
 
 
 # ---------------------------------------------------------------------------
@@ -1350,38 +1364,52 @@ def _gemini_enterprise_usage(ctx, start: dt.datetime, end: dt.datetime, *, email
     return merged
 
 
-def collect_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None = None,
-                  rng=None, surface: str | None = None, fresh: bool = False,
-                  surfaces: list[str] | tuple[str, ...] | None = None) -> UsageResult:
-    """Collects unified usage across Antigravity, Gemini Platform and Gemini Enterprise (logs only)."""
-    wanted = set(surfaces) if surfaces else set(config.VALID_SERVICES)
-    if surface not in (None, "", "all"):
-        wanted &= {surface}
+def _usage_cache_ttl(ctx) -> float:
+    srv_ttl = (ctx.config.get("server") or {}).get("cache_ttl_seconds")
+    if srv_ttl is None:
+        return 120.0
+    return max(0.0, float(srv_ttl))
+
+
+def _collect_usage_uncached(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None = None,
+                            rng=None, wanted: set[str] | None = None, fresh: bool = False) -> UsageResult:
+    """Fetches all requested AI surfaces in parallel, then attributes Gemini Platform header labels."""
+    wanted = set(wanted) if wanted is not None else set(config.VALID_SERVICES)
     tasks = {}
     if "antigravity" in wanted:
         tasks["antigravity"] = lambda: antigravity_usage(ctx, start, end, email=email, rng=rng, fresh=fresh)
     if "gemini_enterprise" in wanted:
         tasks["gemini_enterprise"] = lambda: _gemini_enterprise_usage(ctx, start, end, email=email, rng=rng)
+    if "gemini_platform" in wanted:
+        tasks["gemini_platform"] = lambda: _fetch_vertex_raw(ctx, start, end, fresh=fresh)
     res = ctx.run(tasks)
     combined = UsageResult("combined")
     any_ok = False
-    for _name, (ok, val) in res.items():
+    for name in ("antigravity", "gemini_enterprise"):
+        if name not in res:
+            continue
+        ok, val = res[name]
         if ok and isinstance(val, UsageResult) and val.ok:
             any_ok = True
             combined.merge(val)
-    if "gemini_platform" in wanted:
-        # Runs after the other surfaces so header-label uids can be resolved against every person already seen.
-        try:
-            vx = vertex_usage(ctx, start, end, email=email, rng=rng, fresh=fresh,
-                              directory=user_directory(ctx, set(combined.users)))
-        except GcpError as err:
-            ctx.warn_error("gemini_platform", err, "Gemini Platform usage")
-            vx = None
-        if vx is not None and vx.ok:
-            any_ok = True
-            combined.merge(vx)
-        elif vx is not None:
-            combined.token_sources.update(vx.token_sources)
+    if "gemini_platform" in res:
+        ok, val = res["gemini_platform"]
+        if ok:
+            inf_rows, audit_rows, truncated = val
+            extra_people = set(combined.users) | {
+                identity.person_key(a.get("email")) for a in (audit_rows or []) if a.get("email")
+            }
+            vx = _build_vertex_usage(
+                ctx, inf_rows, audit_rows, truncated,
+                email=email, rng=rng, directory=user_directory(ctx, extra_people),
+            )
+            if vx.ok:
+                any_ok = True
+                combined.merge(vx)
+            else:
+                combined.token_sources.update(vx.token_sources)
+        else:
+            ctx.warn_error("gemini_platform", val, "Gemini Platform usage")
     combined.ok = any_ok
     if any_ok and not email:
         remember_people(ctx, combined.users.keys())
@@ -1391,6 +1419,56 @@ def collect_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | Non
         except Exception as err:  # pylint: disable=broad-except
             LOG.debug("model observation skipped: %s", type(err).__name__)
     return combined
+
+
+def collect_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | None = None,
+                  rng=None, surface: str | None = None, fresh: bool = False,
+                  surfaces: list[str] | tuple[str, ...] | None = None) -> UsageResult:
+    """Collects unified usage across Antigravity, Gemini Platform and Gemini Enterprise (logs only).
+
+    Uses stampede-coalesced TTL caching (`server.cache_ttl_seconds`) when `fresh=False`; `fresh=True`
+    bypasses the cache, merges live Cloud Logging tail entries, and refreshes the cached snapshot.
+    """
+    wanted = set(surfaces) if surfaces else set(config.VALID_SERVICES)
+    if surface not in (None, "", "all"):
+        wanted &= {surface}
+    cache = getattr(ctx.app, "cache", None)
+    ttl = _usage_cache_ttl(ctx)
+    start_m = _minute(start)
+    end_m = _minute(end)
+    ckey = (
+        "usage",
+        ctx.version,
+        tuple(ctx.projects),
+        start_m.isoformat() if start_m else "",
+        end_m.isoformat() if end_m else "",
+        email or "",
+        tuple(sorted(wanted)),
+        (rng.start.isoformat(), rng.end.isoformat(), rng.granularity, rng.tz_name) if rng is not None else None,
+    )
+
+    def compute():
+        sub = ctx.child()
+        usage = _collect_usage_uncached(sub, start, end, email=email, rng=rng, wanted=wanted, fresh=fresh)
+        return usage, set(sub.sources), list(sub.warnings)
+
+    if cache is not None and ttl > 0:
+        if fresh:
+            usage, sources, warnings = compute()
+            if usage.ok:
+                cache.set(ckey, (usage, sources, warnings), ttl)
+        else:
+            (usage, sources, warnings), _ = cache.get_or_compute(
+                ckey, ttl, compute, cacheable=lambda item: bool(item[0].ok),
+            )
+    else:
+        usage, sources, warnings = compute()
+
+    for s in sources:
+        ctx.add_source(s)
+    for w in warnings:
+        ctx.warn(w["source"], w["code"], w["message"])
+    return copy.deepcopy(usage)
 
 
 # ---------------------------------------------------------------------------

@@ -532,6 +532,7 @@ def apply_policy(ctx, scope: str, req: dict, *, dry_run: bool, if_match: str | N
     _save_intent(ctx, scope, None if req["mode"] == "inherit" else intent)
     if getattr(ctx.app, "cache", None) is not None:
         ctx.app.cache.clear("model_policy_eff")
+        ctx.app.cache.clear("model_policy_raw")
     op = operations.create(ctx, "model_access.update", target=scope,
                            detail="Organization Policy %s updated; enforcement typically within minutes (up to ~15)."
                                   % CONSTRAINT,
@@ -579,15 +580,31 @@ def _dry_run(ctx) -> bool:
     return raw
 
 
+def _read_policy_cached(ctx, scope: str, *, fresh: bool = False) -> dict:
+    srv_ttl = (ctx.config.get("server") or {}).get("cache_ttl_seconds")
+    ttl = 0.0 if (srv_ttl is not None and float(srv_ttl) <= 0) else min(
+        60.0, float(srv_ttl) if srv_ttl is not None else 60.0)
+    cache = getattr(ctx.app, "cache", None)
+    if fresh or cache is None or ttl <= 0:
+        parsed = parse_policy(read_policy(ctx, scope))
+        if cache is not None and ttl > 0:
+            cache.set(("model_policy_raw", ctx.version, scope), parsed, ttl)
+        return parsed
+    val, _ = cache.get_or_compute(("model_policy_raw", ctx.version, scope), ttl,
+                                  lambda: parse_policy(read_policy(ctx, scope)))
+    return val
+
+
 def list_policies(ctx) -> dict:
-    """GET /v1/model-access?scope_type=&limit=&cursor="""
+    """GET /v1/model-access?scope_type=&fresh=&limit=&cursor="""
     stype = (ctx.params.get("scope_type") or "").strip().lower()
+    fresh = str(ctx.params.get("fresh") or "").lower() in ("1", "true")
     scopes = managed_scopes(ctx)
     if stype:
         scopes = [s for s in scopes if s.startswith(stype + "/")]
     page = paginate_list(scopes, ctx.params, default_limit=50, max_limit=200)
     catalog = reg.load_catalog(ctx)
-    tasks = {s: (lambda s=s: (parse_policy(read_policy(ctx, s)), _intent(ctx, s))) for s in page["data"]}
+    tasks = {s: (lambda s=s: (_read_policy_cached(ctx, s, fresh=fresh), _intent(ctx, s))) for s in page["data"]}
     outcomes = ctx.run(tasks) if tasks else {}
     data = []
     for s in page["data"]:

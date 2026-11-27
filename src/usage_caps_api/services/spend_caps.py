@@ -11,6 +11,7 @@ Manages Cloud Billing spend cap budgets for workspace projects targeting Gemini 
 
 from __future__ import annotations
 
+import copy
 import decimal
 import logging
 import re
@@ -39,6 +40,7 @@ AWAITING_NEXT_PERIOD = "AWAITING_NEXT_PERIOD"
 STATES = ("STATE_UNSPECIFIED", CONFIGURED, ENFORCED, AWAITING_NEXT_PERIOD)
 MAX_AMOUNT = 1e9
 LOOKUP_TTL = 24 * 3600
+LIVE_CAPS_TTL = 60
 
 SERVICE_RE = re.compile(r"services/[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}")
 BUDGET_NAME_RE = re.compile(r"billingAccounts/([0-9A-Fa-f]{6}-[0-9A-Fa-f]{6}-[0-9A-Fa-f]{6})/budgets/[A-Za-z0-9_\-]{1,128}")
@@ -152,13 +154,36 @@ def _own_project(budget: dict) -> str | None:
     return proj if config.valid_project(proj) else None
 
 
-def read_live_caps(ctx) -> dict:
-    out: dict = {"ok": False, "error": None, "items": {}, "currency": None}
+def _live_caps_ttl(ctx) -> float:
+    srv_ttl = (ctx.config.get("server") or {}).get("cache_ttl_seconds")
+    if srv_ttl is not None and float(srv_ttl) <= 0:
+        return 0.0
+    return min(float(LIVE_CAPS_TTL), float(srv_ttl)) if srv_ttl is not None else float(LIVE_CAPS_TTL)
+
+
+def _invalidate_live_caps(ctx) -> None:
+    cache = getattr(ctx.app, "cache", None)
+    if cache is not None:
+        acct = account_id(ctx.config)
+        if acct:
+            cache.delete(("spend_caps", "live", acct))
+
+
+def read_live_caps(ctx, *, fresh: bool = False) -> dict:
+    out: dict = {"ok": False, "error": None, "error_kind": None, "items": {}, "currency": None}
     reason = _gate(ctx.config)
     if reason:
         out["error"] = reason
+        out["error_kind"] = "disabled" if not enabled(ctx.config) else "not_configured"
         return out
     acct = account_id(ctx.config)
+    cache = getattr(ctx.app, "cache", None)
+    ttl = _live_caps_ttl(ctx)
+    ckey = ("spend_caps", "live", acct)
+    if not fresh and cache is not None and ttl > 0:
+        hit, cached = cache.get(ckey)
+        if hit:
+            return copy.deepcopy(cached)
     try:
         found, truncated = ctx.gcp.paginate(
             "%s/billingAccounts/%s/budgets" % (BUDGETS_V1, acct),
@@ -166,9 +191,13 @@ def read_live_caps(ctx) -> dict:
         )
     except GcpError as err:
         out["error"] = "Could not read Cloud Billing budgets (%s)." % err.kind
+        out["error_kind"] = err.kind
+        if err.kind == "denied" and cache is not None and ttl > 0:
+            cache.set(ckey, copy.deepcopy(out), ttl)
         return out
     if truncated:
         out["error"] = "Billing account exceeds maximum readable budget pages."
+        out["error_kind"] = "truncated"
         return out
     items, currency = {}, None
     for b in found or ():
@@ -192,8 +221,58 @@ def read_live_caps(ctx) -> dict:
             "filter_services": list(flt.get("services") or []),
             "has_spend_cap": isinstance(b.get("spendCap"), dict),
         }
-    out.update(ok=True, items=items, currency=currency)
+    out.update(ok=True, error_kind=None, items=items, currency=currency)
+    if cache is not None and ttl > 0:
+        cache.set(ckey, copy.deepcopy(out), ttl)
     return out
+
+
+def _billing_sync_view(ctx, live: dict) -> dict:
+    acct = account_id(ctx.config) or None
+    if not enabled(ctx.config):
+        return {
+            "status": "disabled",
+            "message": live.get("error") or _gate(ctx.config),
+            "billing_account": acct,
+            "required_role": None,
+            "remediation": None,
+        }
+    if not acct:
+        return {
+            "status": "not_configured",
+            "message": live.get("error") or _gate(ctx.config),
+            "billing_account": None,
+            "required_role": None,
+            "remediation": None,
+        }
+    if live.get("ok"):
+        return {
+            "status": "ok",
+            "message": None,
+            "billing_account": acct,
+            "required_role": None,
+            "remediation": None,
+        }
+    if live.get("error_kind") == "denied":
+        sa = ((ctx.config.get("hub") or {}).get("runtime_service_account") or "").strip() or "RUNTIME_SERVICE_ACCOUNT"
+        return {
+            "status": "permission_required",
+            "message": live.get("error"),
+            "billing_account": acct,
+            "required_role": "roles/billing.costsManager",
+            "remediation": (
+                "Grant roles/billing.costsManager on billing account %s to serviceAccount:%s "
+                "(requires Billing Account Admin), or set SPEND_CAPS_ENABLED=false if Cloud Billing hard spend caps "
+                "are not used." % (acct, sa)
+            ),
+        }
+    return {
+        "status": "error",
+        "message": live.get("error"),
+        "billing_account": acct,
+        "required_role": None,
+        "remediation": None,
+    }
 
 
 def _not_owned(ctx, project: str, cap: dict | None) -> str | None:
@@ -231,7 +310,7 @@ def _apply_one(ctx, project: str, amount: float, *, dry_run: bool = False) -> di
     reason = _gate(ctx.config)
     if reason:
         return {"project": project, "status": "skipped", "message": reason}
-    live = read_live_caps(ctx)
+    live = read_live_caps(ctx, fresh=True)
     if not live["ok"]:
         return {"project": project, "status": "failed", "message": live["error"]}
     existing = live["items"].get(project)
@@ -265,6 +344,7 @@ def _apply_one(ctx, project: str, amount: float, *, dry_run: bool = False) -> di
                         "message": "Could not resolve Gemini Platform service ID or project number."}
             created = ctx.rest("POST", "%s/billingAccounts/%s/budgets" % (BUDGETS_V1, acct),
                                json_body=create_body(project, num, svc, amount, "USD")) or {}
+            _invalidate_live_caps(ctx)
             return {"project": project, "op": "create", "status": "created", "amount": amount,
                     "budget": created.get("name")}
         problem = _not_owned(ctx, project, existing)
@@ -278,6 +358,7 @@ def _apply_one(ctx, project: str, amount: float, *, dry_run: bool = False) -> di
             body["spendCap"] = {"inputState": CONFIGURED}
         ctx.rest("PATCH", "%s/%s" % (BUDGETS_V1, existing["budget"]),
                  params={"updateMask": ",".join(mask)}, json_body=body)
+        _invalidate_live_caps(ctx)
         return {"project": project, "op": "update", "status": "updated", "amount": amount,
                 "budget": existing["budget"]}
     except GcpError as err:
@@ -291,9 +372,10 @@ def _apply_one(ctx, project: str, amount: float, *, dry_run: bool = False) -> di
 
 def list_project_caps(ctx) -> dict:
     """GET /v1/caps/projects"""
+    fresh = str(ctx.params.get("fresh") or "").lower() in ("1", "true")
     doc, _ = ctx.store.load(PROJECT_CAPS_DOC)
     stored = dict(doc.get("projects") or {})
-    live = read_live_caps(ctx) if _gate(ctx.config) is None else {"ok": False, "items": {}, "currency": None, "error": _gate(ctx.config)}
+    live = read_live_caps(ctx, fresh=fresh)
     projects = sorted(set(ctx.all_projects) | set(stored.keys()) | set((live.get("items") or {}).keys()))
     rows = []
     for pid in projects:
@@ -316,6 +398,7 @@ def list_project_caps(ctx) -> dict:
         "billing_account_configured": bool(account_id(ctx.config)),
         "billing_currency": live.get("currency"),
         "sync_error": live.get("error"),
+        "billing_sync": _billing_sync_view(ctx, live),
         "data": rows,
         "total": len(rows),
     }
@@ -378,7 +461,7 @@ def lift_project_cap(ctx) -> dict:
     reason = _gate(ctx.config)
     if reason:
         raise ApiError("not_configured", reason)
-    live = read_live_caps(ctx)
+    live = read_live_caps(ctx, fresh=True)
     if not live["ok"]:
         raise ApiError("upstream_error", live["error"] or "Failed to read Cloud Billing budgets.")
     item = live["items"].get(project)
@@ -403,6 +486,7 @@ def lift_project_cap(ctx) -> dict:
     except GcpError as err:
         raise ApiError("upstream_error", "Failed to lift spend cap (%s)." % err.kind)
 
+    _invalidate_live_caps(ctx)
     audit.write_audit(ctx, "caps.project.lifted", target=project, details={"budget": item["budget"]})
     webhooks.dispatch_event(ctx, "project_cap.lifted", {"project_id": project, "budget": item["budget"], "actor": ctx.caller.id})
     return {

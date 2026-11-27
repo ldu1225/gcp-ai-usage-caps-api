@@ -274,6 +274,8 @@ def create_group(ctx) -> dict:
         return rec
 
     ctx.store.mutate(GROUPS_DOC, save)
+    from . import caps as caps_svc
+    caps_svc._invalidate_caps_caches(ctx)  # pylint: disable=protected-access
     sync = None
     if rec["google_group"]:
         sync = _sync_one(ctx, gid)
@@ -293,6 +295,7 @@ def get_group(ctx) -> dict:
 
 def patch_group(ctx) -> dict:
     """PATCH /v1/groups/{group_id} {name?, description?, priority?, members? (replace), google_group?, excluded?}"""
+    from . import caps as caps_svc
     gid = _gid(ctx)
     before = _require_group(ctx, gid)
     body = ctx.body or {}
@@ -329,6 +332,7 @@ def patch_group(ctx) -> dict:
         _sync_one(ctx, gid)
         after = load_groups(ctx)[gid]
     enforcement = _after_membership_change(ctx, gid, before, after)
+    caps_svc._invalidate_caps_caches(ctx)  # pylint: disable=protected-access
     audit.write_audit(ctx, "group.updated", target="group:" + gid, details={"fields": sorted(updates)})
     out = _group_view(ctx, gid, load_groups(ctx)[gid])
     out["enforcement"] = enforcement
@@ -366,6 +370,7 @@ def delete_group(ctx) -> dict:
             return rdoc
         ctx.store.mutate(user_model_rules.RULES_DOC, drop_rules)
         enforcement = _reconcile(ctx, doc, {p: {gid} for p in effective_members(before)})
+    caps_svc._invalidate_caps_caches(ctx)  # pylint: disable=protected-access
     audit.write_audit(ctx, "group.deleted", target="group:" + gid,
                       details={"members": len(effective_members(before)), "enforcement": enforcement})
     return {"object": "group", "id": gid, "deleted": True, "enforcement": enforcement}
@@ -614,7 +619,10 @@ def _after_membership_change(ctx, gid: str, before: dict, after: dict) -> dict |
     from . import caps as caps_svc
     removed = sorted(set(effective_members(before)) - set(effective_members(after)))
     added = sorted(set(effective_members(after)) - set(effective_members(before)))
-    if not (removed or added) or not _has_enforced_policy(ctx, gid):
+    if not (removed or added):
+        return None
+    if not _has_enforced_policy(ctx, gid):
+        caps_svc._invalidate_caps_caches(ctx)  # pylint: disable=protected-access
         return None
     with caps_svc._WRITE_LOCK:  # pylint: disable=protected-access
         def save(doc):

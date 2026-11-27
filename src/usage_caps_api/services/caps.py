@@ -630,8 +630,18 @@ def _block_in_sync(src: dict, def_svcs, blocked_global: set, blocked_projects: d
     return True
 
 
-def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = None,
-                        deny_client: enforcers.DenyPolicyClient | None = None) -> tuple[dict, dict]:
+CAPS_STATUS_CACHE_TTL = 60.0
+
+
+def _caps_status_ttl(ctx) -> float:
+    srv_ttl = (ctx.config.get("server") or {}).get("cache_ttl_seconds")
+    if srv_ttl is not None and float(srv_ttl) <= 0:
+        return 0.0
+    return min(CAPS_STATUS_CACHE_TTL, float(srv_ttl)) if srv_ttl is not None else CAPS_STATUS_CACHE_TTL
+
+
+def _compute_caps_status_uncached(ctx, *, fresh: bool = False, now: dt.datetime | None = None,
+                                  deny_client: enforcers.DenyPolicyClient | None = None) -> tuple[dict, dict]:
     """Computes full per-user (and per-user-per-project) cap status, safety gates, and the enforcement plan."""
     now = now or utcnow()
     policy = effective_policy(ctx)
@@ -817,6 +827,23 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
         else:
             status, status_scope = "active", None
 
+        desired_global: set[str] = set()
+        desired_projects: dict[str, set[str]] = {}
+        if block_src is not None:
+            b_svcs = set(block_src.get("services") or def_svcs)
+            if block_src.get("projects") is None:
+                desired_global |= b_svcs
+            else:
+                for bp in block_src["projects"]:
+                    desired_projects.setdefault(bp, set()).update(b_svcs)
+        if susp_active and not (rule and rule.get("type") == "allow"):
+            s_svcs = set((rule or {}).get("services") or def_svcs)
+            if susp.get("projects") is None:
+                desired_global |= s_svcs
+            else:
+                for sp in susp["projects"]:
+                    desired_projects.setdefault(sp, set()).update(s_svcs)
+
         restore_at = None
         if status == "suspended":
             restore_at = (susp or {}).get("until") or win["next_reset_iso"]
@@ -838,6 +865,9 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
             "block_in_sync": (_block_in_sync(block_src, def_svcs, blocked_global, blocked_projects_raw,
                                              susp=(susp if susp_active else None))
                               if (block_src and backend == "iam_deny") else True),
+            "_desired_blocked_services": sorted(desired_global),
+            "_desired_blocked_projects": {p: sorted(v) for p, v in desired_projects.items()},
+            "_enforcement_backend": backend,
             "over_cap": over,
             "over_cap_reasons": (list(reasons) if over_t else sorted({r for pr_ in project_rows if pr_["over_cap"]
                                                                       for r in pr_["over_cap_reasons"]})) +
@@ -905,6 +935,41 @@ def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = N
     return payload, internal
 
 
+def compute_caps_status(ctx, *, fresh: bool = False, now: dt.datetime | None = None,
+                        deny_client: enforcers.DenyPolicyClient | None = None) -> tuple[dict, dict]:
+    """Computes full per-user cap status with stampede-coalesced TTL caching (`caps_status`)."""
+    cache = getattr(ctx.app, "cache", None)
+    ttl = _caps_status_ttl(ctx)
+    if now is not None or deny_client is not None or cache is None or ttl <= 0:
+        return _compute_caps_status_uncached(ctx, fresh=fresh, now=now, deny_client=deny_client)
+
+    ckey = ("caps_status", ctx.version, tuple(ctx.projects))
+
+    def _is_cacheable(item) -> bool:
+        pl, intr = item[0], item[1]
+        backend = (intr.get("policy") or {}).get("enforcement_backend") or "iam_deny"
+        deny_ok = backend == "notify_only" or bool(intr["deny_state"].readable)
+        return bool((pl.get("telemetry") or {}).get("telemetry_ok") and deny_ok)
+
+    def _compute():
+        sub = ctx.child()
+        pl, intr = _compute_caps_status_uncached(sub, fresh=fresh)
+        return pl, intr, set(sub.sources), list(sub.warnings)
+
+    if fresh:
+        pl, intr, sources, warnings = _compute()
+        if _is_cacheable((pl, intr, sources, warnings)):
+            cache.set(ckey, (pl, intr, sources, warnings), ttl)
+    else:
+        (pl, intr, sources, warnings), _ = cache.get_or_compute(ckey, ttl, _compute, cacheable=_is_cacheable)
+
+    for s in sources:
+        ctx.add_source(s)
+    for w in warnings:
+        ctx.warn(w["source"], w["code"], w["message"])
+    return copy.deepcopy(pl), intr
+
+
 # ---------------------------------------------------------------------------
 # Public REST handlers: GET/PUT/DELETE /v1/caps/users*
 # ---------------------------------------------------------------------------
@@ -915,6 +980,56 @@ def _public_user_cap(row: dict) -> dict:
     out.pop("manual_block", None)
     out.pop("expired_block", None)
     out.pop("block_in_sync", None)
+    desired_global = set(out.pop("_desired_blocked_services", None) or ())
+    desired_projects = {p: set(v or ()) for p, v in (out.pop("_desired_blocked_projects", None) or {}).items()}
+    backend = out.pop("_enforcement_backend", "iam_deny")
+
+    live_global = set(out.get("blocked_services") or ())
+    live_projects = {p: set(v or ()) for p, v in (out.get("blocked_projects") or {}).items()}
+    eff_global = sorted(live_global | desired_global)
+    eff_global_set = set(eff_global)
+    eff_projects: dict[str, list[str]] = {}
+    for p in sorted(set(live_projects.keys()) | set(desired_projects.keys())):
+        svcs = (live_projects.get(p, set()) | desired_projects.get(p, set())) - eff_global_set
+        if svcs:
+            eff_projects[p] = sorted(svcs)
+
+    if backend == "iam_deny":
+        pending_global = sorted(desired_global - live_global)
+        pending_projects: dict[str, list[str]] = {}
+        for p in sorted(desired_projects.keys()):
+            missing = sorted(desired_projects[p] - live_global - live_projects.get(p, set()))
+            if missing:
+                pending_projects[p] = missing
+    else:
+        pending_global = []
+        pending_projects = {}
+
+    if not eff_global and not eff_projects:
+        enf_status = "none"
+    elif pending_global or pending_projects:
+        enf_status = "propagating"
+    else:
+        enf_status = "enforced"
+
+    pub_projects = []
+    for pr_ in out.get("projects") or []:
+        p_out = dict(pr_)
+        pname = p_out.get("project")
+        p_live = set(p_out.get("blocked_services") or ())
+        p_desired = desired_global | desired_projects.get(pname, set())
+        p_eff = sorted(p_live | p_desired)
+        p_pending = sorted(p_desired - p_live) if backend == "iam_deny" else []
+        p_out["blocked_services"] = p_eff
+        p_out["enforcement_status"] = "none" if not p_eff else ("propagating" if p_pending else "enforced")
+        pub_projects.append(p_out)
+
+    out["blocked_services"] = eff_global
+    out["blocked_projects"] = eff_projects
+    out["enforcement_status"] = enf_status
+    out["pending_blocked_services"] = pending_global
+    out["pending_blocked_projects"] = pending_projects
+    out["projects"] = pub_projects
     return out
 
 
@@ -961,6 +1076,9 @@ def get_user_cap_snapshot(ctx, email: str, *, fresh: bool = False) -> dict:
         "status_scope": None,
         "blocked_services": [],
         "blocked_projects": {},
+        "enforcement_status": "none",
+        "pending_blocked_services": [],
+        "pending_blocked_projects": {},
         "over_cap": False,
         "over_scope": None,
         "cap_scope": pol.get("cap_scope") or "total",
@@ -1560,6 +1678,7 @@ def enforce_cycle(ctx, *, trigger: str = "api", dry_run: bool = False,
                         per_ap[st.attachment] = m
                     apply_res = enforcers.apply(ctx, bg_deny, {}, dry_run=False, client=deny_client, per_attachment=per_ap)
                     ctx.store.mutate(USER_CAPS_DOC, lambda d: (d.pop("pending_breakglass_restores", None), d)[1])
+                    _invalidate_caps_caches(ctx)
                     return {
                         "object": "enforcement_run", "trigger": trigger, "mode": "apply",
                         "backend": backend, "enforcement_mode": policy.get("enforcement_mode"),
@@ -1585,6 +1704,7 @@ def enforce_cycle(ctx, *, trigger: str = "api", dry_run: bool = False,
         if use_job_if_configured and deny_client is None and (ctx.config.get("caps") or {}).get("enforcement_job"):
             job_res = _trigger_enforcer_job(ctx)
             if job_res:
+                _invalidate_caps_caches(ctx)
                 audit.write_audit(ctx, "caps.enforce.job_triggered", target=job_res["job"],
                                   details={"trigger": trigger, "execution": job_res.get("execution")})
                 return {
@@ -1671,6 +1791,7 @@ def enforce_cycle(ctx, *, trigger: str = "api", dry_run: bool = False,
             return doc
 
         ctx.store.mutate(USER_CAPS_DOC, persist)
+        _invalidate_caps_caches(ctx)
 
         # 6. Audit & outbound webhooks
         audit.write_audit(ctx, "caps.enforce", target="global", details=run_summary)
