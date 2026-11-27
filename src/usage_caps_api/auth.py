@@ -96,12 +96,14 @@ def validate_scopes(scopes) -> list[str]:
 def create_api_key(store, *, name: str, scopes: list[str], created_by: str = "system",
                    expires_at: str | None = None) -> dict:
     """Creates a new scoped API key. Plaintext `key` is returned ONCE and never stored."""
-    clean_name = str(name or "").strip()[:120]
+    if not isinstance(name, str) or any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise ApiError("bad_request", "Field 'name' must be a printable string.")
+    clean_name = name.strip()[:120]
     if not clean_name:
         raise ApiError("bad_request", "Field 'name' is required.")
     clean_scopes = validate_scopes(scopes)
     if expires_at is not None and expires_at != "":
-        if parse_rfc3339(expires_at) is None:
+        if not isinstance(expires_at, str) or parse_rfc3339(expires_at) is None:
             raise ApiError("bad_request", "Field 'expires_at' must be an RFC3339 timestamp.")
     else:
         expires_at = None
@@ -142,6 +144,11 @@ def create_api_key(store, *, name: str, scopes: list[str], created_by: str = "sy
 
 
 def public_key_view(rec: dict) -> dict:
+    if rec.get("revoked_at"):
+        status = "revoked"
+    else:
+        exp = parse_rfc3339(rec.get("expires_at"))
+        status = "expired" if (exp is not None and dt.datetime.now(dt.timezone.utc) >= exp) else "active"
     return {
         "id": rec.get("id"),
         "name": rec.get("name"),
@@ -152,7 +159,7 @@ def public_key_view(rec: dict) -> dict:
         "expires_at": rec.get("expires_at"),
         "revoked_at": rec.get("revoked_at"),
         "last_used_at": rec.get("last_used_at"),
-        "status": "revoked" if rec.get("revoked_at") else "active",
+        "status": status,
     }
 
 
@@ -421,6 +428,8 @@ RATE_LIMITS = {
 
 
 class RateLimiter:
+    MAX_BUCKETS = 50_000
+
     def __init__(self, limits: dict | None = None):
         self.limits = dict(limits or RATE_LIMITS)
         self._lock = threading.Lock()
@@ -432,17 +441,21 @@ class RateLimiter:
         rate = limit / 60.0
         now = time.monotonic()
         with self._lock:
+            if now - self._last_prune > 60 or len(self._buckets) >= self.MAX_BUCKETS:
+                self._last_prune = now
+                stale = [k for k, (_, t) in self._buckets.items() if now - t > 600]
+                for k in stale:
+                    del self._buckets[k]
+                if len(self._buckets) >= self.MAX_BUCKETS:
+                    oldest = sorted(self._buckets.items(), key=lambda kv: kv[1][1])[:len(self._buckets) // 4 + 1]
+                    for k, _ in oldest:
+                        del self._buckets[k]
             tokens, last = self._buckets.get((key, bucket), (float(limit), now))
             tokens = min(float(limit), tokens + (now - last) * rate)
             if tokens < 1.0:
                 self._buckets[(key, bucket)] = (tokens, now)
                 return False, max(1, int(math.ceil((1.0 - tokens) / rate)))
             self._buckets[(key, bucket)] = (tokens - 1.0, now)
-            if now - self._last_prune > 60:
-                self._last_prune = now
-                stale = [k for k, (_, t) in self._buckets.items() if now - t > 600]
-                for k in stale:
-                    del self._buckets[k]
             return True, 0
 
     def check(self, key: str, bucket: str):

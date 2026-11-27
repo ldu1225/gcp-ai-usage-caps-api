@@ -15,7 +15,7 @@ from .schema import SchemaRegistry
 from .services import (audit, base as svc_base, caps, chargeback, groups, model_access, model_registry, operations,
                        pricing_sync, quotas, readiness, spend_caps, surface_models, usage, usage_events,
                        user_model_rules, vertex_logging, webhooks)
-from .store import make_doc_store
+from .store import StoreConflict, StoreError, make_doc_store
 
 LOG = logging.getLogger("usage_caps_api.app")
 
@@ -68,7 +68,7 @@ def _admin_create_key(ctx) -> dict:
     body = ctx.body or {}
     created = auth.create_api_key(
         ctx.store,
-        name=body.get("name") or "",
+        name=body.get("name"),
         scopes=body.get("scopes"),
         created_by=ctx.caller.id,
         expires_at=body.get("expires_at"),
@@ -303,38 +303,43 @@ class App:
                 is_public = bool(opts.get("public"))
                 optional_auth = bool(opts.get("optional_auth"))
                 caller = None
-                if not is_public or optional_auth:
-                    caller = app.authenticator.authenticate(
-                        self.headers, self.client_ip(), path, allow_optional=is_public,
-                    )
-                if caller is not None:
-                    req_scope = opts.get("scope")
-                    if req_scope and not caller.has_scope(req_scope):
-                        needed = req_scope if isinstance(req_scope, str) else " or ".join(req_scope)
-                        raise ApiError("insufficient_scope",
-                                       "Missing required scope '%s'." % needed, status=403)
-                    app.limiter.check(caller.rate_key, opts.get("rate") or "general")
-                else:
-                    app.limiter.check("anon:" + (self.client_ip() or "unknown"), "general")
+                try:
+                    if not is_public or optional_auth:
+                        caller = app.authenticator.authenticate(
+                            self.headers, self.client_ip(), path, allow_optional=is_public,
+                        )
+                    if caller is not None:
+                        req_scope = opts.get("scope")
+                        if req_scope and not caller.has_scope(req_scope):
+                            needed = req_scope if isinstance(req_scope, str) else " or ".join(req_scope)
+                            raise ApiError("insufficient_scope",
+                                           "Missing required scope '%s'." % needed, status=403)
+                        app.limiter.check(caller.rate_key, opts.get("rate") or "general")
+                    else:
+                        app.limiter.check("anon:" + (self.client_ip() or "unknown"), "general")
 
-                body = {}
-                if method in ("POST", "PUT", "PATCH", "DELETE"):
-                    raw = self.read_body_bytes()
-                    if raw:
-                        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-                        if ctype and ctype != "application/json":
-                            raise ApiError("bad_request", "Content-Type must be application/json.")
-                        body = parse_json_object(raw)
+                    body = {}
+                    if method in ("POST", "PUT", "PATCH", "DELETE"):
+                        raw = self.read_body_bytes()
+                        if raw:
+                            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                            if ctype and ctype != "application/json":
+                                raise ApiError("bad_request", "Content-Type must be application/json.")
+                            body = parse_json_object(raw)
 
-                rng = None
-                if opts.get("range"):
-                    ws = app.config["workspace"]
-                    rng = timeutil.parse_range(params, ws.get("timezone") or "UTC", ws.get("default_range_days", 14))
+                    rng = None
+                    if opts.get("range"):
+                        ws = app.config["workspace"]
+                        rng = timeutil.parse_range(params, ws.get("timezone") or "UTC", ws.get("default_range_days", 14))
 
-                fwd_headers = {name: self.headers.get(name) for name in ("If-Match", "Idempotency-Key")}
-                ctx = svc_base.Ctx(app, app.config, caller, params=params, path_params=path_params, body=body, rng=rng,
-                                   headers=fwd_headers)
-                result = fn(ctx)
+                    fwd_headers = {name: self.headers.get(name) for name in ("If-Match", "Idempotency-Key")}
+                    ctx = svc_base.Ctx(app, app.config, caller, params=params, path_params=path_params, body=body, rng=rng,
+                                       headers=fwd_headers)
+                    result = fn(ctx)
+                except StoreConflict:
+                    raise ApiError("conflict", "Concurrent state update conflict; retry the request.", status=409)
+                except StoreError:
+                    raise ApiError("unavailable", "State storage is temporarily unavailable; retry shortly.", status=503)
                 if isinstance(result, dict) and ctx.warnings:
                     result = dict(result, warnings=ctx.warnings)
                 created = path in ("/v1/admin/api-keys", "/v1/admin/webhooks", "/v1/groups") or (

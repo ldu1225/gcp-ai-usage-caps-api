@@ -14,6 +14,7 @@ import sys
 
 from . import auth
 from .app import App
+from .httpkit import ApiError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,21 +42,25 @@ def main(argv=None, *, app: App | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     app = app or App()
-    if args.command == "keys":
-        if args.keys_action == "create":
-            scopes = [s.strip() for s in args.scopes.split(",") if s.strip()]
-            created = auth.create_api_key(
-                app.store, name=args.name, scopes=scopes, created_by="cli", expires_at=args.expires_at,
-            )
-            print(json.dumps(created, indent=2, ensure_ascii=False))
-            return 0
-        if args.keys_action == "list":
-            print(json.dumps(auth.list_api_keys(app.store), indent=2, ensure_ascii=False))
-            return 0
-        if args.keys_action == "revoke":
-            revoked = auth.revoke_api_key(app.store, args.key_id, revoked_by="cli")
-            print(json.dumps(revoked, indent=2, ensure_ascii=False))
-            return 0
+    try:
+        if args.command == "keys":
+            if args.keys_action == "create":
+                scopes = [s.strip() for s in args.scopes.split(",") if s.strip()]
+                created = auth.create_api_key(
+                    app.store, name=args.name, scopes=scopes, created_by="cli", expires_at=args.expires_at,
+                )
+                print(json.dumps(created, indent=2, ensure_ascii=False))
+                return 0
+            if args.keys_action == "list":
+                print(json.dumps(auth.list_api_keys(app.store), indent=2, ensure_ascii=False))
+                return 0
+            if args.keys_action == "revoke":
+                revoked = auth.revoke_api_key(app.store, args.key_id, revoked_by="cli")
+                print(json.dumps(revoked, indent=2, ensure_ascii=False))
+                return 0
+    except ApiError as err:
+        sys.stderr.write(json.dumps({"error": {"code": err.code, "message": err.message}}, ensure_ascii=False) + "\n")
+        return 1
     return 1
 
 

@@ -532,6 +532,10 @@ def list_models(ctx) -> dict:
     if "access" in include:
         from . import model_access
         project = (ctx.params.get("project") or ctx.project).strip().lower()
+        if not config.valid_project(project):
+            raise ApiError("bad_request", "Invalid project id '%s'." % project)
+        if project not in ctx.all_projects:
+            raise ApiError("forbidden", "Project '%s' is not managed by this control plane." % project)
         access_eval = model_access.access_evaluator(ctx, project, catalog)
     rows = []
     for mid in sorted(catalog):
@@ -607,6 +611,27 @@ def sync_models(ctx) -> dict:
     return dict({"object": "model_catalog_sync"}, **summary)
 
 
+def _traffic_slices(mrec: dict) -> dict[str, dict]:
+    by_t = mrec.get("by_traffic") or {}
+    if not by_t:
+        return {"on_demand": mrec}
+    out = {t: dict(tr) for t, tr in by_t.items()}
+    rem = {}
+    has_rem = False
+    for k in ("requests", "input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens",
+              "thoughts_tokens", "total_tokens", "long_input_tokens", "long_output_tokens",
+              "long_cached_tokens", "long_cache_write_tokens"):
+        diff = int(mrec.get(k) or 0) - sum(int(tr.get(k) or 0) for tr in by_t.values())
+        if diff > 0:
+            rem[k] = diff
+            has_rem = True
+    if has_rem:
+        od = out.setdefault("on_demand", {})
+        for k, v in rem.items():
+            od[k] = int(od.get(k) or 0) + v
+    return out
+
+
 def usage_by_model(ctx) -> dict:
     """GET /v1/usage/models?start=&end=&group_by=user|project|surface|traffic&project=&surface=&model="""
     from . import caps as caps_svc
@@ -649,7 +674,7 @@ def usage_by_model(ctx) -> dict:
                 m["users"].add(email)
                 m["projects"].add(proj)
                 if group_by == "traffic":
-                    for t, tr in (mrec.get("by_traffic") or {"on_demand": mrec}).items():
+                    for t, tr in _traffic_slices(mrec).items():
                         add_group(m, t, tr)
                 elif group_by:
                     add_group(m, {"user": email, "project": proj, "surface": mrec.get("surface") or "antigravity"}[group_by], mrec)
@@ -667,7 +692,7 @@ def usage_by_model(ctx) -> dict:
             elif group_by == "surface":
                 add_group(m, mrec.get("surface") or "gemini_platform", mrec)
             elif group_by == "traffic":
-                for t, tr in (mrec.get("by_traffic") or {"on_demand": mrec}).items():
+                for t, tr in _traffic_slices(mrec).items():
                     add_group(m, t, tr)
     rows = []
     for model, m in models.items():

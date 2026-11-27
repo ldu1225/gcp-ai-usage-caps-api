@@ -16,6 +16,7 @@ import copy
 import json
 import logging
 import os
+import random
 import re
 import tempfile
 import threading
@@ -83,7 +84,8 @@ class FileBackend:
 
     def _generation(self, path: str) -> int:
         try:
-            return os.stat(path).st_mtime_ns
+            st = os.stat(path)
+            return ((st.st_mtime_ns << 32) ^ st.st_ino) or 1
         except FileNotFoundError:
             return 0
 
@@ -176,7 +178,7 @@ class GcsBackend:
                 data=body, headers={"Content-Type": "application/json"},
             )
         except GcpError as err:
-            if err.kind == "precondition":
+            if err.kind == "precondition" or err.status == 429:
                 raise StoreConflict()
             raise StoreError("GCS object write failed (%s)" % err.kind)
         return int(payload.get("generation") or 0)
@@ -224,9 +226,9 @@ class DocStore:
             self._cache[name] = (copy.deepcopy(doc), gen, now)
         return copy.deepcopy(doc), gen
 
-    def mutate(self, name: str, fn, attempts: int = 5):
-        """Loads fresh doc, calls fn(doc), and saves with optimistic concurrency retry."""
-        for _ in range(attempts):
+    def mutate(self, name: str, fn, attempts: int = 8):
+        """Loads fresh doc, calls fn(doc), and saves with optimistic concurrency retry and jittered backoff."""
+        for attempt in range(attempts):
             doc, gen = self.load(name, fresh=True)
             result = fn(doc)
             try:
@@ -236,6 +238,11 @@ class DocStore:
                 return result
             except StoreConflict:
                 self.clear_cache(name)
+                if attempt + 1 < attempts:
+                    if self.kind == "gcs":
+                        time.sleep(min(1.5, 0.12 * (1.5 ** attempt) + random.uniform(0.0, 0.1)))
+                    elif self.kind == "file":
+                        time.sleep(0.005 * (attempt + 1) + random.uniform(0.0, 0.005))
                 continue
         raise StoreConflict("Concurrent update conflict on document '%s'" % name)
 

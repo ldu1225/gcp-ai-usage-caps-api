@@ -36,7 +36,7 @@ ENFORCEMENT_JOB_RE = re.compile(
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 VALID_SERVICES = ("antigravity", "gemini_platform", "gemini_enterprise")
-# `gemini_platform` = Gemini Enterprise Agent Platform ("Gemini platform", formerly Vertex AI). The legacy surface id
+# `gemini_platform` = Gemini Platform (formerly Vertex AI / Agent Platform). The legacy surface id
 # `vertex_ai` is still accepted on input and in stored documents and is normalized to `gemini_platform`.
 SERVICE_ALIASES = {"vertex_ai": "gemini_platform", "vertex": "gemini_platform", "agent_platform": "gemini_platform"}
 
@@ -149,7 +149,7 @@ DEFAULTS = {
         "output_price_per_million": 0.0,
         "model_overrides": [],
         "model_aliases": [],
-        "catalog_services": ["Vertex AI", "Agent Platform", "Gemini API", "Generative Language"],
+        "catalog_services": ["Gemini Platform", "Vertex AI", "Agent Platform", "Gemini API", "Generative Language"],
         "include_partner_models": True,
         "excluded_sku_patterns": list(MANDATORY_EXCLUDED_SKU_PATTERNS),
         "fx_sources": ["https://open.er-api.com/v6/latest/USD"],
@@ -235,25 +235,38 @@ def quota_project(cfg: dict) -> str:
     return ws.get("quota_project_id") or ws.get("project_id") or ""
 
 
+def _is_public_address(ip) -> bool:
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return bool(
+        ip.is_global
+        and not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                 or ip.is_multicast or ip.is_unspecified)
+    )
+
+
 def is_public_ip(host: str) -> bool:
-    """Checks that host does not resolve to loopback, private, link-local, or reserved IPs (SSRF guard)."""
+    """Checks that host does not resolve to loopback, private, link-local, CGNAT, or reserved IPs (SSRF guard)."""
+    clean = str(host or "").strip("[]").rstrip(".")
+    if not clean:
+        return False
     try:
-        ip = ipaddress.ip_address(host.strip("[]"))
-        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast)
+        return _is_public_address(ipaddress.ip_address(clean))
     except ValueError:
         pass
     try:
-        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(clean, 443, proto=socket.IPPROTO_TCP)
     except OSError:
         return False
     if not infos:
         return False
     for info in infos:
         try:
-            ip = ipaddress.ip_address(info[4][0])
+            ip = ipaddress.ip_address(info[4][0].split("%")[0])
         except ValueError:
             return False
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+        if not _is_public_address(ip):
             return False
     return True
 
@@ -261,15 +274,20 @@ def is_public_ip(host: str) -> bool:
 def valid_https_url(url: str, *, check_dns: bool = False) -> bool:
     if not isinstance(url, str) or len(url) > 2048 or CONTROL_RE.search(url):
         return False
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != "https" or not parsed.hostname:
+    try:
+        parsed = urllib.parse.urlparse(url)
+        _ = parsed.port
+    except ValueError:
         return False
-    host = parsed.hostname.lower()
-    if host in ("localhost", "metadata.google.internal") or host.endswith(".local") or host.endswith(".internal"):
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return False
+    host = parsed.hostname.strip("[]").rstrip(".").lower()
+    if not host or host in ("localhost", "metadata.google.internal", "metadata") \
+            or host.endswith(".local") or host.endswith(".internal") or host.endswith(".localhost"):
         return False
     try:
-        ip = ipaddress.ip_address(host.strip("[]"))
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+        ip = ipaddress.ip_address(host)
+        if not _is_public_address(ip):
             return False
     except ValueError:
         if "." not in host:

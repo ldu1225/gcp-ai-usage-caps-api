@@ -186,12 +186,13 @@ def sync_pricing(ctx) -> dict:
         except GcpError:
             pass
     if cur != "USD" and cur not in rates:
+        from . import webhooks as _wh
         for url in (ctx.config.get("pricing") or {}).get("fx_sources") or []:
             if not config.valid_https_url(url, check_dns=True):
                 continue
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "GcpAiUsageCapsApi/1.2"})
-                with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310
+                with _wh._NO_REDIRECT_OPENER.open(req, timeout=10) as resp:  # pylint: disable=protected-access
                     payload = json.loads(resp.read(512 * 1024).decode("utf-8"))
                 r = to_float((payload.get("rates") or {}).get(cur))
                 if r and r > 0:

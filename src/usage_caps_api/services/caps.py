@@ -255,9 +255,13 @@ def update_policy(ctx) -> dict:
         raw_t = body["webhook_thresholds"]
         if not isinstance(raw_t, list) or len(raw_t) > 10:
             raise ApiError("bad_request", "Field 'webhook_thresholds' must be a list of up to 10 integers (1-100).")
-        clean_t = sorted({int(x) for x in raw_t if isinstance(x, int) and not isinstance(x, bool) and 1 <= x <= 100})
-        if len(clean_t) != len(set(raw_t)):
-            raise ApiError("bad_request", "All webhook_thresholds must be integers between 1 and 100.")
+        clean_t = []
+        for x in raw_t:
+            if isinstance(x, bool) or not isinstance(x, int) or not (1 <= x <= 100):
+                raise ApiError("bad_request", "All webhook_thresholds must be integers between 1 and 100.")
+            if x not in clean_t:
+                clean_t.append(x)
+        clean_t.sort()
         updates["webhook_thresholds"] = clean_t
     if "change_budget_min" in body:
         cbm = _opt_nonneg_int(body["change_budget_min"], "change_budget_min", hi=10000)

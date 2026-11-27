@@ -164,11 +164,15 @@ def parse_query(query: str) -> dict[str, str]:
     return out
 
 
+def _reject_json_constant(const: str):
+    raise ValueError("Invalid JSON constant: %s" % const)
+
+
 def parse_json_object(raw: bytes) -> dict:
     if not raw:
         return {}
     try:
-        obj = json.loads(raw.decode("utf-8"))
+        obj = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
     except (UnicodeDecodeError, ValueError):
         raise ApiError("bad_request", "Request body must be valid JSON.")
     if not isinstance(obj, dict):
@@ -190,11 +194,14 @@ def decode_cursor(cursor: str | None) -> int:
         return 0
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
-        obj = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("ascii"))
-        offset = int(obj.get("o"))
-        if offset < 0:
-            raise ValueError("negative offset")
-        return offset
+        obj = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("ascii"),
+                         parse_constant=_reject_json_constant)
+        if not isinstance(obj, dict):
+            raise ValueError("cursor payload must be an object")
+        raw_offset = obj.get("o")
+        if isinstance(raw_offset, bool) or not isinstance(raw_offset, int) or raw_offset < 0 or raw_offset > 10 ** 9:
+            raise ValueError("invalid offset")
+        return raw_offset
     except Exception:
         raise ApiError("bad_request", "Parameter 'cursor' is invalid.")
 
@@ -202,6 +209,8 @@ def decode_cursor(cursor: str | None) -> int:
 def parse_limit(raw, default: int = 100, maximum: int = 500) -> int:
     if raw is None or raw == "":
         return default
+    if isinstance(raw, bool):
+        raise ApiError("bad_request", "Parameter 'limit' must be an integer.")
     try:
         val = int(raw)
     except (TypeError, ValueError):

@@ -312,20 +312,25 @@ def parse_request(ctx, body: dict) -> dict:
     mode = str(body.get("mode") or "").strip().lower()
     if mode not in MODES:
         raise ApiError("bad_request", "Field 'mode' must be one of: %s." % ", ".join(MODES))
-    models = body.get("models") or []
+    models = body.get("models")
+    if models is None:
+        models = []
     if not isinstance(models, list) or len(models) > 1000:
         raise ApiError("bad_request", "Field 'models' must be a list of model ids or patterns (max 1000).")
-    if mode in ("allow_list", "deny_list") and not models and mode == "deny_list":
+    if mode == "deny_list" and not models:
         raise ApiError("bad_request", "deny_list requires at least one model.")
     actions = _validate_actions(body.get("actions")) or list(
         (ctx.config.get("models") or {}).get("default_actions") or ["predict"])
     inherit = body.get("inherit_from_parent", False)
     if not isinstance(inherit, bool):
         raise ApiError("bad_request", "Field 'inherit_from_parent' must be a boolean.")
+    force = body.get("force", False)
+    if not isinstance(force, bool):
+        raise ApiError("bad_request", "Field 'force' must be a boolean.")
     for m in models:
         reg.parse_model_ref(m)
     return {"mode": mode, "models": [str(m).strip().lower() for m in models], "actions": actions,
-            "inherit_from_parent": inherit, "force": bool(body.get("force", False)),
+            "inherit_from_parent": inherit, "force": force,
             "reason": str(body.get("reason") or "")[:300]}
 
 
@@ -460,8 +465,11 @@ def apply_policy(ctx, scope: str, req: dict, *, dry_run: bool, if_match: str | N
     except GcpError as err:
         raise _upstream(err, scope)
     current = parse_policy(current_raw)
-    if if_match and current.get("etag") and if_match.strip('"') != str(current["etag"]).strip('"'):
-        raise ApiError("precondition_failed", "If-Match does not match the current policy etag '%s'." % current["etag"])
+    if if_match and if_match.strip() != "*":
+        cur_etag = str(current.get("etag") or "").strip('"')
+        if not cur_etag or if_match.strip().strip('"') != cur_etag:
+            raise ApiError("precondition_failed",
+                           "If-Match does not match the current policy etag '%s'." % (current.get("etag") or "none"))
     values, pairs = build_values(ctx, catalog, req) if req["mode"] in ("allow_list", "deny_list") else ([], [])
     if req["mode"] == "allow_list" and not pairs and not req["force"]:
         raise ApiError("lockout_prevented", "An allow_list with no models would block every Model Garden model in %s. "
@@ -697,9 +705,12 @@ def _model_toggle(ctx, allow: bool) -> dict:
                     "detail": "All models are already denied at this scope."}
         else:
             mode, models = "deny_list", [model_ref]
+    force = body.get("force", False)
+    if not isinstance(force, bool):
+        raise ApiError("bad_request", "Field 'force' must be a boolean.")
     req = {"mode": mode, "models": models, "actions": actions,
            "inherit_from_parent": bool((intent or {}).get("inherit_from_parent", current["inherit_from_parent"])),
-           "force": bool(body.get("force", False)), "reason": str(body.get("reason") or "")[:300]}
+           "force": force, "reason": str(body.get("reason") or "")[:300]}
     return apply_policy(ctx, scope, req, dry_run=_dry_run(ctx), catalog=catalog)
 
 
@@ -716,9 +727,13 @@ def restrict_model(ctx) -> dict:
 def bulk_apply(ctx) -> dict:
     """POST /v1/model-access/bulk-apply {scopes: ["projects/*"] | [...], mode, models, actions?, dryRun?, force?}"""
     body = ctx.body or {}
-    raw_scopes = body.get("scopes") or ["projects/*"]
-    if not isinstance(raw_scopes, list) or len(raw_scopes) > MAX_BULK_SCOPES:
-        raise ApiError("bad_request", "Field 'scopes' must be a list (max %d)." % MAX_BULK_SCOPES)
+    raw_in = body.get("scopes")
+    if raw_in is None:
+        raw_scopes = ["projects/*"]
+    else:
+        if not isinstance(raw_in, list) or not raw_in or len(raw_in) > MAX_BULK_SCOPES:
+            raise ApiError("bad_request", "Field 'scopes' must be a non-empty list (max %d)." % MAX_BULK_SCOPES)
+        raw_scopes = raw_in
     scopes = []
     for s in raw_scopes:
         s = str(s or "").strip().lower()

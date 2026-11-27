@@ -98,8 +98,13 @@ def billing_users_report(ctx) -> dict:
     query_end = min(end_utc, now)
     complete = now >= end_utc
 
+    project_f = ctx.selected_project
+    if project_f != "all":
+        _ = ctx.projects  # validates project is within managed workspace scope
+
     pricing = pricing_svc.resolve_pricing(ctx, policy)
-    usage = usage_svc.collect_usage(ctx.child(params={}), start_utc, query_end)
+    usage_params = {"project": project_f} if project_f != "all" else {}
+    usage = usage_svc.collect_usage(ctx.child(params=usage_params), start_utc, query_end)
     mode = (ctx.config.get("caps") or {}).get("chargeback_allocation_mode") or "credit_share"
     credit_per_user = float((ctx.config.get("caps") or {}).get("credit_per_user_month") or 0.0)
     prefixes = tuple((ctx.config.get("caps") or {}).get("credit_model_prefixes") or pricing_svc.CREDIT_MODEL_PREFIXES)
@@ -107,6 +112,11 @@ def billing_users_report(ctx) -> dict:
     facts: list[dict] = []
     partial_users: set[str] = set()
     for email, rec in sorted(usage.users.items()):
+        if project_f != "all":
+            proj_rec = (rec.get("by_project") or {}).get(project_f)
+            if not proj_rec:
+                continue
+            rec = dict(proj_rec, by_project={project_f: proj_rec})
         gemini_cost, other_cost, known, is_partial = pricing_svc.split_cost(rec, pricing, prefixes)
         if is_partial:
             partial_users.add(email)
@@ -236,6 +246,8 @@ def billing_users_report(ctx) -> dict:
 
     unattributed = []
     for proj, prec in sorted(usage.unattributed.items()):
+        if project_f != "all" and proj != project_f:
+            continue
         cost, partial = pricing_svc.estimate_cost(prec, pricing)
         unattributed.append({"project": proj, "requests": int(prec.get("requests") or 0),
                              "total_tokens": int(prec.get("total_tokens") or 0),

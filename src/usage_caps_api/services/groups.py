@@ -316,7 +316,9 @@ def patch_group(ctx) -> dict:
 
     def save(doc):
         groups = dict(doc.get("groups") or {})
-        g = dict(groups.get(gid) or {})
+        if gid not in groups or not isinstance(groups.get(gid), dict):
+            raise ApiError("not_found", "Group '%s' does not exist." % gid)
+        g = dict(groups[gid])
         g.update(updates, updated_at=now_iso(), updated_by=ctx.caller.id)
         groups[gid] = g
         doc["groups"] = groups
@@ -380,7 +382,9 @@ def _edit_list(ctx, field: str, event: str) -> dict:
 
     def save(doc):
         groups = dict(doc.get("groups") or {})
-        g = dict(groups.get(gid) or {})
+        if gid not in groups or not isinstance(groups.get(gid), dict):
+            raise ApiError("not_found", "Group '%s' does not exist." % gid)
+        g = dict(groups[gid])
         cur = [p for p in (g.get(field) or []) if p not in set(remove)]
         for p in add:
             if p not in cur:

@@ -78,10 +78,14 @@ def list_webhooks(ctx) -> dict:
 
 def create_webhook(ctx) -> dict:
     body = ctx.body or {}
-    url = str(body.get("url") or "").strip()
-    if not config.valid_https_url(url, check_dns=False):
+    raw_url = body.get("url")
+    if not isinstance(raw_url, str) or not config.valid_https_url(raw_url.strip(), check_dns=False):
         raise ApiError("bad_request", "Field 'url' must be a valid public HTTPS URL.")
-    name = str(body.get("name") or url)[:120].strip()
+    url = raw_url.strip()
+    raw_name = body.get("name")
+    if raw_name is not None and not isinstance(raw_name, str):
+        raise ApiError("bad_request", "Field 'name' must be a string.")
+    name = (raw_name if raw_name else url)[:120].strip()
     events = body.get("events")
     if events is None:
         events = list(SUPPORTED_EVENTS)
@@ -146,11 +150,21 @@ def delete_webhook(ctx) -> dict:
     return {"id": wh_id, "deleted": True}
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses all 3xx redirects so a registered HTTPS endpoint cannot redirect to internal/metadata IPs."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("webhook redirect blocked (HTTP %s)" % code)
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
 def _default_sender(url: str, body: bytes, headers: dict) -> int:
     if not config.valid_https_url(url, check_dns=True):
         raise ValueError("webhook URL failed public IP check")
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=DELIVERY_TIMEOUT_SECONDS) as resp:  # nosec B310
+    with _NO_REDIRECT_OPENER.open(req, timeout=DELIVERY_TIMEOUT_SECONDS) as resp:  # nosec B310
         return int(getattr(resp, "status", 200))
 
 

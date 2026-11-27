@@ -90,7 +90,8 @@ def enable_handler(ctx) -> dict:
     project = (ctx.path_params.get("project_id") or "").strip().lower()
     if project not in ctx.all_projects:
         raise ApiError("not_found", "Project '%s' is not a managed project of this hub." % project)
-    dry_run = (ctx.body or {}).get("dryRun", False)
+    body = ctx.body or {}
+    dry_run = body.get("dryRun", body.get("dry_run", False))
     if not isinstance(dry_run, bool):
         raise ApiError("bad_request", "Field 'dryRun' must be a boolean.")
     return dict({"object": "vertex_inference_logging"}, **enable(ctx, project, dry_run=dry_run))
@@ -99,12 +100,16 @@ def enable_handler(ctx) -> dict:
 def bulk_enable_handler(ctx) -> dict:
     """POST /v1/vertex-logging/enable {projects?: ["*"] | [ids], dryRun?: bool}"""
     body = ctx.body or {}
-    dry_run = body.get("dryRun", True)
+    dry_run = body.get("dryRun", body.get("dry_run", True))
     if not isinstance(dry_run, bool):
         raise ApiError("bad_request", "Field 'dryRun' must be a boolean.")
-    raw = body.get("projects") or ["*"]
-    if not isinstance(raw, list):
-        raise ApiError("bad_request", "Field 'projects' must be a list.")
+    raw_in = body.get("projects")
+    if raw_in is None:
+        raw = ["*"]
+    else:
+        if not isinstance(raw_in, list) or not raw_in:
+            raise ApiError("bad_request", "Field 'projects' must be a non-empty list.")
+        raw = raw_in
     managed = list(ctx.all_projects)
     targets = managed if "*" in raw else [p for p in (str(x).strip().lower() for x in raw) if p in managed]
     unknown = [] if "*" in raw else [x for x in raw if str(x).strip().lower() not in managed]

@@ -1522,7 +1522,7 @@ def get_user_usage(ctx) -> dict:
             "requests": drec["requests"],
             "total_tokens": drec["total_tokens"],
         })
-    cap_status = caps_svc.get_user_cap_snapshot(ctx, email)
+    cap_status = caps_svc.get_user_cap_snapshot(ctx, email, fresh=fresh)
     return {
         "object": "user_usage",
         "range": rng.meta(),

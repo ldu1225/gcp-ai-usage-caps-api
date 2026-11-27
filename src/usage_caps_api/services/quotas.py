@@ -292,7 +292,7 @@ def list_project_limits(ctx) -> dict:
 
 
 def _find_limit(ctx, project: str, lid: str) -> dict:
-    if not LIMIT_ID_RE.match(lid or ""):
+    if not isinstance(lid, str) or not LIMIT_ID_RE.match(lid):
         raise ApiError("bad_request", "Invalid rate limit id.")
     for ai_only in (True, False):
         rows, _ = project_limits(ctx, project, with_usage=True, ai_only=ai_only)
@@ -364,12 +364,14 @@ def _save_request(ctx, rec: dict):
 
 def _resolve_target(ctx, project: str, body: dict) -> dict:
     lid = body.get("limit_id")
-    if lid:
+    if lid is not None and lid != "":
         return _find_limit(ctx, project, lid)
     qid = str(body.get("quota_id") or "").strip()
     if not qid:
         raise ApiError("bad_request", "Provide 'limit_id' or 'quota_id' (+ optional 'model' / 'location' / 'dimensions').")
     raw_dims = body.get("dimensions")
+    if raw_dims is not None and not isinstance(raw_dims, dict):
+        raise ApiError("bad_request", "Field 'dimensions' must be an object {dimension: value}.")
     explicit_dims = {str(k): str(v) for k, v in raw_dims.items() if k and v not in (None, "")} if isinstance(raw_dims, dict) else {}
     model = (str(body.get("model") or explicit_dims.get("base_model") or "").strip().lower() or None)
     location = (str(body.get("location") or explicit_dims.get("region") or "").strip().lower() or None)
@@ -398,11 +400,12 @@ def _resolve_target(ctx, project: str, body: dict) -> dict:
 
 
 def _submit(ctx, row: dict, body: dict) -> dict:
+    import math
     project = row["project_id"]
     requested = body.get("requested_value")
     if requested is None and body.get("increase_pct") is not None:
         pct = body["increase_pct"]
-        if isinstance(pct, bool) or not isinstance(pct, (int, float)) or pct <= 0 or pct > 10000:
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct) or pct <= 0 or pct > 10000:
             raise ApiError("bad_request", "Field 'increase_pct' must be a positive number.")
         requested = int((row.get("limit") or 0) * (1 + pct / 100.0))
     if isinstance(requested, bool) or not isinstance(requested, int) or requested < 0 or requested > 10 ** 15:
@@ -433,14 +436,22 @@ def _submit(ctx, row: dict, body: dict) -> dict:
     dry_run = body.get("dryRun", body.get("dry_run", False))
     if not isinstance(dry_run, bool):
         raise ApiError("bad_request", "Field 'dryRun' must be a boolean.")
-    force = bool(body.get("force", False))
+    force = body.get("force", False)
+    if not isinstance(force, bool):
+        raise ApiError("bad_request", "Field 'force' must be a boolean.")
     if kind == "decrease" and row.get("usage_peak") is not None and requested < row["usage_peak"] and not force:
         raise ApiError("unprocessable", "Requested value %d is below the observed 24h peak usage %d; this will cause "
                        "429 errors. Pass force=true to confirm." % (requested, row["usage_peak"]))
     idem = ctx.headers.get("idempotency-key") or body.get("idempotency_key")
     if idem:
+        if not isinstance(idem, str) or len(idem) > 128:
+            raise ApiError("bad_request", "Idempotency-Key must be a string up to 128 characters.")
         for rec in _load_requests(ctx):
             if rec.get("idempotency_key") == idem and rec.get("project_id") == project:
+                if rec.get("limit_id") != row["id"] or rec.get("requested_value") != requested:
+                    raise ApiError("conflict",
+                                   "Idempotency-Key '%s' was already used for a different quota request." % idem,
+                                   status=409)
                 return dict(_public(rec), idempotent_replay=True)
     for rec in _load_requests(ctx):
         if rec.get("limit_id") == row["id"] and rec.get("status") == "pending" and not force:

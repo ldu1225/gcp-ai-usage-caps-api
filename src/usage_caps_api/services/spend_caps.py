@@ -5,7 +5,7 @@ Manages Cloud Billing spend cap budgets for workspace projects targeting Gemini 
 - Workspace project allowlist (never pauses projects outside workspace scope)
 - USD billing account guard (no stale FX conversion)
 - 60-char display name check (`GCP AI Cap: <project_id>`)
-- Strict ownership verification (`_not_owned`: exact project number + Agent Platform service + spendCap present)
+- Strict ownership verification (`_not_owned`: exact project number + Gemini Platform service + spendCap present)
 - Explicit administrator lift (`AWAITING_NEXT_PERIOD`) for ENFORCED caps.
 """
 
@@ -30,7 +30,7 @@ CRM_V3 = "https://cloudresourcemanager.googleapis.com/v3"
 
 DISPLAY_PREFIX = "GCP AI Cap: "
 MAX_DISPLAY_NAME = 60
-SERVICE_NAMES = ("Agent Platform", "Gemini Enterprise Agent Platform", "Vertex AI")
+SERVICE_NAMES = ("Gemini Platform", "Agent Platform", "Gemini Enterprise Agent Platform", "Vertex AI")
 SERVICE_ID = "C7E2-9256-1C43"
 THRESHOLDS = (0.5, 0.8, 1.0)
 CONFIGURED = "CONFIGURED"
@@ -45,7 +45,7 @@ BUDGET_NAME_RE = re.compile(r"billingAccounts/([0-9A-Fa-f]{6}-[0-9A-Fa-f]{6}-[0-
 PROJECT_NAME_RE = re.compile(r"projects/([0-9]{1,30})")
 CURRENCY_RE = re.compile(r"[A-Z]{3}")
 
-NOT_OWNED = "Budget display name matches, but filter does not exclusively cover this project and Agent Platform."
+NOT_OWNED = "Budget display name matches, but filter does not exclusively cover this project and Gemini Platform."
 
 
 def enabled(cfg: dict) -> bool:
@@ -262,7 +262,7 @@ def _apply_one(ctx, project: str, amount: float, *, dry_run: bool = False) -> di
             num = project_number(ctx, project)
             if not svc or not num:
                 return {"project": project, "op": "create", "status": "failed",
-                        "message": "Could not resolve Agent Platform service ID or project number."}
+                        "message": "Could not resolve Gemini Platform service ID or project number."}
             created = ctx.rest("POST", "%s/billingAccounts/%s/budgets" % (BUDGETS_V1, acct),
                                json_body=create_body(project, num, svc, amount, "USD")) or {}
             return {"project": project, "op": "create", "status": "created", "amount": amount,
@@ -410,5 +410,5 @@ def lift_project_cap(ctx) -> dict:
         "project_id": project,
         "status": "lifted",
         "budget": item["budget"],
-        "message": "Spend cap lifted until next month. Google Cloud resumes Agent Platform usage within ~1 hour.",
+        "message": "Spend cap lifted until next month. Google Cloud resumes Gemini Platform usage within ~1 hour.",
     }

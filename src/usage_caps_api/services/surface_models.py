@@ -70,6 +70,7 @@ def _app_view(engine: dict, project: str, location: str) -> dict | None:
     return {
         "object": "gemini_enterprise_app",
         "id": "%s/%s/%s" % (project, location, engine_id),
+        "path_id": "%s~%s~%s" % (project, location, engine_id),
         "project_id": project,
         "location": location,
         "engine_id": engine_id,
@@ -225,13 +226,20 @@ def apply_app_models(ctx, project: str, location: str, engine_id: str, updates: 
     return dict(result, status="updated", after=_clean_models(models))
 
 
+def _parse_dry_run(body: dict) -> bool:
+    raw = body.get("dryRun", body.get("dry_run", False))
+    if not isinstance(raw, bool):
+        raise ApiError("bad_request", "Field 'dryRun' must be a boolean.")
+    return raw
+
+
 def patch_app_models(ctx) -> dict:
     """PATCH /v1/gemini-enterprise/apps/{app_id}/models {models: {id: on|off|default}, dryRun?}"""
     project, location, engine_id = _parse_app_id(ctx.path_params.get("app_id"))
     _require_managed(ctx, project)
     body = ctx.body or {}
     updates = _clean_updates(body.get("models"))
-    dry_run = bool(body.get("dryRun", body.get("dry_run", False)))
+    dry_run = _parse_dry_run(body)
     res = apply_app_models(ctx, project, location, engine_id, updates, dry_run=dry_run)
     if res["status"] == "updated":
         if getattr(ctx.app, "cache", None) is not None:
@@ -251,10 +259,14 @@ def bulk_patch_app_models(ctx) -> dict:
     """POST /v1/gemini-enterprise/apps/bulk-models {apps: ["*"] | [app ids], models: {...}, dryRun?}"""
     body = ctx.body or {}
     updates = _clean_updates(body.get("models"))
-    dry_run = bool(body.get("dryRun", body.get("dry_run", False)))
-    targets = body.get("apps") or ["*"]
-    if not isinstance(targets, list):
-        raise ApiError("bad_request", "Field 'apps' must be a list of app ids or ['*'].")
+    dry_run = _parse_dry_run(body)
+    raw_targets = body.get("apps")
+    if raw_targets is None:
+        targets = ["*"]
+    else:
+        if not isinstance(raw_targets, list) or not raw_targets:
+            raise ApiError("bad_request", "Field 'apps' must be a non-empty list of app ids or ['*'].")
+        targets = raw_targets
     if "*" in targets:
         apps, _ = list_ge_apps(ctx)
         ids = [(a["project_id"], a["location"], a["engine_id"]) for a in apps]
@@ -354,7 +366,13 @@ def agy_models_handler(ctx) -> dict:
 
 def agy_models_write_handler(ctx) -> dict:
     """PUT /v1/antigravity/models -> 409 console_required (explicit, documented behaviour)."""
-    project = (ctx.params.get("project") or (ctx.body or {}).get("project") or ctx.project).strip().lower()
+    raw_project = ctx.params.get("project") if ctx.params.get("project") is not None else (ctx.body or {}).get("project")
+    if raw_project is None or raw_project == "":
+        project = ctx.project
+    else:
+        if not isinstance(raw_project, str) or not config.valid_project(raw_project.strip().lower()):
+            raise ApiError("bad_request", "Field 'project' must be a valid GCP project ID.")
+        project = raw_project.strip().lower()
     raise ApiError("console_required",
                    "Antigravity authorized models can only be changed in the Google Cloud Console (%s). "
                    "For API-driven control use per-user model rules." % (CONSOLE_DEVTOOLS_URL % project))

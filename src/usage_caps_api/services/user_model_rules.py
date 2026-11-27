@@ -86,7 +86,9 @@ def validate_rule(ctx, body: dict, *, is_default: bool = False) -> dict:
     if mode not in MODES or (is_default and mode == "inherit"):
         raise ApiError("bad_request", "Field 'mode' must be one of: %s." % ", ".join(
             [m for m in MODES if not (is_default and m == "inherit")]))
-    models = body.get("models") or []
+    models = body.get("models")
+    if models is None:
+        models = []
     if not isinstance(models, list) or len(models) > MAX_RULE_MODELS:
         raise ApiError("bad_request", "Field 'models' must be a list (max %d)." % MAX_RULE_MODELS)
     clean_models = []
@@ -95,11 +97,16 @@ def validate_rule(ctx, body: dict, *, is_default: bool = False) -> dict:
         m = str(m).strip().lower()
         if m not in clean_models:
             clean_models.append(m)
-    if mode == "allow_list" and not clean_models and not body.get("force"):
+    force = body.get("force", False)
+    if not isinstance(force, bool):
+        raise ApiError("bad_request", "Field 'force' must be a boolean.")
+    if mode == "allow_list" and not clean_models and not force:
         raise ApiError("lockout_prevented", "An allow_list rule with no models blocks every model; pass force=true.")
     if mode == "deny_list" and not clean_models:
         raise ApiError("bad_request", "A deny_list rule needs at least one model.")
-    limits_raw = body.get("limits") or []
+    limits_raw = body.get("limits")
+    if limits_raw is None:
+        limits_raw = []
     if not isinstance(limits_raw, list) or len(limits_raw) > MAX_LIMITS:
         raise ApiError("bad_request", "Field 'limits' must be a list (max %d)." % MAX_LIMITS)
     limits = []
@@ -126,9 +133,12 @@ def validate_rule(ctx, body: dict, *, is_default: bool = False) -> dict:
         block_minutes = _num(block_minutes, "block_minutes")
         if block_minutes > 525600:
             raise ApiError("bad_request", "Field 'block_minutes' must be <= 525600.")
-    until = body.get("until") or None
-    if until is not None and timeutil.parse_rfc3339(until) is None:
-        raise ApiError("bad_request", "Field 'until' must be an RFC3339 timestamp.")
+    until = body.get("until")
+    if until is not None and until != "":
+        if not isinstance(until, str) or timeutil.parse_rfc3339(until) is None:
+            raise ApiError("bad_request", "Field 'until' must be an RFC3339 timestamp.")
+    else:
+        until = None
     return {
         "mode": mode,
         "models": clean_models,
@@ -292,7 +302,13 @@ def _violation_key(email: str, v: dict, window_id: str) -> str:
 
 
 def _protected(ctx, email: str) -> bool:
-    prot = {str(p).lower() for p in (ctx.config.get("models") or {}).get("protected_principals") or []}
+    prot = {str(p).strip().lower() for p in (ctx.config.get("models") or {}).get("protected_principals") or [] if p}
+    hub = ctx.config.get("hub") or {}
+    for key in ("runtime_service_account", "enforcer_service_account"):
+        sa = str(hub.get(key) or "").strip().lower()
+        if sa:
+            prot.add(sa)
+    prot |= set(identity._STATE.get("protected") or ())  # pylint: disable=protected-access
     if email in prot:
         return True
     domain = email.split("@", 1)[-1] if "@" in email else ""
@@ -510,11 +526,15 @@ def evaluate_all(ctx, *, dry_run: bool = False, now: dt.datetime | None = None, 
         violations, hits = [], set()
         rec = day_usage.users.get(email) or {}
         model_projects: dict[str, set] = {}
+        model_surfaces: dict[str, set] = {}
         for proj, prec in (rec.get("by_project") or {}).items():
-            for model in (prec.get("by_model") or {}):
+            for model, pmrec in (prec.get("by_model") or {}).items():
                 model_projects.setdefault(model, set()).add(proj)
+                if pmrec.get("surface"):
+                    model_surfaces.setdefault(model, set()).add(pmrec["surface"])
         for model, mrec in (rec.get("by_model") or {}).items():
             surface = mrec.get("surface") or "antigravity"
+            model_surfaces.setdefault(model, set()).add(surface)
             kind = access_violation(rule, model, surface, mrec.get("publisher"))
             if kind:
                 violations.append({"type": kind, "model": model, "publisher": mrec.get("publisher"),
@@ -527,7 +547,14 @@ def evaluate_all(ctx, *, dry_run: bool = False, now: dt.datetime | None = None, 
             stats[model].update(day_requests=mrec.get("requests", 0), day_tokens=mrec.get("total_tokens", 0))
         if month_usage is not None:
             mrec_all = month_usage.users.get(email) or {}
+            for proj, prec in (mrec_all.get("by_project") or {}).items():
+                for model, pmrec in (prec.get("by_model") or {}).items():
+                    model_projects.setdefault(model, set()).add(proj)
+                    if pmrec.get("surface"):
+                        model_surfaces.setdefault(model, set()).add(pmrec["surface"])
             for model, mrec in (mrec_all.get("by_model") or {}).items():
+                if mrec.get("surface"):
+                    model_surfaces.setdefault(model, set()).add(mrec["surface"])
                 s = stats.setdefault(model, {})
                 s.update(month_requests=mrec.get("requests", 0), month_tokens=mrec.get("total_tokens", 0))
                 if pricing is not None:
@@ -537,7 +564,7 @@ def evaluate_all(ctx, *, dry_run: bool = False, now: dt.datetime | None = None, 
             lv["projects"] = sorted({p for m in lv["models"] for p in (model_projects.get(m) or ())})
             violations.append(lv)
             for m in lv["models"]:
-                hits.add(((rec.get("by_model") or {}).get(m) or {}).get("surface") or "antigravity")
+                hits |= (model_surfaces.get(m) or {"antigravity"})
         if violations:
             window_id = day_id
             found.append({"email": email, "rule": rule, "rule_source": source, "violations": violations,
@@ -728,18 +755,17 @@ def get_user_rate_limits(ctx) -> dict:
 def put_user_rate_limits(ctx) -> dict:
     """PUT /v1/rate-limits/users/{email} {limits: [...], on_violation?, block_minutes?}"""
     email = _email(ctx)
-    state = load_rules(ctx)
-    base = dict(state["rules"].get(email) or {"mode": "inherit"})
-    body = dict(base, **{k: v for k, v in (ctx.body or {}).items() if k in ("limits", "on_violation", "block_minutes",
-                                                                           "block_services")})
-    rule = validate_rule(ctx, body)
+    patch_fields = {k: v for k, v in (ctx.body or {}).items()
+                    if k in ("limits", "on_violation", "block_minutes", "block_services")}
 
     def save(doc):
         rules = dict(doc.get("rules") or {})
+        base = dict(rules.get(email) if isinstance(rules.get(email), dict) else {"mode": "inherit"})
+        rule = validate_rule(ctx, dict(base, **patch_fields))
         rules[email] = rule
         doc["rules"] = rules
-        return doc
-    ctx.store.mutate(RULES_DOC, save)
+        return rule
+    rule = ctx.store.mutate(RULES_DOC, save)
     audit.write_audit(ctx, "user_rate_limit.updated", target=email, details={"limits": rule["limits"]})
     return {"object": "user_rate_limits", "email": email, "limits": rule["limits"], "source": "user",
             "on_violation": rule["on_violation"]}
@@ -748,22 +774,22 @@ def put_user_rate_limits(ctx) -> dict:
 def delete_user_rate_limits(ctx) -> dict:
     """DELETE /v1/rate-limits/users/{email}: clears the user's own limits (default rule limits apply again)."""
     email = _email(ctx)
-    state = load_rules(ctx)
-    base = state["rules"].get(email)
-    if not base or not base.get("limits"):
-        raise ApiError("not_found", "No per-user rate limits found for '%s'." % email)
 
     def save(doc):
         rules = dict(doc.get("rules") or {})
-        r = dict(rules.get(email) or {})
+        cur = rules.get(email)
+        if not isinstance(cur, dict) or not cur.get("limits"):
+            return False
+        r = dict(cur)
         r["limits"] = []
         if r.get("mode") in (None, "inherit") and not r.get("models"):
             rules.pop(email, None)
         else:
             rules[email] = r
         doc["rules"] = rules
-        return doc
-    ctx.store.mutate(RULES_DOC, save)
+        return True
+    if not ctx.store.mutate(RULES_DOC, save):
+        raise ApiError("not_found", "No per-user rate limits found for '%s'." % email)
     audit.write_audit(ctx, "user_rate_limit.deleted", target=email)
     return {"object": "user_rate_limits", "email": email, "deleted": True}
 

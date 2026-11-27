@@ -182,9 +182,11 @@ class Ctx:
     @property
     def selected_project(self) -> str:
         raw = (self.params.get("project") or "all").strip().lower()
-        if raw and raw != "all" and config.valid_project(raw):
-            return raw
-        return "all"
+        if not raw or raw == "all":
+            return "all"
+        if not config.valid_project(raw):
+            raise ApiError("bad_request", "Parameter 'project' must be 'all' or a valid GCP project ID.")
+        return raw
 
     @property
     def all_projects(self) -> list[str]:
