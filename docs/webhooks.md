@@ -131,7 +131,7 @@ def verify(secret: str, headers: dict, raw_body: bytes, tolerance: int = 300) ->
 | `user.unblocked` | 수동 해제, 기간 리셋 자동 복구 | `caps.unblock_user`, `caps.enforce_cycle` | 발송 |
 | `project_cap.enforced` | 프로젝트 지출 캡(Billing Budget `spendCap.outputState`)이 `ENFORCED`인 동안, 거버넌스 주기마다 확인 — 프로젝트별 하루 1회. `SPEND_CAPS_ENABLED=true`일 때만 | `governance_cycle.notify_enforced_project_caps` | 발송 |
 | `project_cap.lifted` | `POST /v1/caps/projects/{project_id}/lift` 성공 | `spend_caps.lift_project_cap` | 발송 |
-| `model.access_changed` | Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI) 모델 접근 정책 적용, Gemini Enterprise 앱 모델 변경(단건/일괄) | `model_access`(정책 적용), `surface_models.patch_app_models`, `surface_models.bulk_patch_app_models` | 발송 |
+| `model.access_changed` | Gemini Platform 모델 접근 정책 적용, Gemini Enterprise 앱 모델 변경(단건/일괄) | `model_access`(정책 적용), `surface_models.patch_app_models`, `surface_models.bulk_patch_app_models` | 발송 |
 | `model.lifecycle_notice` | 카탈로그 모델의 `deprecation_date` 또는 `shutdown_date`가 90일 이내(이미 지난 날짜 포함) — 거버넌스 주기마다 확인, 모델·필드·날짜별 1회 | `governance_cycle.notify_model_lifecycle` | 발송 |
 | `user.model_violation` | 사용자별 모델 규칙 위반 탐지(허용되지 않은 모델, 한도 초과) — `models.violation_notify`가 `true`일 때 | `user_model_rules.apply_violations` | 발송 |
 | `rate_limit.threshold_reached` | 프로젝트 쿼터 사용률 ≥ `quotas.headroom_warn_pct`(기본 80%) — 거버넌스 주기(시간 단위) | `quotas` 임계값 점검 → `webhooks.notify_once` | 발송 |

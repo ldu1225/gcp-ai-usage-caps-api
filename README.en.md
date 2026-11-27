@@ -16,7 +16,7 @@
 
 # GCP AI Usage & Spend Caps API
 
-**GCP AI Usage & Spend Caps API** is a headless, machine-to-machine admin API that **measures, caps and enforces** the use of Google Cloud **Antigravity**, **Gemini Platform (Gemini Enterprise Agent Platform, formerly Vertex AI)** and **Gemini Enterprise** **per user, per group and per project**. Install it once in a **hub (main) project** and it governs every managed project; an existing enterprise AI portal only needs REST calls and a webhook receiver to govern Google Cloud AI the same way it governs other AI services. Cost is computed from token counts in logs multiplied by official SKU prices, so no billing data access is required, and blocks are enforced with IAM Deny v2 so they cannot be bypassed.
+**GCP AI Usage & Spend Caps API** is a headless, machine-to-machine admin API that **measures, caps and enforces** the use of Google Cloud **Antigravity**, **Gemini Platform** and **Gemini Enterprise** **per user, per group and per project**. Install it once in a **hub (main) project** and it governs every managed project; an existing enterprise AI portal only needs REST calls and a webhook receiver to govern Google Cloud AI the same way it governs other AI services. Cost is computed from token counts in logs multiplied by official SKU prices, so no billing data access is required, and blocks are enforced with IAM Deny v2 so they cannot be bypassed.
 
 > [!IMPORTANT]
 > **Cost = token counts from logs x official Cloud Billing Catalog SKU prices.** The Cloud Billing export to BigQuery is NOT used and NOT required. Amounts are list-price (or contract-price) estimates; credits, committed-use discounts and taxes are excluded. See [Cost methodology](docs/cost-methodology.md).
@@ -300,6 +300,8 @@ The header suffix can be changed with `VERTEX_USER_HEADER_LABEL` (default `user`
 | **Users and groups** | Allow / deny lists plus per-model RPM, TPM, daily / monthly token and cost limits. On violation: **immediate service block in the affected project plus a webhook** | `/v1/model-rules/...`, `/v1/users/{email}/model-rules`, `/v1/groups/{group_id}/model-rules` |
 
 Model rules resolve **user > group (by priority) > default rule**. Publishers are never guessed from names; policies use `<publisher>/<model-id>` or `<publisher>/*`. See [docs/model-governance.md](docs/model-governance.md).
+
+> **Partner models (e.g. Anthropic Claude) first-time enablement**: Official Cloud Billing Catalog SKU pricing sync (`/v1/pricing`) and log-based metering/blocking work automatically with no extra approval. However, before calling a third-party partner model such as `claude-opus-5-5` for the **first time in a new GCP project**, a project administrator must complete the one-time **Enable / Request Access** EULA flow in Google Cloud Console (**Gemini Platform → Model Garden**); otherwise direct inference returns `HTTP 404`.
 
 ## 9. Rate limits and quotas
 

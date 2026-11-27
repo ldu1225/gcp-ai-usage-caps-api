@@ -4,7 +4,7 @@
 > Enforcer Job executions, daily price sync), verifying enforcement (IAM Deny v2 typically propagates in ~1–2 minutes),
 > emergency unblock / break-glass (order matters: unblock while `enforcement_backend=iam_deny`, or delete the managed
 > deny policy after switching to `notify_only`), protected principals and `allow` overrides, a symptom → cause → fix
-> troubleshooting table (missing usage data, Gemini Platform (Gemini Enterprise Agent Platform, formerly Vertex AI) `requests_only`, high `unattributed`, unpriced models, VPC-SC
+> troubleshooting table (missing usage data, Gemini Platform `requests_only`, high `unattributed`, unpriced models, VPC-SC
 > denials, permission denied on Org Policy / Cloud Quotas / deny policies, IAM v2 read quota, Pub/Sub push failures,
 > Scheduler, stuck quota requests, model policy drift, Gemini Enterprise `not_applicable`), webhook signature
 > verification with a Python sample, API key rotation, GCS state bucket backup/restore, upgrade/rollback, and §10 on
@@ -49,7 +49,7 @@ ADMIN_KEY=gcpai_xxxxxxxxxxxx_yyyyyyyy...   # admin 스코프 키
 | Enforcer Job 실행 이력 | `gcloud run jobs executions list --job $SVC-enforcer --region $REGION --project $HUB --limit 5` | 5분 간격 성공 실행 |
 | 스케줄러 | `gcloud scheduler jobs describe $SVC-enforce-schedule --location $REGION --project $HUB --format='value(state,lastAttemptTime,status)'` | `ENABLED`, 최근 시도 성공 |
 | **단가 동기화** | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/pricing" \| jq '.pricing_source'` / `gcloud scheduler jobs describe $SVC-pricing-sync --location $REGION --project $HUB` | `catalog_synced_at`이 24시간 이내, `official_sku_models > 0`, `billing_export: "not_used"` |
-| **Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI) 토큰 출처** | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/usage/users?limit=1" \| jq '.telemetry'` | `token_sources.gemini_platform = "logs"`, `attribution.unattributed`가 전체 대비 작음 |
+| **Gemini Platform 토큰 출처** | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/usage/users?limit=1" \| jq '.telemetry'` | `token_sources.gemini_platform = "logs"`, `attribution.unattributed`가 전체 대비 작음 |
 | 실시간 구독 적체 | Cloud Monitoring `pubsub.googleapis.com/subscription/num_undelivered_messages` (구독 `$SVC-usage-events-push`) | 0 근처 |
 | 감사 로그 | `curl -s -H "Authorization: Bearer $ADMIN_KEY" "$API/v1/audit-logs"` | 예상하지 못한 `api_key.created`, `user.blocked` 등 없음 |
 

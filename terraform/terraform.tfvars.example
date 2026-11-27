@@ -39,8 +39,9 @@ create_vertex_logging_reader_role = true
 
 # Project hard spend caps (costs come from log token counts x official Cloud Billing Catalog SKU prices;
 # no Cloud Billing export is needed)
-billing_account_id = ""
-spend_caps_enabled = false
+billing_account_id  = ""
+spend_caps_enabled  = false
+grant_billing_roles = false # set true when the Terraform caller holds roles/billing.admin on billing_account_id
 
 # Enforcement, models and quotas
 enforcement_backend    = "iam_deny"
@@ -53,7 +54,8 @@ cap_currency           = "USD"
 pricing_sync_schedule  = "0 3 * * *"
 
 # Optional runtime settings (empty = application defaults)
-cap_scope                   = "" # total | per_project
-vertex_user_header_label    = ""
-metered_surfaces            = []
-model_violation_block_scope = "" # project | all
+cap_scope                      = "" # total | per_project
+vertex_user_header_label       = ""
+metered_surfaces               = []
+model_violation_block_scope    = "" # project | all
+oidc_internal_service_accounts = [] # extra Pub/Sub or Scheduler OIDC SAs allowed on /v1/internal/*

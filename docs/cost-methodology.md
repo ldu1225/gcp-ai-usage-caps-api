@@ -10,7 +10,7 @@
 
 | 항목 | 내용 |
 |---|---|
-| 사용량(토큰 수) 출처 | **Cloud Logging 로그만** 사용 — Antigravity 추론 로그, Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI) 추론 요청 로그(`aiplatform.googleapis.com/inference_request`), Data Access 감사 로그(요청 수·사용자 귀속), Gemini Enterprise 활동 로그 |
+| 사용량(토큰 수) 출처 | **Cloud Logging 로그만** 사용 — Antigravity 추론 로그, Gemini Platform 추론 요청 로그(`aiplatform.googleapis.com/inference_request`), Data Access 감사 로그(요청 수·사용자 귀속), Gemini Enterprise 활동 로그 |
 | 단가 출처 | **공식 Cloud Billing Catalog API의 SKU 목록가**(`cloudbilling.googleapis.com/v1/services/{id}/skus`), 매일 동기화 · 또는 계약 단가 override |
 | Cloud Billing Export | **사용하지 않음 · 필요 없음** (BigQuery 결제 내보내기 테이블을 읽지 않으며 설정 항목도 없음) |
 | 결과의 성격 | **목록가 기준 추정액** — 크레딧·약정 사용 할인(CUD)·협상 할인(override 미입력 시)·세금 **미반영** |

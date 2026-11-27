@@ -120,7 +120,7 @@ caps:write,users:write`, 모델 관리 도구 `models:read,models:write`.
 
 | 주체 | 핵심 권한 | 의도적으로 **없는** 권한 |
 |---|---|---|
-| 런타임 SA `ai-usage-caps-api` | 로그·BigQuery 읽기(`logging.viewer`, `privateLogViewer`, `bigquery.dataViewer`, `jobUser`), 감사 로그 쓰기(`logging.logWriter`), 쿼터(`cloudquotas.admin`), GE 앱(`discoveryengine.editor`), 조직 `iam.denyReviewer`(읽기만), 조직 `orgpolicy.policyAdmin`(모델 거버넌스), 1권한 커스텀 역할 `gcpAiCapsVertexLoggingReader`(`aiplatform.endpoints.fetchPublisherModelConfig`) | IAM Deny 정책 쓰기(`iam.denyAdmin`), 프로젝트 IAM 변경, SA 키, **결제 계정·Billing Export 데이터 읽기**(단가는 공개 Cloud Billing Catalog API), Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI) 로그 설정 쓰기(`setPublisherModelConfig` — 필요 시 별도 부여), Google Admin의 그룹 쓰기 권한 |
+| 런타임 SA `ai-usage-caps-api` | 로그·BigQuery 읽기(`logging.viewer`, `privateLogViewer`, `bigquery.dataViewer`, `jobUser`), 감사 로그 쓰기(`logging.logWriter`), 쿼터(`cloudquotas.admin`), GE 앱(`discoveryengine.editor`), 조직 `iam.denyReviewer`(읽기만), 조직 `orgpolicy.policyAdmin`(모델 거버넌스), 1권한 커스텀 역할 `gcpAiCapsVertexLoggingReader`(`aiplatform.endpoints.fetchPublisherModelConfig`) | IAM Deny 정책 쓰기(`iam.denyAdmin`), 프로젝트 IAM 변경, SA 키, **결제 계정·Billing Export 데이터 읽기**(단가는 공개 Cloud Billing Catalog API), Gemini Platform 로그 설정 쓰기(`setPublisherModelConfig` — 필요 시 별도 부여), Google Admin의 그룹 쓰기 권한 |
 | 집행 SA `ai-usage-caps-enforcer` | 조직 `iam.denyAdmin`, 로그·BigQuery 읽기 | 조직 정책 쓰기, 쿼터, Discovery Engine |
 | 싱크 writer identity | 감사 **데이터세트에만** WRITER, 허브 토픽에만 publisher | 프로젝트 수준 BigQuery 권한 |
 | Pub/Sub 서비스 에이전트 | 런타임 SA에 대한 `iam.serviceAccountTokenCreator`(푸시 OIDC) | — |

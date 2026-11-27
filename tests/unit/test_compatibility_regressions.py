@@ -211,21 +211,46 @@ class CompatibilityRegressionTests(unittest.TestCase):
         self.assertEqual(len(da_filters), 1)
         self.assertIn("protoPayload.methodName=~", da_filters[0])
 
-    def test_e2e_pick_model_reads_lifecycle_stage_and_skips_preview_omni(self):
+    def test_e2e_pick_model_prefers_latest_gemini4_and_skips_preview_omni(self):
         mod = _load_e2e_module()
-        args = argparse.Namespace(api_url="http://127.0.0.1:0", admin_key="k", project="p",
-                                  location="global", test_sa="sa@p.iam.gserviceaccount.com", model=None)
-        run = mod.Run(args)
-        sample_models = {"data": [
+        def _run_with(models):
+            args = argparse.Namespace(api_url="http://127.0.0.1:0", admin_key="k", project="p",
+                                      location="global", test_sa="sa@p.iam.gserviceaccount.com", model=None)
+            r = mod.Run(args)
+            with mock.patch.object(mod.Run, "api", return_value=(200, {"data": models})):
+                r.pick_model()
+            return r.model
+
+        # 1) Modern catalog: prefers gemini-4-carbon over argon/neon/3.8-flash/2.5-flash and skips preview/omni/image
+        picked = _run_with([
             {"id": "gemini-omni-1.2-flash", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-3.5-flash-preview", "lifecycle": {"stage": "preview"}},
-            {"id": "gemini-2.5-flash-lite", "lifecycle": {"stage": "ga"}},
+            {"id": "gemini-4-carbon-preview", "lifecycle": {"stage": "preview"}},
+            {"id": "gemini-4-argon", "lifecycle": {"stage": "ga"}},
+            {"id": "gemini-4-carbon", "lifecycle": {"stage": "ga"}},
+            {"id": "gemini-4-neon", "lifecycle": {"stage": "ga"}},
+            {"id": "gemini-3.8-flash", "lifecycle": {"stage": "ga"}},
             {"id": "gemini-2.5-flash", "lifecycle": {"stage": "ga"}},
-            {"id": "gemini-2.0-flash", "lifecycle": {"stage": "ga"}},
-        ]}
-        with mock.patch.object(mod.Run, "api", return_value=(200, sample_models)):
-            run.pick_model()
-        self.assertEqual(run.model, "gemini-2.5-flash")
+            {"id": "gemini-nano-banana-2.1", "lifecycle": {"stage": "ga"}},
+        ])
+        self.assertEqual(picked, "gemini-4-carbon")
+
+        # 2) When carbon is absent, prefers gemini-4-argon over 3.8-flash
+        picked2 = _run_with([
+            {"id": "gemini-3.8-flash", "lifecycle": {"stage": "ga"}},
+            {"id": "gemini-4-argon", "lifecycle": {"stage": "ga"}},
+            {"id": "gemini-4-neon", "lifecycle": {"stage": "ga"}},
+        ])
+        self.assertEqual(picked2, "gemini-4-argon")
+
+        # 3) Legacy catalog without Gemini 4 still skips preview/omni/lite cleanly
+        picked3 = _run_with([
+            {"id": "gemini-omni-1.2-flash", "lifecycle": {"stage": "ga"}},
+            {"id": "gemini-3.8-flash-preview", "lifecycle": {"stage": "preview"}},
+            {"id": "gemini-3.8-flash-lite", "lifecycle": {"stage": "ga"}},
+            {"id": "gemini-3.8-flash", "lifecycle": {"stage": "ga"}},
+            {"id": "gemini-2.5-flash", "lifecycle": {"stage": "ga"}},
+        ])
+        self.assertEqual(picked3, "gemini-3.8-flash")
 
     def test_deny_policy_client_caches_reads_and_invalidates_on_write(self):
         app, gcp = build_test_app()
@@ -566,6 +591,53 @@ class CompatibilityRegressionTests(unittest.TestCase):
         cost_flex, _, _ = pricing_svc.model_cost("gemini-4-carbon", agg_flex, pr)
         # 1M * $2.0 (flex) + 1M * $4.0 (on_demand remainder) = $6.0
         self.assertAlmostEqual(cost_flex, 6.0, places=6)
+
+    def test_openapi_documents_fresh_and_quota_dimensions(self):
+        import yaml
+        oas_path = os.path.join(config.repo_root(), "openapi.yaml")
+        with open(oas_path, encoding="utf-8") as fh:
+            spec = yaml.safe_load(fh)
+        paths = spec["paths"]
+        for path in ("/v1/usage/users", "/v1/usage/users/{email}", "/v1/caps/users",
+                     "/v1/caps/users/{email}", "/v1/caps/groups", "/v1/caps/groups/{group_id}"):
+            params = paths[path]["get"].get("parameters") or []
+            names = {p.get("name") for p in params if isinstance(p, dict)}
+            self.assertIn("fresh", names, f"Missing ?fresh=true parameter in OpenAPI GET {path}")
+        rl_props = spec["components"]["schemas"]["RateLimit"]["properties"]
+        self.assertIn("required_dimensions", rl_props)
+        self.assertIn("dimensions_complete", rl_props)
+        qri_props = spec["components"]["schemas"]["QuotaRequestInput"]["properties"]
+        self.assertIn("dimensions", qri_props)
+        # Verify every local $ref resolves cleanly inside openapi.yaml
+        def _walk_refs(node):
+            if isinstance(node, dict):
+                ref = node.get("$ref")
+                if isinstance(ref, str) and ref.startswith("#/"):
+                    cur = spec
+                    for seg in ref[2:].split("/"):
+                        cur = cur[seg]
+                for v in node.values():
+                    _walk_refs(v)
+            elif isinstance(node, list):
+                for item in node:
+                    _walk_refs(item)
+        _walk_refs(spec)
+
+    def test_terraform_module_sync_enforcer_browser_and_internal_oidc(self):
+        tf_dir = os.path.join(config.repo_root(), "terraform")
+        with open(os.path.join(tf_dir, "main.tf"), encoding="utf-8") as fh:
+            main_tf = fh.read()
+        with open(os.path.join(tf_dir, "variables.tf"), encoding="utf-8") as fh:
+            vars_tf = fh.read()
+        self.assertIn("OIDC_INTERNAL_SERVICE_ACCOUNTS = join(\",\", var.oidc_internal_service_accounts)", main_tf)
+        self.assertIn('variable "oidc_internal_service_accounts"', vars_tf)
+        self.assertIn('variable "grant_billing_roles"', vars_tf)
+        self.assertIn('resource "google_billing_account_iam_member" "api_billing_costs_manager"', main_tf)
+        # Ensure roles/browser is granted to enforcer SA on both hub and managed projects
+        enforcer_block = main_tf.split("enforcer_roles = [", 1)[1].split("]", 1)[0]
+        enforcer_managed_block = main_tf.split("enforcer_managed_roles = concat([", 1)[1].split("]", 1)[0]
+        self.assertIn('"roles/browser"', enforcer_block)
+        self.assertIn('"roles/browser"', enforcer_managed_block)
 
 
 if __name__ == "__main__":

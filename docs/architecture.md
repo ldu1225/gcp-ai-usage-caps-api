@@ -1,6 +1,6 @@
 # 아키텍처 (Architecture)
 
-> **English summary** - One *hub* project hosts a headless Cloud Run API, a Cloud Run Enforcer Job, a GCS state bucket, a central BigQuery dataset, a Pub/Sub topic, Secret Manager and Cloud Scheduler (5-minute enforcement, daily price sync, hourly group sync). Every *managed (spoke)* project routes AI usage **logs** to the hub - Antigravity `inference_response`, Gemini Platform (Gemini Enterprise Agent Platform, formerly Vertex AI) `inference_request` (token counts, enabled per project) and Data Access audit logs (caller identity), Gemini Enterprise activity - BigQuery for history, Pub/Sub for real time. Cost = log token counts x **official Cloud Billing Catalog SKU prices**; the **Cloud Billing export is not used**. The model catalog is live Model Garden plus models observed in logs (no built-in list). Policies apply to users, groups (explicit members plus Cloud Identity group sync) and a global default. Controls are enforced back on every spoke through IAM Deny v2 (per project, or per folder/organization), Organization Policy (`vertexai.allowedModels`), Discovery Engine and the Cloud Quotas API, and every state change is pushed to the portal as a signed outbound webhook.
+> **English summary** - One *hub* project hosts a headless Cloud Run API, a Cloud Run Enforcer Job, a GCS state bucket, a central BigQuery dataset, a Pub/Sub topic, Secret Manager and Cloud Scheduler (5-minute enforcement, daily price sync, hourly group sync). Every *managed (spoke)* project routes AI usage **logs** to the hub - Antigravity `inference_response`, Gemini Platform `inference_request` (token counts, enabled per project) and Data Access audit logs (caller identity), Gemini Enterprise activity - BigQuery for history, Pub/Sub for real time. Cost = log token counts x **official Cloud Billing Catalog SKU prices**; the **Cloud Billing export is not used**. The model catalog is live Model Garden plus models observed in logs (no built-in list). Policies apply to users, groups (explicit members plus Cloud Identity group sync) and a global default. Controls are enforced back on every spoke through IAM Deny v2 (per project, or per folder/organization), Organization Policy (`vertexai.allowedModels`), Discovery Engine and the Cloud Quotas API, and every state change is pushed to the portal as a signed outbound webhook.
 
 ## 1. 전체 구성 (Hub-and-Spoke)
 
@@ -35,7 +35,7 @@
 | surface id | 서비스 |
 |---|---|
 | `antigravity` | Antigravity |
-| `gemini_platform` | Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI). 레거시 id `vertex_ai`도 별칭으로 계속 허용되며 `gemini_platform`으로 정규화됩니다 |
+| `gemini_platform` | Gemini Platform. 레거시 id `vertex_ai`도 별칭으로 계속 허용되며 `gemini_platform`으로 정규화됩니다 |
 | `gemini_enterprise` | Gemini Enterprise |
 
 ### 1.2 그룹 / 정책 주체 (Groups / policy subjects)

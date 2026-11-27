@@ -127,7 +127,7 @@ class Run:
 
     # -- helpers -------------------------------------------------------------------
     def user_cap(self) -> dict:
-        st, body = self.api("GET", "/v1/caps/users/%s" % self.q(self.a.test_sa))
+        st, body = self.api("GET", "/v1/caps/users/%s?fresh=true" % self.q(self.a.test_sa))
         return body if st == 200 else {}
 
     def wait_usage(self, minimum: int) -> tuple[bool, float, int]:
@@ -145,23 +145,43 @@ class Run:
             return
         st, page = self.api("GET", "/v1/models?publisher=google&limit=500")
         rows = page.get("data") or [] if st == 200 else []
-        def ok(m):
-            mid = str(m.get("id") or "")
-            lc = m.get("lifecycle") if isinstance(m.get("lifecycle"), dict) else {}
-            stage = str(lc.get("stage") or m.get("launch_stage") or "").upper()
-            return ("flash" in mid and mid.startswith("gemini-")
-                    and not any(x in mid for x in ("image", "tts", "audio", "live", "embedding", "omni", "preview", "exp", "lite"))
-                    and stage in ("GA", ""))
+        skip_primary = ("image", "tts", "audio", "live", "embedding", "omni", "preview", "exp", "lite",
+                        "nano", "veo", "imagen", "chirp", "lyria", "code", "computer", "robotics")
+        skip_fallback = ("image", "tts", "audio", "live", "embedding", "omni", "veo", "imagen", "chirp", "lyria")
+        tier_rank = {"carbon": 60, "argon": 50, "neon": 40, "hydrogen": 30, "pro": 20, "flash": 10}
 
-        cands = sorted((m for m in rows if ok(m)), key=lambda m: str(m.get("id")), reverse=True)
+        def _stage(m) -> str:
+            lc = m.get("lifecycle") if isinstance(m.get("lifecycle"), dict) else {}
+            return str(lc.get("stage") or m.get("launch_stage") or "").upper()
+
+        def _score(m) -> tuple[int, int, int, str]:
+            mid = str(m.get("id") or "").lower()
+            parts = mid.split("-")
+            major, minor = 0, 0
+            for token in parts[1:]:
+                if token and token[0].isdigit():
+                    nums = token.split(".")
+                    if nums[0].isdigit():
+                        major = int(nums[0])
+                        minor = int(nums[1]) if len(nums) > 1 and nums[1].isdigit() else 0
+                    break
+            tr = max((score for name, score in tier_rank.items() if name in parts), default=0)
+            return (major, minor, tr, mid)
+
+        def ok(m):
+            mid = str(m.get("id") or "").lower()
+            return (mid.startswith("gemini-")
+                    and not any(x in mid for x in skip_primary)
+                    and _stage(m) in ("GA", ""))
+
+        cands = sorted((m for m in rows if ok(m)), key=_score, reverse=True)
         if not cands:
             def fallback_ok(m):
-                mid = str(m.get("id") or "")
-                lc = m.get("lifecycle") if isinstance(m.get("lifecycle"), dict) else {}
-                stage = str(lc.get("stage") or m.get("launch_stage") or "").upper()
-                return ("flash" in mid and not any(x in mid for x in ("image", "tts", "audio", "live", "embedding", "omni"))
-                        and stage in ("GA", ""))
-            cands = sorted((m for m in rows if fallback_ok(m)), key=lambda m: str(m.get("id")), reverse=True)
+                mid = str(m.get("id") or "").lower()
+                return (mid.startswith("gemini-")
+                        and not any(x in mid for x in skip_fallback)
+                        and _stage(m) in ("GA", ""))
+            cands = sorted((m for m in rows if fallback_ok(m)), key=_score, reverse=True)
         if not cands:
             raise SystemExit("Could not pick a model from GET /v1/models; pass --model <model-id>.")
         self.model = cands[0]["id"]

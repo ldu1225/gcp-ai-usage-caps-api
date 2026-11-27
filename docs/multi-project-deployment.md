@@ -3,7 +3,7 @@
 > **English summary** — One **hub** project hosts the Cloud Run API, the Enforcer Job, the GCS state bucket, the
 > Pub/Sub real-time topic and Cloud Scheduler, and governs any number of **managed (spoke)** projects. Every managed
 > project gets a Log Router sink into one central BigQuery dataset (default) and a Pub/Sub sink into the single hub
-> topic (Antigravity `inference_response` + Gemini Platform (Gemini Enterprise Agent Platform, formerly Vertex AI)
+> topic (Antigravity `inference_response` + Gemini Platform
 > `inference_request`), Gemini Platform inference request logging, plus
 > least-privilege grants for the runtime and enforcer service accounts. Users ↔ projects are **N:M**: usage is
 > measured per (user, project) and caps can be total or per project, so an over-cap in one project suspends the user
@@ -79,7 +79,7 @@ flowchart LR
 | `<service>-usage-events` | `log_id("businessaicode.googleapis.com/inference_response") OR log_id("aiplatform.googleapis.com/inference_request")` | `pubsub.googleapis.com/projects/<HUB>/topics/<service>-usage-events` | 허브 토픽에 `roles/pubsub.publisher` |
 
 > [!NOTE]
-> `aiplatform.googleapis.com/inference_request`는 Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI) 토큰 수의 유일한 로그 출처이며, 프로젝트마다 **추론 요청 메타데이터 로깅**을 켜야 생성됩니다(`prepare.sh` 5단계 / Terraform `enable_vertex_inference_logging`, 기본 켜짐). 1.1 이하에서 만든 싱크를 채택(`--reuse-sinks`)했다면 필터에 이 로그를 추가하세요. 결제 내보내기(Billing Export) 싱크·데이터세트는 필요 없습니다.
+> `aiplatform.googleapis.com/inference_request`는 Gemini Platform 토큰 수의 유일한 로그 출처이며, 프로젝트마다 **추론 요청 메타데이터 로깅**을 켜야 생성됩니다(`prepare.sh` 5단계 / Terraform `enable_vertex_inference_logging`, 기본 켜짐). 1.1 이하에서 만든 싱크를 채택(`--reuse-sinks`)했다면 필터에 이 로그를 추가하세요. 결제 내보내기(Billing Export) 싱크·데이터세트는 필요 없습니다.
 
 - 실시간 경로: Antigravity 추론 로그와 Gemini Platform 추론 요청 로그 → 각 프로젝트 Pub/Sub 싱크 → **하나의** 허브 토픽 → 푸시 구독(OIDC, 런타임 SA
   서명) → `POST /v1/internal/usage-event`. Pub/Sub 서비스 에이전트

@@ -1,7 +1,7 @@
 # 실환경 E2E 검증 가이드 (Live E2E Test)
 
 이 문서는 실제 Google Cloud 프로젝트(예: `duleetest`)에서 **한도 초과 시 실제로 차단(HTTP 403)되는지**를
-처음부터 끝까지 자동으로 검증하는 절차입니다. 실제 Gemini Platform(Gemini Enterprise Agent Platform, 구 Vertex AI)
+처음부터 끝까지 자동으로 검증하는 절차입니다. 실제 Gemini Platform
 모델 호출과 실제 IAM Deny v2 정책을 사용합니다.
 
 ## 1. 무엇을 검증하나

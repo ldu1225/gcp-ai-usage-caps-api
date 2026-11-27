@@ -4,7 +4,7 @@ info:
   version: 1.3.0
   description: |
     Headless M2M REST API for enterprise AI management portals to query per-user Google Cloud AI
-    usage & estimated costs (Antigravity, Gemini Platform - Gemini Enterprise Agent Platform, formerly Gemini Platform -,
+    usage & estimated costs (Antigravity, Gemini Platform,
     Gemini Enterprise) and
     enforce user-level and project-level Spend Caps via IAM Deny v2 and Cloud Billing Spend Caps.
 
@@ -34,7 +34,7 @@ info:
     - **Multi-project users**: usage, caps (`cap_scope`, `project_caps`, `project_defaults`) and blocks
       (`projects: [...]`) work per (user, project); one hub governs every managed project.
     - **Project Spend Cap Lift**: Lifting an `ENFORCED` Google Cloud Billing Spend Cap takes up to
-      **~1 hour** for Google Cloud to resume Agent Platform traffic.
+      **~1 hour** for Google Cloud to resume Gemini Platform traffic.
 
 servers:
   - url: https://your-api-service.run.app
@@ -123,6 +123,9 @@ paths:
         - name: model
           in: query
           schema: { type: string, description: "Only users who used this exact model id" }
+        - name: fresh
+          in: query
+          schema: { type: boolean, default: false, description: "Bypass usage cache and merge recent Cloud Logging tail entries" }
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
@@ -184,6 +187,9 @@ paths:
         - name: project
           in: query
           schema: { type: string }
+        - name: fresh
+          in: query
+          schema: { type: boolean, default: false, description: "Bypass usage cache and merge recent Cloud Logging tail entries" }
       responses:
         "200":
           description: User usage details, time series, and active cap status
@@ -301,6 +307,9 @@ paths:
         - name: multi_project
           in: query
           schema: { type: boolean, description: "Only users active in more than one project" }
+        - name: fresh
+          in: query
+          schema: { type: boolean, default: false, description: "Bypass cached usage/cap snapshots and compute fresh status" }
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
@@ -342,6 +351,9 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - name: fresh
+          in: query
+          schema: { type: boolean, default: false, description: "Bypass cached usage/cap snapshots and compute fresh status" }
       responses:
         "200":
           description: User cap status
@@ -692,6 +704,7 @@ paths:
       summary: List group spend caps with pooled usage, utilization and member status counts
       description: Requires `caps:read`.
       parameters:
+        - { name: fresh, in: query, schema: { type: boolean, default: false }, description: Bypass cached usage/cap snapshots }
         - { $ref: "#/components/parameters/Limit" }
         - { $ref: "#/components/parameters/Cursor" }
       responses:
@@ -711,7 +724,9 @@ paths:
       tags: [Groups, Spend Caps]
       summary: Get one group's spend cap status
       description: Requires `caps:read`.
-      parameters: [{ $ref: "#/components/parameters/GroupId" }]
+      parameters:
+        - { $ref: "#/components/parameters/GroupId" }
+        - { name: fresh, in: query, schema: { type: boolean, default: false }, description: Bypass cached usage/cap snapshots }
       responses:
         "200": { description: Group cap, content: { application/json: { schema: { $ref: "#/components/schemas/GroupCap" } } } }
         "404": { $ref: "#/components/responses/Error" }
@@ -796,7 +811,7 @@ paths:
     put:
       tags: [Project Spend Caps]
       summary: Configure and optionally apply a monthly USD project spend cap
-      description: Requires scope `caps:write`. Uses Cloud Billing Budget API v1 spendCap for Agent Platform.
+      description: Requires scope `caps:write`. Uses Cloud Billing Budget API v1 spendCap for Gemini Platform.
       parameters:
         - name: project_id
           in: path
@@ -1508,9 +1523,10 @@ paths:
       tags: [Rate Limits & Quotas]
       summary: Submit a quota increase/decrease directly to Google Cloud (one project or many)
       description: |
-        Requires `quotas:write`. Target with `limit_id`, or `quota_id` (+ `model`, `location`). Bulk with
-        `projects: ["*"]`. Increases need `justification` (>=10 chars) and `contact_email`. Supports
-        `Idempotency-Key` header and `dryRun`.
+        Requires `quotas:write`. Target with `limit_id` (must have `dimensions_complete: true`), or `quota_id`
+        (+ `model`, `location`, or explicit `dimensions`). Returns `422` (including `dryRun: true`) if a default
+        fallback row is missing `required_dimensions`. Bulk with `projects: ["*"]`. Increases need `justification`
+        (>=10 chars) and `contact_email`. Supports `Idempotency-Key` header and `dryRun`.
       parameters:
         - { name: Idempotency-Key, in: header, schema: { type: string } }
       requestBody:
@@ -2368,6 +2384,8 @@ components:
         model: { type: [string, "null"] }
         location: { type: string }
         dimensions: { type: object }
+        required_dimensions: { type: array, items: { type: string }, description: "Dimension keys required by Cloud Quotas when submitting a QuotaPreference" }
+        dimensions_complete: { type: boolean, description: "True when all required_dimensions are populated on this row (false on default fallback rows)" }
         is_default: { type: boolean }
         limit: { type: [integer, "null"] }
         usage_peak: { type: [integer, "null"] }
@@ -2388,6 +2406,7 @@ components:
         quota_id: { type: string }
         model: { type: string }
         location: { type: string }
+        dimensions: { type: object, additionalProperties: { type: string }, description: "Explicit Cloud Quotas dimension map (required if targeting a multi-dimension quota without a concrete limit_id)" }
         requested_value: { type: integer, minimum: 0 }
         increase_pct: { type: number, exclusiveMinimum: 0 }
         justification: { type: string, minLength: 10 }

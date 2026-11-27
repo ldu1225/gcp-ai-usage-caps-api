@@ -110,6 +110,7 @@ locals {
   ]
 
   enforcer_roles = [
+    "roles/browser",
     "roles/bigquery.dataViewer",
     "roles/bigquery.jobUser",
     "roles/logging.viewer",
@@ -129,6 +130,7 @@ locals {
   ], local.central ? [] : ["roles/bigquery.dataViewer"])
 
   enforcer_managed_roles = concat([
+    "roles/browser",
     "roles/logging.viewer",
     "roles/logging.privateLogViewer",
   ], local.central ? [] : ["roles/bigquery.dataViewer"])
@@ -173,45 +175,46 @@ locals {
   vertex_reader_projects        = var.create_vertex_logging_reader_role ? toset(concat([var.project_id], var.grant_managed_roles ? local.managed_projects : [])) : toset([])
 
   common_env = {
-    HOST                          = "0.0.0.0"
-    PROJECT_ID                    = var.project_id
-    SCAN_PROJECTS                 = join(",", local.managed_projects)
-    SCAN_ALL_PROJECTS             = "false"
-    QUOTA_PROJECT_ID              = var.quota_project_id
-    AUDIT_DATASET_ID              = local.dataset_id
-    AUDIT_PROJECT_ID              = local.audit_project
-    SCOPE_TYPE                    = var.scope_type
-    SCOPE_IDS                     = join(",", var.scope_ids)
-    BILLING_ACCOUNT_ID            = var.billing_account_id
-    WORKSPACE_TIMEZONE            = var.workspace_timezone
-    SETTINGS_BUCKET               = google_storage_bucket.state.name
-    PUBLIC_BASE_URL               = local.public_base_url
-    OIDC_ALLOWED_SERVICE_ACCOUNTS = join(",", var.oidc_allowed_service_accounts)
-    HUB_REGION                    = var.region
-    SERVICE_NAME                  = var.service_name
-    RUNTIME_SERVICE_ACCOUNT       = google_service_account.api_sa.email
-    ENFORCER_SERVICE_ACCOUNT      = google_service_account.enforcer_sa.email
-    ORG_ID                        = var.organization_id
-    VPC_NETWORK                   = var.vpc_network
-    VPC_SUBNET                    = var.vpc_subnet
-    VPC_EGRESS                    = var.vpc_network != "" ? var.vpc_egress : ""
-    ENFORCEMENT_BACKEND           = var.enforcement_backend
-    ENFORCEMENT_MODE              = var.enforcement_mode
-    DENY_ATTACHMENT               = var.deny_attachment
-    DENY_POLICY_ID                = var.deny_policy_id
-    ENFORCEMENT_JOB               = local.enforcer_job_ref
-    USAGE_EVENTS_TOPIC            = var.realtime_enforcement ? local.usage_topic_name : ""
-    USAGE_EVENTS_SUBSCRIPTION     = var.realtime_enforcement ? local.usage_sub_ref : ""
-    SPEND_CAPS_ENABLED            = var.spend_caps_enabled ? "true" : "false"
-    CAP_CURRENCY                  = var.cap_currency
-    QUOTA_CONTACT_EMAIL           = var.quota_contact_email
-    MODEL_VIOLATION_ACTION        = var.model_violation_action
-    CAP_SCOPE                     = var.cap_scope
-    VERTEX_USER_HEADER_LABEL      = var.vertex_user_header_label
-    METERED_SURFACES              = join(",", var.metered_surfaces)
-    MODEL_VIOLATION_BLOCK_SCOPE   = var.model_violation_block_scope
-    VERTEX_LOGGING_ENDPOINT       = var.vertex_logging_endpoint
-    SERVICE_ACCOUNT_SUBJECTS      = var.service_account_subjects ? "true" : "false"
+    HOST                           = "0.0.0.0"
+    PROJECT_ID                     = var.project_id
+    SCAN_PROJECTS                  = join(",", local.managed_projects)
+    SCAN_ALL_PROJECTS              = "false"
+    QUOTA_PROJECT_ID               = var.quota_project_id
+    AUDIT_DATASET_ID               = local.dataset_id
+    AUDIT_PROJECT_ID               = local.audit_project
+    SCOPE_TYPE                     = var.scope_type
+    SCOPE_IDS                      = join(",", var.scope_ids)
+    BILLING_ACCOUNT_ID             = var.billing_account_id
+    WORKSPACE_TIMEZONE             = var.workspace_timezone
+    SETTINGS_BUCKET                = google_storage_bucket.state.name
+    PUBLIC_BASE_URL                = local.public_base_url
+    OIDC_ALLOWED_SERVICE_ACCOUNTS  = join(",", var.oidc_allowed_service_accounts)
+    OIDC_INTERNAL_SERVICE_ACCOUNTS = join(",", var.oidc_internal_service_accounts)
+    HUB_REGION                     = var.region
+    SERVICE_NAME                   = var.service_name
+    RUNTIME_SERVICE_ACCOUNT        = google_service_account.api_sa.email
+    ENFORCER_SERVICE_ACCOUNT       = google_service_account.enforcer_sa.email
+    ORG_ID                         = var.organization_id
+    VPC_NETWORK                    = var.vpc_network
+    VPC_SUBNET                     = var.vpc_subnet
+    VPC_EGRESS                     = var.vpc_network != "" ? var.vpc_egress : ""
+    ENFORCEMENT_BACKEND            = var.enforcement_backend
+    ENFORCEMENT_MODE               = var.enforcement_mode
+    DENY_ATTACHMENT                = var.deny_attachment
+    DENY_POLICY_ID                 = var.deny_policy_id
+    ENFORCEMENT_JOB                = local.enforcer_job_ref
+    USAGE_EVENTS_TOPIC             = var.realtime_enforcement ? local.usage_topic_name : ""
+    USAGE_EVENTS_SUBSCRIPTION      = var.realtime_enforcement ? local.usage_sub_ref : ""
+    SPEND_CAPS_ENABLED             = var.spend_caps_enabled ? "true" : "false"
+    CAP_CURRENCY                   = var.cap_currency
+    QUOTA_CONTACT_EMAIL            = var.quota_contact_email
+    MODEL_VIOLATION_ACTION         = var.model_violation_action
+    CAP_SCOPE                      = var.cap_scope
+    VERTEX_USER_HEADER_LABEL       = var.vertex_user_header_label
+    METERED_SURFACES               = join(",", var.metered_surfaces)
+    MODEL_VIOLATION_BLOCK_SCOPE    = var.model_violation_block_scope
+    VERTEX_LOGGING_ENDPOINT        = var.vertex_logging_endpoint
+    SERVICE_ACCOUNT_SUBJECTS       = var.service_account_subjects ? "true" : "false"
   }
 }
 
@@ -306,6 +309,14 @@ resource "google_organization_iam_member" "org_roles" {
   org_id   = var.organization_id
   role     = split("|", each.key)[1]
   member   = each.value
+}
+
+# Optional Billing Account role for project-level Cloud Billing hard spend caps (requires roles/billing.admin)
+resource "google_billing_account_iam_member" "api_billing_costs_manager" {
+  count              = var.grant_billing_roles && var.spend_caps_enabled && var.billing_account_id != "" ? 1 : 0
+  billing_account_id = var.billing_account_id
+  role               = "roles/billing.costsManager"
+  member             = local.api_sa_member
 }
 
 # 3. Private Versioned GCS State Bucket

@@ -16,7 +16,7 @@
 
 # GCP AI Usage & Spend Caps API
 
-**GCP AI Usage & Spend Caps API**는 Google Cloud의 **Antigravity**, **Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI)**, **Gemini Enterprise** 사용을 **사용자 · 그룹 · 프로젝트 단위로 측정하고, 지출 한도를 걸고, 실제로 차단까지 집행하는** UI 없는(Headless) M2M 관리 API입니다. **허브(메인) 프로젝트 한 곳**에 설치하면 여러 관리 대상 프로젝트 전체를 관할하며, 이미 운영 중인 사내 AI 통합 포털은 REST 호출과 Webhook 수신만으로 Google Cloud AI를 다른 AI 서비스와 같은 방식으로 통제할 수 있습니다. 비용은 로그의 토큰 수에 공식 SKU 단가를 곱해 계산하므로 결제 데이터 접근이 필요 없고, 차단은 IAM Deny v2로 집행되어 우회할 수 없습니다.
+**GCP AI Usage & Spend Caps API**는 Google Cloud의 **Antigravity**, **Gemini Platform**, **Gemini Enterprise** 사용을 **사용자 · 그룹 · 프로젝트 단위로 측정하고, 지출 한도를 걸고, 실제로 차단까지 집행하는** UI 없는(Headless) M2M 관리 API입니다. **허브(메인) 프로젝트 한 곳**에 설치하면 여러 관리 대상 프로젝트 전체를 관할하며, 이미 운영 중인 사내 AI 통합 포털은 REST 호출과 Webhook 수신만으로 Google Cloud AI를 다른 AI 서비스와 같은 방식으로 통제할 수 있습니다. 비용은 로그의 토큰 수에 공식 SKU 단가를 곱해 계산하므로 결제 데이터 접근이 필요 없고, 차단은 IAM Deny v2로 집행되어 우회할 수 없습니다.
 
 > [!IMPORTANT]
 > **비용 = 로그의 토큰 수 x 공식 Cloud Billing Catalog SKU 단가.** Cloud Billing Export(BigQuery 결제 내보내기)는 사용하지 않으며 필요하지도 않습니다. 금액은 목록가(또는 계약 단가) 기준 추정치이며 크레딧·약정 할인·세금은 제외됩니다. 자세한 내용은 [비용 산정 방식](docs/cost-methodology.md)을 참고하세요.
@@ -300,6 +300,8 @@ def generate(user_email: str, prompt: str) -> dict:
 | **사용자 · 그룹** | 허용/차단 목록 + 모델별 RPM·TPM·일/월 토큰·비용 한도. 위반 시 **해당 프로젝트에서 즉시 서비스 차단 + Webhook** | `/v1/model-rules/...`, `/v1/users/{email}/model-rules`, `/v1/groups/{group_id}/model-rules` |
 
 모델 규칙 해석 순서는 **사용자 > 그룹(우선순위 순) > 기본 규칙**입니다. publisher는 이름으로 추측하지 않으며, 정책에는 `<publisher>/<model-id>` 또는 `<publisher>/*` 형식을 사용합니다. 자세한 내용은 [docs/model-governance.md](docs/model-governance.md)를 참고하세요.
+
+> **파트너 모델(Anthropic Claude 등) 최초 활성화 안내**: Cloud Billing Catalog 공식 SKU 동기화(`/v1/pricing`)와 로그 기반 집계·차단은 별도 승인 없이 자동 동작합니다. 다만 신규 GCP 프로젝트에서 `claude-opus-5-5` 같은 서드파티 파트너 모델을 **처음 추론 호출**하려면 프로젝트 관리자가 Google Cloud 콘솔 **Gemini Platform → Model Garden**에서 해당 모델의 **Enable / Request Access**(약관 동의)를 프로젝트별 최초 1회 완료해야 합니다(미동의 시 추론 API가 `HTTP 404` 반환).
 
 ## 9. Rate Limit · 쿼터
 

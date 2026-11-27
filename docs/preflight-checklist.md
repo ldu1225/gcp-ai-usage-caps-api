@@ -409,7 +409,7 @@ curl -s -H "Authorization: Bearer $KEY" "$API/v1/projects/team-a/capabilities" \
 
 사용 API: Cloud Logging v2 `sinks.list`(프로젝트 + `includeChildren`인 상위 폴더/조직 싱크), `exclusions.list`,
 CRM `getIamPolicy`(프로젝트/폴더/조직의 `auditConfigs`), BigQuery `datasets.get`(접근 목록), Pub/Sub
-`topics.getIamPolicy`, Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI) v1beta1 `projects/P:fetchPublisherModelConfig`.
+`topics.getIamPolicy`, Gemini Platform v1beta1 `projects/P:fetchPublisherModelConfig`.
 
 필요 로그(`NEEDED_LOGS`): `businessaicode.googleapis.com/inference_response`,
 **`aiplatform.googleapis.com/inference_request`**(Gemini Platform 토큰 출처), `cloudaudit.googleapis.com/data_access`,

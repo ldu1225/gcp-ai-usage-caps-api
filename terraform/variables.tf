@@ -139,13 +139,25 @@ variable "workspace_timezone" {
 variable "public_base_url" {
   type        = string
   default     = ""
-  description = "Public base URL for OIDC token audience validation (defaults to Cloud Run URL)."
+  description = "Public base URL (or comma-separated dual Cloud Run URLs) for OIDC token audience validation (defaults to Cloud Run URL)."
 }
 
 variable "oidc_allowed_service_accounts" {
   type        = list(string)
   default     = []
   description = "External GCP service accounts permitted to call the API with OIDC Bearer tokens."
+}
+
+variable "oidc_internal_service_accounts" {
+  type        = list(string)
+  default     = []
+  description = "Additional GCP service accounts allowed to call /v1/internal/* (e.g. custom Pub/Sub push or Cloud Scheduler SAs)."
+}
+
+variable "grant_billing_roles" {
+  type        = bool
+  default     = false
+  description = "Grant roles/billing.costsManager on billing_account_id to the API runtime SA (requires roles/billing.admin on the billing account; needed for project hard spend caps)."
 }
 
 variable "bootstrap_admin_key_secret" {

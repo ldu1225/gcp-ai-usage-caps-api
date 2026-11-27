@@ -2,7 +2,7 @@
 
 > 이 문서는 고객 보안·운영 검토용입니다. 이 API의 **모든 차단/해제**(지출 캡 초과, 수동 차단, 사용자별 모델 규칙 위반)는 하나의 엔진을 거칩니다.
 > 이 엔진은 레퍼런스 리포지토리 `ldu1225/ai-control-plane`의 `enforcers.py` · `usage_events.py` · `enforce_job.py` · `spend_caps.py`에서 **검증된 로직을 그대로 이식·재구성**하고, 1.2.0에서 **프로젝트 단위(멀티 프로젝트) 집행**으로 확장했습니다.
-> 대상 AI 서비스는 Antigravity, Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI), Gemini Enterprise입니다. 사용자뿐 아니라 **그룹**도 같은 엔진으로 집행됩니다([9장](#9-그룹-groups)).
+> 대상 AI 서비스는 Antigravity, Gemini Platform, Gemini Enterprise입니다. 사용자뿐 아니라 **그룹**도 같은 엔진으로 집행됩니다([9장](#9-그룹-groups)).
 
 > **English summary** — One managed IAM Deny v2 policy per attachment point (each managed project, or the folder/organization scope), one deny rule per AI surface. Desired state is computed **per attachment point**: global entries (no `projects`) go to every scope attachment point, project-scoped entries only to `projects/{id}`. A user who overspends in one project is suspended only there (`plan.suspend_projects`); model-rule violations block only in the violating project by default (`models.violation_block_scope`). Safety gates G1–G7 still guard every automatic change; propagation takes ~1–2 minutes.
 

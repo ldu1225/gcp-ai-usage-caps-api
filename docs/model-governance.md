@@ -1,6 +1,6 @@
 # 모델 거버넌스 & 쿼터 API 가이드
 
-기존 AI 벤더 Admin API에서 고객 포털이 쓰던 기능(**모델 조회 · 모델 제한 · 제한 해제 · Rate Limit 조회/조정 · 쿼터 상향 요청**)을 Google Cloud에서 **메인(허브) 프로젝트 한 곳에서 모든 관리 대상 프로젝트에** 똑같이 쓰도록 만든 API입니다. 대상 서비스는 Antigravity, Gemini Platform (Gemini Enterprise Agent Platform, 구 Vertex AI), Gemini Enterprise입니다.
+기존 AI 벤더 Admin API에서 고객 포털이 쓰던 기능(**모델 조회 · 모델 제한 · 제한 해제 · Rate Limit 조회/조정 · 쿼터 상향 요청**)을 Google Cloud에서 **메인(허브) 프로젝트 한 곳에서 모든 관리 대상 프로젝트에** 똑같이 쓰도록 만든 API입니다. 대상 서비스는 Antigravity, Gemini Platform, Gemini Enterprise입니다.
 
 > 모든 예시는 `BASE=https://<cloud-run-url>` 와 `KEY=gcpai_...` (적절한 scope) 를 가정합니다.
 
