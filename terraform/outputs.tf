@@ -56,3 +56,8 @@ output "usage_event_sink_writers" {
   value       = { for p, s in google_logging_project_sink.usage_events : p => s.writer_identity }
   description = "Writer identity of the real-time Pub/Sub sink in each project (granted Pub/Sub Publisher on the hub topic)."
 }
+
+output "bootstrap_admin_key_command" {
+  description = "Prints the bootstrap admin API key (Secret Manager)."
+  value       = "gcloud secrets versions access latest --secret=${local.bootstrap_secret} --project=${var.project_id}"
+}

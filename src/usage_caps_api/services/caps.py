@@ -901,7 +901,9 @@ def _compute_caps_status_uncached(ctx, *, fresh: bool = False, now: dt.datetime 
     gates, plan = evaluate_gates_and_plan(
         rows,
         deny_readable=deny_state.readable,
-        telemetry_ok=usage_res.ok,
+        # A partially readable window (one surface / project failed) must not release over-cap users: their
+        # overspend may live exactly in the unreadable source.
+        telemetry_ok=usage_res.ok and not getattr(usage_res, "degraded", None),
         telemetry_records=usage_res.records,
         telemetry_truncated=usage_res.truncated,
         policy=policy,

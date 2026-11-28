@@ -274,6 +274,9 @@ def phase_user_cap(r: Run):
     cap = base + r.a.cap
     st, res = r.api("PUT", "/v1/caps/users/%s" % sa, {"type": "limit", "request_cap": cap, "note": "e2e live test"})
     r.cleanup.append(("delete user cap", lambda: r.api("DELETE", "/v1/caps/users/%s" % sa)))
+    if st == 400 and "valid email" in str((res or {}).get("error", {}).get("message", "")):
+        r.info("service-account caps are opt-in: redeploy with SERVICE_ACCOUNT_SUBJECTS=true "
+               "(SERVICE_ACCOUNT_SUBJECTS=true scripts/deploy.sh --project %s ...)" % r.a.project)
     r.step("A1 user request cap set", st == 200, "request_cap=%d (baseline %d requests this period)" % (cap, base))
     codes = [r.call_model() for _ in range(r.a.cap + 1)]
     r.step("A2 calls under/over the cap succeed (cap is enforced after logs arrive)",
@@ -281,7 +284,9 @@ def phase_user_cap(r: Run):
     ok, secs, seen = r.wait_usage(base + len(codes))
     r.step("A3 usage visible from logs", ok, "requests=%d after %.0fs" % (seen, secs), log_latency_s=secs)
     snap = r.user_cap()
-    r.step("A4 status over_cap with utilization >= 100 pct", snap.get("status") == "over_cap",
+    # The real-time Pub/Sub path can suspend the identity before this check: blocked/suspended also proves over-cap.
+    r.step("A4 status over_cap with utilization >= 100 pct",
+           snap.get("status") in ("over_cap", "blocked", "suspended") and float(snap.get("utilization_pct") or 0) >= 100,
            "status=%s utilization=%s%% cost=%s" % (snap.get("status"), snap.get("utilization_pct"),
                                                    (snap.get("usage") or {}).get("estimated_cost")))
     run = r.enforce()

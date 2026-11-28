@@ -231,6 +231,7 @@ class UsageResult:
         self.models_seen: dict[str, dict] = {}      # model -> {publisher, surfaces, projects, users, requests, ...}
         self.attribution: dict[str, int] = {k: 0 for k in ATTRIBUTION_KINDS}
         self.token_sources: dict[str, str] = {}     # surface -> "logs" | "requests_only" | "unavailable"
+        self.degraded: set[str] = set()             # log sources that failed while reading (partial telemetry)
         self.computed_at: dt.datetime | None = None  # when the logs were read (cache snapshots keep the original time)
 
     def user(self, person: str) -> dict:
@@ -371,6 +372,7 @@ class UsageResult:
             if p not in self.project_last or last > self.project_last[p]:
                 self.project_last[p] = last
         self.token_sources.update(other.token_sources)
+        self.degraded |= set(getattr(other, "degraded", ()) or ())
 
 
 def _window_params(start: dt.datetime, end: dt.datetime) -> dict:
@@ -612,6 +614,7 @@ def _logging_antigravity(ctx, start: dt.datetime, end: dt.datetime, *, email: st
         if not ok:
             if p == ctx.project:
                 raise val
+            ctx.warn_error("api:logging.entries:%s" % p, val, "Antigravity Cloud Logging usage")
             continue
         entries, truncated = val
         usage.truncated = usage.truncated or truncated
@@ -640,10 +643,17 @@ def antigravity_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str |
         try:
             usage = _bq_antigravity(ctx, src, start, end, email=email, rng=rng)
             ctx.add_source(src.label)
-            if fresh and mode == "auto":
-                # Tail read from Cloud Logging for the newest entries not yet flushed to BigQuery.
+            if mode == "auto":
+                # Cloud Logging for (a) managed projects that have no per-project sink table yet (always) and
+                # (b) the fresh=True tail of entries not yet flushed to BigQuery.
+                covered = set(ctx.projects) if ctx.central_audit_project else {s.project for s in _sources_of(src)}
                 tail_ranges = {}
                 for p in ctx.projects:
+                    if p not in covered:
+                        tail_ranges[p] = (start, end)
+                        continue
+                    if not fresh:
+                        continue
                     last = usage.project_last.get(p)
                     lo = (last + dt.timedelta(microseconds=1)) if (last and last >= start) else start
                     if lo < end:
@@ -1102,6 +1112,8 @@ def _logging_vertex(ctx, start: dt.datetime, end: dt.datetime, *,
                     inf.append(item)
         elif p == ctx.project and isinstance(val, GcpError):
             raise val
+        elif not ok:
+            ctx.warn_error("api:logging.entries:%s" % p, val, "Gemini Platform inference request logs")
         if need_audit:
             ok, val = res.get(("aud", p), (False, None))
             if ok:
@@ -1262,14 +1274,14 @@ def _fetch_vertex_raw(ctx, start: dt.datetime, end: dt.datetime, *,
             audit_rows = audit_rows if audit_rows is not None else log_audit
             ctx.add_source("api:logging.entries")
         except GcpError as err:
-            if mode == "logging":
+            if mode == "logging" or not bq_ok:
                 ctx.warn_error("api:logging.entries", err, "Gemini Platform inference request logs")
             if not bq_ok:
                 inf_rows = None
     elif bq_ok and inf_rows and mode == "auto":
         # Merge Cloud Logging for (a) projects whose per-project BQ table doesn't exist yet (e.g. newly onboarded)
         # and (b) fresh=True tail entries not yet flushed by the BigQuery streaming sink.
-        audit_proj = ((ctx.config.get("workspace") or {}).get("audit_project_id") or "").strip()
+        audit_proj = ctx.central_audit_project
         bq_covered = set(ctx.projects) if audit_proj else {s.project for s in _sources_of(src)}
         last_by_proj: dict[str, dt.datetime] = {}
         for r in inf_rows:
@@ -1487,6 +1499,8 @@ def _collect_usage_uncached(ctx, start: dt.datetime, end: dt.datetime, *, email:
         if ok and isinstance(val, UsageResult) and val.ok:
             any_ok = True
             combined.merge(val)
+        elif not ok:
+            ctx.warn_error(name, val, "%s usage" % name)
     if "gemini_platform" in res:
         ok, val = res["gemini_platform"]
         if ok:
@@ -1546,6 +1560,7 @@ def collect_usage(ctx, start: dt.datetime, end: dt.datetime, *, email: str | Non
     def compute():
         sub = ctx.child()
         usage = _collect_usage_uncached(sub, start, end, email=email, rng=rng, wanted=wanted, fresh=fresh)
+        usage.degraded |= set(sub.degraded)
         return usage, set(sub.sources), list(sub.warnings)
 
     if cache is not None and ttl > 0:
@@ -1642,6 +1657,7 @@ def usage_meta(usage: UsageResult) -> dict:
         "token_sources": dict(usage.token_sources),
         "unattributed_projects": sorted(usage.unattributed.keys()),
         "telemetry_ok": usage.ok,
+        "degraded_sources": sorted(getattr(usage, "degraded", ()) or ()),
         "truncated": usage.truncated,
     }
 

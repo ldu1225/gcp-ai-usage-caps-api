@@ -281,6 +281,25 @@ class MultiTableSource:
         return "%s AS (%s)" % (quote_ident(name), "\nUNION ALL ".join(parts))
 
 
+def _as_gcp_error(err: Exception):
+    """Maps google-cloud-bigquery client exceptions (tables.get) to the classified GcpError used everywhere else."""
+    from .gcp import GcpError, _classify_api_error
+    if isinstance(err, GcpError):
+        return err
+    try:
+        from google.api_core import exceptions as gexc  # type: ignore
+        if isinstance(err, gexc.GoogleAPICallError):
+            return _classify_api_error(err, "schema")
+    except ImportError:  # pragma: no cover
+        pass
+    name = type(err).__name__
+    if "RefreshError" in name or "DefaultCredentialsError" in name or "TransportError" in name:
+        return GcpError("credentials", message=name)
+    if "Timeout" in name:
+        return GcpError("timeout", message=name)
+    return GcpError("http", message=name)
+
+
 class SchemaRegistry:
     """Discovers BigQuery tables and schemas with TTL caching."""
 
@@ -328,7 +347,10 @@ class SchemaRegistry:
         key = ("schema_loc", project, dataset, table)
         def load():
             client = self.gcp.bq_client(quota_project)
-            tbl = client.get_table("%s.%s.%s" % (project, dataset, table))
+            try:
+                tbl = client.get_table("%s.%s.%s" % (project, dataset, table))
+            except Exception as err:  # pylint: disable=broad-except
+                raise _as_gcp_error(err)
             tp = getattr(tbl, "time_partitioning", None)
             pfield = getattr(tp, "field", None) if tp else None
             ingestion = tp is not None and not pfield

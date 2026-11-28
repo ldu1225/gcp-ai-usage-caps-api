@@ -17,7 +17,7 @@ import urllib.request
 
 from .. import config
 from ..gcp import GcpError
-from ..httpkit import now_iso
+from ..httpkit import ApiError, now_iso
 from . import models_catalog as mc
 from . import pricing
 from .base import to_float
@@ -143,7 +143,7 @@ def _collapse(candidates: dict, scale: float = 1e6, fx_rate: float = 1.0) -> dic
     return out
 
 
-def _scan(ctx, services, currency: str):
+def _scan(ctx, services, currency: str, failures: list | None = None):
     candidates: dict = {}
     usd_rate, effective = None, None
     excluded = list(ctx.excluded_patterns)
@@ -157,6 +157,8 @@ def _scan(ctx, services, currency: str):
                     candidates.setdefault((key, tier, direction), []).append((rank, price, threshold, sku))
         except GcpError as err:
             LOG.warning("catalog sync skipped service=%s kind=%s", svc["name"], err.kind)
+            if failures is not None:
+                failures.append(svc["id"])
     return candidates, usd_rate, effective
 
 
@@ -173,9 +175,19 @@ def sync_pricing(ctx) -> dict:
     from . import caps as caps_svc
     now = now_iso()
     learned = learn_families(ctx)
-    services = select_model_services(list_catalog_services(ctx), ctx.config)
-    candidates, _rate, _eff = _scan(ctx, services, "USD")
+    try:
+        services = select_model_services(list_catalog_services(ctx), ctx.config)
+    except GcpError as err:
+        raise ApiError("upstream_error", "Cloud Billing Catalog could not be read (%s); previously synced prices are "
+                       "kept. Check cloudbilling.googleapis.com access, VPC Service Controls and egress." % err.kind)
+    failures: list = []
+    candidates, _rate, _eff = _scan(ctx, services, "USD", failures)
     models_out = _collapse(candidates)
+    if failures or not models_out:
+        # Never let a partial / failed scan wipe good prices: keep previously synced entries that were not refreshed.
+        prev, _ = ctx.store.load("pricing", fresh=True)
+        for key, entry in (prev.get("models") or {}).items():
+            models_out.setdefault(key, entry)
 
     # Fetch FX for configured and active-policy non-USD currencies
     currencies: list[str] = []
@@ -229,6 +241,7 @@ def sync_pricing(ctx) -> dict:
     return {
         "synced_at": now,
         "services_scanned": len(services),
+        "services_failed": len(failures),
         "models_synced": len(models_out),
         "models_with_tiers": sum(1 for v in models_out.values() if v.get("tiers")),
         "families_learned": learned,

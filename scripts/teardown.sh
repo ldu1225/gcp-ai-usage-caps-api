@@ -22,6 +22,13 @@ HELP
 init_defaults
 parse_common_args "$@"
 finalize_args
+if [[ "$SCOPE_TYPE" != "projects" ]]; then
+  # Resolve every project under the folder/org scope (read-only preflight) so their sinks are removed too.
+  SKIP_PREFLIGHT_BLOCKERS=1
+  DRY_RUN_SAVED="$DRY_RUN"; DRY_RUN=0
+  run_preflight
+  DRY_RUN="$DRY_RUN_SAVED"
+fi
 load_project_arrays
 
 del() { run "$@" --quiet 2>/dev/null || true; }

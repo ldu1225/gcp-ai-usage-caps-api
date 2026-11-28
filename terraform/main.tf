@@ -26,10 +26,24 @@ terraform {
       source  = "hashicorp/google"
       version = ">= 6.0.0, < 8.0.0"
     }
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = ">= 6.0.0, < 8.0.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = ">= 3.5.0, < 4.0.0"
+    }
   }
 }
 
 provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+# Only for google_project_service_identity (the Pub/Sub service agent does not exist yet in a brand-new project).
+provider "google-beta" {
   project = var.project_id
   region  = var.region
 }
@@ -43,6 +57,7 @@ locals {
   enforcer_sa_member = "serviceAccount:${google_service_account.enforcer_sa.email}"
   quota_project      = var.quota_project_id != "" ? var.quota_project_id : var.project_id
   settings_bucket    = var.settings_bucket_name != "" ? var.settings_bucket_name : "${var.project_id}-${var.service_name}-state"
+  bootstrap_secret   = var.bootstrap_admin_key_secret != "" ? var.bootstrap_admin_key_secret : "${var.service_name}-bootstrap-key"
   dataset_location   = var.dataset_location != "" ? var.dataset_location : var.region
   run_url            = "https://${var.service_name}-${data.google_project.this.number}.${var.region}.run.app"
   public_base_url    = var.public_base_url != "" ? trimsuffix(var.public_base_url, "/") : local.run_url
@@ -533,15 +548,12 @@ resource "google_cloud_run_v2_service" "api" {
         }
       }
 
-      dynamic "env" {
-        for_each = var.bootstrap_admin_key_secret != "" ? [1] : []
-        content {
-          name = "BOOTSTRAP_ADMIN_KEY"
-          value_source {
-            secret_key_ref {
-              secret  = var.bootstrap_admin_key_secret
-              version = "latest"
-            }
+      env {
+        name = "BOOTSTRAP_ADMIN_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = local.bootstrap_secret
+            version = "latest"
           }
         }
       }
@@ -552,7 +564,46 @@ resource "google_cloud_run_v2_service" "api" {
     google_project_service.apis,
     google_project_iam_member.api_roles,
     google_storage_bucket_iam_member.api_state_rw,
+    google_secret_manager_secret_iam_member.api_bootstrap,
+    google_secret_manager_secret_version.bootstrap,
   ]
+}
+
+# Bootstrap admin API key: generated and stored in Secret Manager unless var.bootstrap_admin_key_secret names an
+# existing secret. User-managed replication in the hub region (gcp.resourceLocations rejects automatic replication).
+# Read it with the bootstrap_admin_key_command output.
+resource "random_password" "bootstrap" {
+  count   = var.bootstrap_admin_key_secret == "" ? 1 : 0
+  length  = 43
+  special = false
+}
+
+resource "google_secret_manager_secret" "bootstrap" {
+  count     = var.bootstrap_admin_key_secret == "" ? 1 : 0
+  project   = var.project_id
+  secret_id = "${var.service_name}-bootstrap-key"
+  replication {
+    user_managed {
+      replicas {
+        location = var.region
+      }
+    }
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "bootstrap" {
+  count       = var.bootstrap_admin_key_secret == "" ? 1 : 0
+  secret      = google_secret_manager_secret.bootstrap[0].id
+  secret_data = "gcpai_${random_password.bootstrap[0].result}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_bootstrap" {
+  project    = var.project_id
+  secret_id  = local.bootstrap_secret
+  role       = "roles/secretmanager.secretAccessor"
+  member     = local.api_sa_member
+  depends_on = [google_secret_manager_secret.bootstrap]
 }
 
 # Public edge (the application still enforces Bearer API key / OIDC). Skipped when domain restricted sharing forbids
@@ -671,12 +722,21 @@ resource "google_pubsub_topic_iam_member" "usage_sink_pub" {
   member   = each.value.writer_identity
 }
 
+# The Pub/Sub service agent is created lazily; make sure it exists before granting it (new projects).
+resource "google_project_service_identity" "pubsub" {
+  count      = var.realtime_enforcement ? 1 : 0
+  provider   = google-beta
+  project    = var.project_id
+  service    = "pubsub.googleapis.com"
+  depends_on = [google_project_service.apis]
+}
+
 resource "google_service_account_iam_member" "pubsub_token_creator" {
   count              = var.realtime_enforcement ? 1 : 0
   service_account_id = google_service_account.api_sa.name
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
-  depends_on         = [google_project_service.apis]
+  depends_on         = [google_project_service.apis, google_project_service_identity.pubsub]
 }
 
 resource "google_pubsub_subscription" "usage_events_push" {

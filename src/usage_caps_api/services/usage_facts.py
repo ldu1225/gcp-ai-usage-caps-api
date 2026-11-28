@@ -255,14 +255,21 @@ def antigravity_atoms(ctx, start, end, *, fresh: bool = False) -> tuple[list[dic
             else:
                 ctx.warn_error(s.label, val, "Antigravity BigQuery usage facts")
         if any_ok:
-            if fresh and mode == "auto":
+            if mode == "auto":
                 last: dict[str, dt.datetime] = {}
                 for a in atoms:
                     if a["project"] and (a["project"] not in last or a["ts"] > last[a["project"]]):
                         last[a["project"]] = a["ts"]
-                # Hour-floored atoms: re-read the newest hour from Cloud Logging and drop the BigQuery copy of it.
+                # Cloud Logging for (a) managed projects without a per-project sink table yet (always, full window) and
+                # (b) when fresh, the newest hour of covered projects (hour-floored atoms: drop the BigQuery copy).
+                covered = set(ctx.projects) if ctx.central_audit_project else {s.project for s in parts}
                 tail = {}
                 for p in ctx.projects:
+                    if p not in covered:
+                        tail[p] = (start, end)
+                        continue
+                    if not fresh:
+                        continue
                     lo = max(start, last[p]) if p in last else start
                     if lo < end:
                         tail[p] = (lo, end)
@@ -272,8 +279,9 @@ def antigravity_atoms(ctx, start, end, *, fresh: bool = False) -> tuple[list[dic
                         atoms = [a for a in atoms if not (a["project"] in tail and a["ts"] >= tail[a["project"]][0])]
                         atoms.extend(extra)
                         ctx.add_source("api:logging.entries")
-                    except GcpError:
-                        pass
+                    except GcpError as err:
+                        if any(p not in covered for p in tail):
+                            ctx.warn_error("api:logging.entries", err, "Antigravity Cloud Logging usage facts")
             return atoms, False, "logs"
         if mode == "bigquery":
             return [], False, "unavailable"

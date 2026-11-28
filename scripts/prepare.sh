@@ -95,7 +95,8 @@ if [[ "$ENABLE_VERTEX_INFERENCE_LOGGING" == "true" ]]; then
       info "${pid}: already ENABLED (preflight)"
       continue
     fi
-    if _csv_has "${PREFLIGHT_VERTEX_LOGGING_NA:-}" "$pid"; then
+    # The hub got aiplatform.googleapis.com in step 1 (after the preflight ran on a blank hub): never skip it.
+    if [[ "$pid" != "$HUB" ]] && _csv_has "${PREFLIGHT_VERTEX_LOGGING_NA:-}" "$pid"; then
       info "${pid}: aiplatform.googleapis.com not enabled (Gemini Platform unused); skipped"
       continue
     fi

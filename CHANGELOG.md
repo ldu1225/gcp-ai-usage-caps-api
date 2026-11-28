@@ -1,5 +1,42 @@
 # Changelog
 
+## [1.4.1] - 2026-11-28
+*어떤 고객 환경에서도 한 줄 설치 · 깡통 프로젝트 실설치 검증 · 런타임 안전성 수정*
+*One-command install in any customer environment, verified live on brand-new projects; runtime safety fixes*
+
+새로 만든 빈 프로젝트 3개(허브 단독, 허브+스포크)에 README의 설치 명령을 그대로 실행하고, 재실행·기존 운영 프로젝트 dry-run·실제 403 차단/해제까지 확인하면서 찾은 문제를 고쳤습니다.
+*Found by running the README install command on three brand-new projects (hub only, hub + spoke), re-running it, dry-running an existing production hub, and blocking / unblocking a real caller.*
+
+### 설치 (Installer)
+- **빈 허브에서 사전 점검이 "프로젝트 없음"으로 설치를 막던 문제**: 아직 API가 꺼진 허브를 쿼터 프로젝트(`x-goog-user-project`)로 보내 403 `SERVICE_DISABLED`가 났습니다. 이 경우 헤더 없이 다시 요청합니다(사전 점검 토큰 클라이언트와 런타임 클라이언트 모두).
+  *Preflight blocked every brand-new hub ("project does not exist"): the hub was sent as quota project before its APIs were enabled. Requests now retry without the header on `SERVICE_DISABLED` / `USER_PROJECT_DENIED` for the quota project.*
+- **빈 프로젝트에서 이미지 빌드 실패**: Cloud Build 기본 계정(Compute Engine 기본 SA)은 새 프로젝트에서 권한이 없거나 존재하지 않습니다. 전용 최소 권한 빌드 계정 `ai-usage-caps-build`(자기 소스 버킷 읽기, `ai-usage-caps` 저장소 쓰기, 로그 쓰기)과 허브 리전 소스 버킷·리전 빌드로 실행합니다. `gcp.resourceLocations`에서도 동작합니다.
+  *Image build failed in new projects (default Cloud Build identity lacks access). Builds now run as a dedicated least-privilege `ai-usage-caps-build` SA, regional, with a regional staging bucket.*
+- **부트스트랩 관리자 키가 사라지던 문제**: 키가 만들어진 뒤 설치가 중단되면 다시 표시되지 않았습니다. 생성 즉시 출력하고, 매 실행 끝에 `gcloud secrets versions access` 명령을 안내합니다.
+- 비밀은 허브 리전 사용자 관리 복제로 생성(`gcp.resourceLocations` 호환).
+- 새 서비스 계정 전파 대기(`wait_for_sa`)와 IAM 부여 재시도 확대. 버킷·시크릿·Cloud Run 바인딩이 일시적 "SA 없음"으로 설치를 중단시키지 않습니다.
+- Pub/Sub 서비스 에이전트를 먼저 생성한 뒤 부여하고, 실패해도 설치를 멈추지 않습니다(2021-04 이후 프로젝트에는 불필요). Terraform은 `google_project_service_identity`.
+- 빈 허브 첫 설치에서 허브의 Gemini Platform 추론 요청 로그 활성화가 건너뛰어지던 문제.
+- 프로젝트 번호 조회 실패 시 `000000000000`으로 잘못된 URL을 만들던 문제(이제 명확한 오류). 재실행 시 Pub/Sub 푸시 엔드포인트와 안전망 스케줄러도 갱신.
+- 입력 검증: `--service-name`(소문자·49자), 도메인 범위 허브 ID 거부, 대문자 관리 프로젝트 ID 소문자화, 63자 초과 버킷 이름 안전 단축.
+- 이미 켜진 API는 다시 켜지 않음(`serviceusage.services.enable` 없이도 기존 프로젝트 설치 가능), 실패 시 실제 오류 표시.
+- `set -e`에서 조용히 종료되던 경로 수정(`read` EOF, 집계 싱크 writer 없음), 싱크 writer 부여 재시도, `bq --headless`.
+- Apple Silicon 로컬 Docker 빌드는 `linux/amd64`. 기존 비-git `$HOME/gcp-ai-usage-caps-api`나 로컬 변경이 있는 클론을 덮어쓰지 않음.
+- `teardown.sh`가 폴더/조직 범위 프로젝트의 싱크도 제거. dry-run 배너는 "Plan complete".
+- Terraform: 부트스트랩 키를 생성해 Secret Manager(리전 복제)에 저장하고 접근 권한 부여, `bootstrap_admin_key_command` 출력.
+
+### 런타임 (Runtime)
+- **(중요) 한 로그 소스를 읽지 못해도 G3가 통과해 한도 초과자가 해제되던 문제**: 읽기 실패한 소스를 `degraded_sources`로 추적하고, 부분적으로만 읽힌 기간에는 해제하지 않습니다.
+  *A partially readable window no longer passes G3, so over-cap users are not released when one source fails.*
+- **중앙 데이터셋(기본 설치)에서 Gemini Platform 요청·토큰 이중 집계**: 설정 키 오타(`audit_project_id`)로 BigQuery 행과 Cloud Logging 행을 모두 더했습니다. 사용량·캡·집행·원장·차지백 모두 영향. 1.4.0 이하를 기본 옵션으로 새로 설치한 경우 Gemini Platform 수치가 2배였습니다.
+- BigQuery `tables.get` 오류를 분류해 Cloud Logging으로 대체 조회(경고 없이 Antigravity 0건이 되던 문제).
+- 프로젝트별 데이터셋 모드에서 싱크 테이블이 아직 없는 프로젝트의 Antigravity 사용량을 항상 Cloud Logging으로 포함(`/v1/usage/*`, `/v1/caps/*`, 원장).
+- 단가 동기화: Catalog 접근 불가 시 500 대신 502와 안내, 일부/전체 SKU 조회 실패 시 기존 단가 유지(비용 null로 캡이 멈추던 문제).
+- 환경변수 파싱: 잘못된 정수 값으로 서비스가 기동 실패하지 않음, `ORG_ID=organizations/N`, `SCOPE_TYPE=folders` 허용.
+
+### 테스트 (Tests)
+- `tests/unit/test_install_regressions.py`, `tests/unit/test_runtime_robustness.py` 추가. 오프라인 테스트 189개 통과. Terraform `validate` 통과(Cloud Build, Terraform 1.9).
+
 ## [1.4.0] - 2026-11-28
 *원장형 사용량 수집 · 시간 단위 · 다차원 · SKU 라인 · 일별 JSONL 내보내기*
 *Ledger-style usage collection: hourly buckets, any dimensions, SKU cost lines, daily JSONL exports*

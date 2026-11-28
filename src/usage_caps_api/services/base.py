@@ -112,6 +112,7 @@ class Ctx:
         self.version = version
         self.warnings: list[dict] = []
         self.sources: set[str] = set()
+        self.degraded: set[str] = set()
         self.deny_quota_patience = False
         self._lock = threading.Lock()
         self._dataset_failed: dict[str, bool] = {}
@@ -130,6 +131,7 @@ class Ctx:
     def absorb(self, other: "Ctx"):
         with self._lock:
             self.sources |= other.sources
+            self.degraded |= other.degraded
             for w in other.warnings:
                 if w not in self.warnings:
                     self.warnings.append(w)
@@ -237,6 +239,8 @@ class Ctx:
 
     def warn_error(self, source: str, err: Exception, what: str):
         kind = getattr(err, "kind", "upstream_error")
+        with self._lock:
+            self.degraded.add(source)
         self.warn(source, kind, "%s could not be read (%s)." % (what, kind))
 
     # -- GCP helpers -------------------------------------------------------------

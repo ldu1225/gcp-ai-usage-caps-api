@@ -163,7 +163,7 @@ variable "grant_billing_roles" {
 variable "bootstrap_admin_key_secret" {
   type        = string
   default     = ""
-  description = "Optional Secret Manager secret name holding initial BOOTSTRAP_ADMIN_KEY."
+  description = "Existing Secret Manager secret holding BOOTSTRAP_ADMIN_KEY. Empty (default): a key is generated and stored in <service_name>-bootstrap-key."
 }
 
 variable "allow_unauthenticated_edge" {

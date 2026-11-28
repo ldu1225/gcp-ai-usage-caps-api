@@ -58,9 +58,18 @@ fi
 if [[ -z "$LOCAL_ROOT" ]]; then
   command -v git >/dev/null || { echo "error: git is required" >&2; exit 1; }
   if [[ -d "$INSTALL_DIR/.git" ]]; then
+    if [[ -n "$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=no 2>/dev/null)" && -z "${CAPS_API_FORCE_UPDATE:-}" ]]; then
+      echo "error: $INSTALL_DIR has local changes. Commit or stash them, set CAPS_API_FORCE_UPDATE=1 to discard them," >&2
+      echo "       or set CAPS_API_INSTALL_DIR to another directory." >&2
+      exit 1
+    fi
     echo "==> Updating gcp-ai-usage-caps-api in $INSTALL_DIR"
-    git -C "$INSTALL_DIR" fetch --depth 1 --quiet origin main
+    git -C "$INSTALL_DIR" fetch --depth 1 --quiet "$REPO_URL" main
     git -C "$INSTALL_DIR" reset --hard --quiet FETCH_HEAD
+  elif [[ -e "$INSTALL_DIR" ]]; then
+    echo "error: $INSTALL_DIR exists but is not a git checkout of gcp-ai-usage-caps-api." >&2
+    echo "       Move it away or set CAPS_API_INSTALL_DIR to another directory." >&2
+    exit 1
   else
     echo "==> Cloning gcp-ai-usage-caps-api into $INSTALL_DIR"
     git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"

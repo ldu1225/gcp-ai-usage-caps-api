@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="openapi.yaml"><img alt="OpenAPI 3.1" src="https://img.shields.io/badge/OpenAPI-3.1-0B1F3A"></a>
-  <img alt="API 1.4.0" src="https://img.shields.io/badge/API-1.4.0-1A73E8">
+  <img alt="API 1.4.1" src="https://img.shields.io/badge/API-1.4.1-1A73E8">
   <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-0B1F3A">
   <img alt="Cloud Run" src="https://img.shields.io/badge/runtime-Cloud%20Run-1A73E8">
   <img alt="Terraform" src="https://img.shields.io/badge/IaC-Terraform-0B1F3A">
@@ -401,6 +401,22 @@ bash <(curl -fsSL https://github.com/ldu1225/gcp-ai-usage-caps-api/raw/main/scri
 
 설치 순서: **1. Preflight**, **2. prepare**(API, 데이터셋, 싱크, 감사 로그, Gemini Platform 추론 요청 로그 활성화), **3. deploy**(서비스 계정, Cloud Run, Job, Pub/Sub, Scheduler, Secret). 완료 시 API URL과 부트스트랩 관리자 키(Secret Manager 저장)를 출력합니다. 추론 요청 로그 활성화는 `--no-vertex-inference-logging`으로 생략할 수 있습니다.
 
+```bash
+# 가장 단순한 설치: 프로젝트 하나 (새로 만든 빈 프로젝트도 그대로 됩니다. 결제 계정만 연결되어 있으면 됩니다)
+bash <(curl -fsSL https://github.com/ldu1225/gcp-ai-usage-caps-api/raw/main/scripts/install.sh) --project HUB_PROJECT
+
+# 관리자 키는 언제든 다시 꺼낼 수 있습니다 (재설치·중단 후에도 Secret Manager에 남아 있음)
+ADMIN=$(gcloud secrets versions access latest --secret=gcp-ai-usage-caps-api-bootstrap-key --project=HUB_PROJECT)
+curl -s "$BASE/v1/admin/readiness" -H "Authorization: Bearer $ADMIN"
+```
+
+- **빈 프로젝트**: API가 하나도 켜져 있지 않아도 됩니다. 설치 스크립트가 필요한 API를 켜고, 이미지 빌드는 전용 최소 권한 서비스 계정(`ai-usage-caps-build`)과 허브 리전 버킷으로 실행합니다. Compute Engine 기본 서비스 계정이나 `iam.automaticIamGrantsForDefaultServiceAccounts` 정책과 무관하게 동작합니다.
+- **기존 프로젝트**: 같은 명령을 다시 실행해도 안전합니다(멱등). 기존 데이터셋·싱크·서비스 계정은 재사용하고, 관리자 키는 바꾸지 않습니다.
+- **리소스 위치 제한**(`gcp.resourceLocations`): 시크릿·버킷·빌드를 모두 `--region`(기본 `asia-northeast3`) 안에 만듭니다.
+- **필요 권한**: 허브 프로젝트 Owner(또는 서비스 사용·IAM·Cloud Run·Secret Manager·Storage·Logging 관리자). 조직 역할은 `--grant-org-roles` 또는 출력된 명령을 조직 관리자에게 전달하세요.
+- **서비스 계정도 캡 대상으로**: 기본값은 사람(사용자) 계정만 캡 대상입니다. 서비스 계정 호출에도 한도·차단을 걸려면 `SERVICE_ACCOUNT_SUBJECTS=true`로 설치하세요.
+- 설치가 중간에 멈추면 원인을 고친 뒤 **같은 명령을 다시 실행**하면 이어서 완료됩니다.
+
 > [!WARNING]
 > `roles/orgpolicy.policyAdmin`(모델 정책 쓰기)과 `roles/iam.denyAdmin`(차단)은 **조직 수준에서만 부여할 수 있습니다.** `--grant-org-roles`를 쓰거나 출력되는 명령을 조직 관리자에게 전달하세요. Google Group 동기화에는 Google 관리 콘솔의 Groups Reader 역할이 별도로 필요합니다([4장](#4-그룹-groups)).
 
@@ -484,7 +500,7 @@ print(c.request("GET", "/v1/users/alice%40company.com/groups")["effective_cap_ru
 
 ## 14. API 엔드포인트 전체 목록
 
-전체 스펙: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API 버전 1.4.0, `GET /v1/openapi.yaml`로도 제공)
+전체 스펙: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API 버전 1.4.1, `GET /v1/openapi.yaml`로도 제공)
 
 | 영역 | 메서드 | 경로 | Scope |
 |---|---|---|---|

@@ -41,11 +41,15 @@ detect_org_id
 
 PROJECT_NUMBER="${PREFLIGHT_PROJECT_NUMBER:-}"
 if [[ -z "$PROJECT_NUMBER" ]]; then
-  PROJECT_NUMBER="$(gcloud projects describe "$HUB" --format='value(projectNumber)' 2>/dev/null || echo '000000000000')"
+  PROJECT_NUMBER="$(gcloud projects describe "$HUB" --format='value(projectNumber)' 2>/dev/null || true)"
+fi
+if [[ ! "$PROJECT_NUMBER" =~ ^[0-9]+$ ]]; then
+  [[ "$DRY_RUN" == "1" ]] && PROJECT_NUMBER="PROJECT_NUMBER" \
+    || die "cannot read the project number of ${HUB} ('gcloud projects describe ${HUB}' failed): check the project id and your access, then re-run"
 fi
 AR_REPO="ai-usage-caps"
 IMAGE="${PREBUILT_IMAGE:-${REGION}-docker.pkg.dev/${HUB}/${AR_REPO}/${SERVICE_NAME}:latest}"
-STATE_BUCKET="${HUB}-${SERVICE_NAME}-state"
+STATE_BUCKET="$(bucket_name "$HUB" "${SERVICE_NAME}-state")"
 ENFORCER_JOB="${SERVICE_NAME}-enforcer"
 ENFORCER_JOB_REF="projects/${HUB}/locations/${REGION}/jobs/${ENFORCER_JOB}"
 RUN_URL="https://${SERVICE_NAME}-${PROJECT_NUMBER}.${REGION}.run.app"
@@ -76,6 +80,8 @@ probe gcloud iam service-accounts describe "$API_SA" --project="$HUB" || \
   run gcloud iam service-accounts create "$API_SA_ID" --display-name="GCP AI Usage Caps API runtime" --project="$HUB"
 probe gcloud iam service-accounts describe "$ENFORCER_SA" --project="$HUB" || \
   run gcloud iam service-accounts create "$ENFORCER_SA_ID" --display-name="GCP AI Usage Caps Enforcer Job" --project="$HUB"
+wait_for_sa "$API_SA" "$HUB"
+wait_for_sa "$ENFORCER_SA" "$HUB"
 for role in $API_HUB_ROLES; do grant_project_role "$HUB" "$API_MEMBER" "$role"; done
 for role in $ENFORCER_HUB_ROLES; do grant_project_role "$HUB" "$ENFORCER_MEMBER" "$role"; done
 ensure_vertex_reader_role "$HUB" "$API_MEMBER"
@@ -130,19 +136,25 @@ if ! probe gcloud storage buckets describe "gs://${STATE_BUCKET}" --project="$HU
     --uniform-bucket-level-access --public-access-prevention
   run gcloud storage buckets update "gs://${STATE_BUCKET}" --versioning
 fi
-run_quiet gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" --member="$API_MEMBER" --role="roles/storage.objectAdmin"
-run_quiet gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" --member="$ENFORCER_MEMBER" --role="roles/storage.objectAdmin"
+for member in "$API_MEMBER" "$ENFORCER_MEMBER"; do
+  _retry_iam_grant gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" --member="$member" \
+    --role="roles/storage.objectAdmin" || die "could not grant ${member} roles/storage.objectAdmin on gs://${STATE_BUCKET}"
+done
 GENERATED_KEY=""
 if ! probe gcloud secrets describe "$BOOT_SECRET" --project="$HUB"; then
   if [[ "$DRY_RUN" != "1" ]]; then
     GENERATED_KEY="gcpai_$(python3 -c 'import secrets; print(secrets.token_hex(6) + "_" + secrets.token_urlsafe(32))')"
-    printf '%s' "$GENERATED_KEY" | gcloud secrets create "$BOOT_SECRET" --data-file=- --project="$HUB" >/dev/null
+    printf '%s' "$GENERATED_KEY" | gcloud secrets create "$BOOT_SECRET" --data-file=- --project="$HUB" \
+      --replication-policy=user-managed --locations="$REGION" >/dev/null
+    info "Bootstrap Admin API key created and stored in Secret Manager '${BOOT_SECRET}':"
+    info "  ${GENERATED_KEY}"
   else
     echo "[dry-run] create secret $BOOT_SECRET"
   fi
 fi
-run_quiet gcloud secrets add-iam-policy-binding "$BOOT_SECRET" --project="$HUB" \
-  --member="$API_MEMBER" --role="roles/secretmanager.secretAccessor"
+_retry_iam_grant gcloud secrets add-iam-policy-binding "$BOOT_SECRET" --project="$HUB" \
+  --member="$API_MEMBER" --role="roles/secretmanager.secretAccessor" \
+  || die "could not grant ${API_MEMBER} roles/secretmanager.secretAccessor on ${BOOT_SECRET}"
 
 log "6/9 Container image (${IMAGE})"
 if [[ -n "$PREBUILT_IMAGE" ]]; then
@@ -150,15 +162,13 @@ if [[ -n "$PREBUILT_IMAGE" ]]; then
 else
   probe gcloud artifacts repositories describe "$AR_REPO" --location="$REGION" --project="$HUB" || \
     run gcloud artifacts repositories create "$AR_REPO" --repository-format=docker --location="$REGION" --project="$HUB"
-  if [[ -n "$WORKER_POOL" ]]; then
-    run gcloud builds submit "$ROOT_DIR" --tag="$IMAGE" --project="$HUB" --region="$REGION" --worker-pool="$WORKER_POOL"
-  elif [[ "${PREFLIGHT_DOCKER_BUILD:-0}" == "1" ]]; then
+  if [[ "${PREFLIGHT_DOCKER_BUILD:-0}" == "1" && -z "$WORKER_POOL" ]]; then
     command -v docker >/dev/null || [[ "$DRY_RUN" == "1" ]] || die "Cloud Build default pool is not allowed and Docker is unavailable: pass --worker-pool or --image"
     run gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
-    run docker build -t "$IMAGE" "$ROOT_DIR"
+    run docker build --platform linux/amd64 -t "$IMAGE" "$ROOT_DIR"
     run docker push "$IMAGE"
   else
-    run gcloud builds submit "$ROOT_DIR" --tag="$IMAGE" --project="$HUB"
+    cloud_build_image
   fi
 fi
 
@@ -231,23 +241,27 @@ run gcloud run jobs "$JOB_VERB" "$ENFORCER_JOB" \
   --service-account="$ENFORCER_SA" --command="python3" --args="-m,usage_caps_api.enforce_job" \
   ${VPC_FLAGS[@]+"${VPC_FLAGS[@]}"} ${JOB_FLAGS[@]+"${JOB_FLAGS[@]}"} \
   --set-env-vars="${ENV_VARS}|PYTHONPATH=/app/src" --max-retries=0 --task-timeout=600s
-run_quiet gcloud run jobs add-iam-policy-binding "$ENFORCER_JOB" --region="$REGION" --project="$HUB" \
-  --member="$API_MEMBER" --role="roles/run.jobsExecutor"
-run_quiet gcloud run jobs add-iam-policy-binding "$ENFORCER_JOB" --region="$REGION" --project="$HUB" \
-  --member="$API_MEMBER" --role="roles/run.viewer"
-run_quiet gcloud run services add-iam-policy-binding "$SERVICE_NAME" --region="$REGION" --project="$HUB" \
-  --member="$API_MEMBER" --role="roles/run.invoker"
+for role in roles/run.jobsExecutor roles/run.viewer; do
+  _retry_iam_grant gcloud run jobs add-iam-policy-binding "$ENFORCER_JOB" --region="$REGION" --project="$HUB" \
+    --member="$API_MEMBER" --role="$role" || warn "could not grant ${role} on job ${ENFORCER_JOB} to ${API_MEMBER}"
+done
+_retry_iam_grant gcloud run services add-iam-policy-binding "$SERVICE_NAME" --region="$REGION" --project="$HUB" \
+  --member="$API_MEMBER" --role="roles/run.invoker" || warn "could not grant roles/run.invoker on ${SERVICE_NAME} to ${API_MEMBER}"
 
 log "8/9 Cloud Scheduler: safety net (every 5 min) + daily official SKU pricing sync"
 SCHED_JOB="${SERVICE_NAME}-enforce-schedule"
-if ! probe gcloud scheduler jobs describe "$SCHED_JOB" --location="$REGION" --project="$HUB"; then
-  run gcloud scheduler jobs create http "$SCHED_JOB" \
-    --project="$HUB" --location="$REGION" \
-    --schedule="*/5 * * * *" --uri="https://run.googleapis.com/v2/${ENFORCER_JOB_REF}:run" \
-    --http-method=POST --message-body="{}" --headers="Content-Type=application/json" \
-    --oauth-service-account-email="$API_SA" \
-    || warn "Cloud Scheduler job not created (API disabled?); enforcement still runs in real time and on demand"
+SCHED_VERB="create"
+SCHED_HEADERS=(--headers="Content-Type=application/json")
+if probe gcloud scheduler jobs describe "$SCHED_JOB" --location="$REGION" --project="$HUB"; then
+  SCHED_VERB="update"
+  SCHED_HEADERS=(--update-headers="Content-Type=application/json")
 fi
+run_quiet gcloud scheduler jobs "$SCHED_VERB" http "$SCHED_JOB" \
+  --project="$HUB" --location="$REGION" \
+  --schedule="*/5 * * * *" --uri="https://run.googleapis.com/v2/${ENFORCER_JOB_REF}:run" \
+  --http-method=POST --message-body="{}" "${SCHED_HEADERS[@]}" \
+  --oauth-service-account-email="$API_SA" \
+  || warn "Cloud Scheduler job not ${SCHED_VERB}d (API disabled?); enforcement still runs in real time and on demand"
 # POST /v1/internal/pricing/sync with a Google OIDC token of the runtime SA (audience = PUBLIC_BASE_URL + path):
 # refreshes Cloud Billing Catalog token prices and FX rates once a day.
 PRICING_JOB="${SERVICE_NAME}-pricing-sync"
@@ -258,7 +272,7 @@ if probe gcloud scheduler jobs describe "$PRICING_JOB" --location="$REGION" --pr
   PRICING_VERB="update"
   PRICING_HEADERS=(--update-headers="Content-Type=application/json")
 fi
-run gcloud scheduler jobs "$PRICING_VERB" http "$PRICING_JOB" \
+run_quiet gcloud scheduler jobs "$PRICING_VERB" http "$PRICING_JOB" \
   --project="$HUB" --location="$REGION" \
   --schedule="$PRICING_SYNC_SCHEDULE" --time-zone="$PRICING_SYNC_TIME_ZONE" --uri="$PRICING_URI" \
   --http-method=POST --message-body="{}" "${PRICING_HEADERS[@]}" \
@@ -271,15 +285,27 @@ if [[ "$REALTIME" == "1" ]]; then
   for pid in "${ALL_ARR[@]}"; do
     ensure_pubsub_sink "$pid"
   done
-  run_quiet gcloud iam service-accounts add-iam-policy-binding "$API_SA" --project="$HUB" \
+  # Only needed for projects created before 2021-04-08; the agent may not exist yet in a brand-new project.
+  if [[ "$DRY_RUN" != "1" ]]; then
+    curl -sS -o /dev/null --max-time 30 -X POST -H "Authorization: Bearer $(gcloud auth print-access-token 2>/dev/null)" \
+      "https://serviceusage.googleapis.com/v1beta1/projects/${PROJECT_NUMBER}/services/pubsub.googleapis.com:generateServiceIdentity" \
+      >/dev/null 2>&1 || true
+  fi
+  _retry_iam_grant gcloud iam service-accounts add-iam-policy-binding "$API_SA" --project="$HUB" \
     --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com" \
-    --role="roles/iam.serviceAccountTokenCreator"
+    --role="roles/iam.serviceAccountTokenCreator" \
+    || warn "could not grant TokenCreator to the Pub/Sub service agent (only needed for projects created before 2021-04-08)"
   if ! probe gcloud pubsub subscriptions describe "$SUB" --project="$HUB"; then
     run gcloud pubsub subscriptions create "$SUB" --project="$HUB" --topic="$TOPIC" \
       --push-endpoint="${RUN_URL}/v1/internal/usage-event" \
       --push-auth-service-account="$API_SA" \
       --push-auth-token-audience="${RUN_URL}/v1/internal/usage-event" \
       --ack-deadline=60 --min-retry-delay=10s --max-retry-delay=60s
+  else
+    # Re-runs repair the push endpoint (e.g. after a service URL change).
+    run_quiet gcloud pubsub subscriptions update "$SUB" --project="$HUB" \
+      --push-endpoint="${RUN_URL}/v1/internal/usage-event" --push-auth-service-account="$API_SA" \
+      --push-auth-token-audience="${RUN_URL}/v1/internal/usage-event"
   fi
 else
   info "skipped (--no-realtime): the 5-minute scheduler enforces caps"
@@ -287,7 +313,11 @@ fi
 
 echo ""
 echo "=================================================================="
-echo " Deployment Complete!"
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo " Plan complete (dry-run: nothing was created or changed)"
+else
+  echo " Deployment Complete!"
+fi
 echo " Hub:         ${HUB} (${REGION})   Managed projects: ${#MANAGED_ARR[@]}"
 echo " API URL:     ${RUN_URL}"
 echo " OpenAPI 3.1: ${RUN_URL}/v1/openapi.yaml"
@@ -296,4 +326,8 @@ if [[ -n "$GENERATED_KEY" ]]; then
   echo " Bootstrap Admin API Key (saved in Secret Manager '${BOOT_SECRET}'):"
   echo "   ${GENERATED_KEY}"
 fi
+echo " Admin key (any time):"
+echo "   ADMIN=\$(gcloud secrets versions access latest --secret=${BOOT_SECRET} --project=${HUB})"
+echo " First call:"
+echo "   curl -s ${RUN_URL}/v1/admin/readiness -H \"Authorization: Bearer \$ADMIN\""
 echo "=================================================================="

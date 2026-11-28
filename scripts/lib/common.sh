@@ -199,6 +199,10 @@ finalize_args() {
   fi
   [[ -n "$PROJECT_ID" && "$PROJECT_ID" != "(unset)" ]] || die "pass --project HUB_PROJECT_ID"
   [[ "$PROJECT_ID" =~ ^[a-z][a-z0-9.:-]{4,99}$ ]] || die "invalid --project: $PROJECT_ID"
+  [[ "$PROJECT_ID" != *:* ]] \
+    || die "domain-scoped project ids (${PROJECT_ID}) cannot host the API (bucket, image and service names); use a standard project as --project (it can still govern domain-scoped projects)"
+  [[ "$SERVICE_NAME" =~ ^[a-z]([-a-z0-9]{0,47}[a-z0-9])?$ ]] \
+    || die "--service-name must be lowercase letters, digits and hyphens, start with a letter, end with a letter or digit, at most 49 characters"
   case "$SCOPE_TYPE" in projects|folder|organization) ;; *) die "--scope-type must be folder or organization" ;; esac
   if [[ "$SCOPE_TYPE" != "projects" && -z "$SCOPE_IDS" ]]; then
     die "--scope-type $SCOPE_TYPE needs --scope-ids"
@@ -239,8 +243,8 @@ finalize_args() {
   fi
   API_SA_ID="ai-usage-caps-api"
   ENFORCER_SA_ID="ai-usage-caps-enforcer"
-  API_SA="${API_SA_ID}@${HUB}.iam.gserviceaccount.com"
-  ENFORCER_SA="${ENFORCER_SA_ID}@${HUB}.iam.gserviceaccount.com"
+  API_SA="${API_SA_ID}@$(sa_domain "$HUB")"
+  ENFORCER_SA="${ENFORCER_SA_ID}@$(sa_domain "$HUB")"
   AI_SINK="${SERVICE_NAME}-ai-logs"
   TOPIC="${SERVICE_NAME}-usage-events"
   USAGE_SINK="${SERVICE_NAME}-usage-events"
@@ -255,6 +259,7 @@ managed_list() {
     split_csv "$MANAGED_PROJECTS"
     split_csv "${PREFLIGHT_MANAGED_PROJECTS:-}"
   } | while IFS= read -r p; do
+    p="$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')"
     [[ "$p" =~ ^[a-z][a-z0-9.:-]{4,99}$ ]] || { warn "skipping invalid project id '$p'"; continue; }
     if [[ "$seen" != *" $p "* ]]; then
       seen="${seen}${p} "
@@ -373,18 +378,25 @@ enable_apis() {
     run gcloud services enable ${req[@]+"${req[@]}"} ${opt[@]+"${opt[@]}"} --project="$project"
     return 0
   fi
-  if [[ ${#req[@]} -gt 0 ]] && ! gcloud services enable "${req[@]}" --project="$project" --quiet >/dev/null 2>&1; then
-    for api in "${req[@]}"; do
-      gcloud services enable "$api" --project="$project" --quiet >/dev/null 2>&1 \
-        || die "could not enable required API ${api} on ${project} (organization policy, billing or permission)"
+  local enabled err
+  local -a req_todo=() opt_todo=()
+  enabled=" $(gcloud services list --enabled --project="$project" --format='value(config.name)' 2>/dev/null | tr '\n' ' ') "
+  for api in ${req[@]+"${req[@]}"}; do [[ "$enabled" == *" ${api} "* ]] || req_todo+=("$api"); done
+  for api in ${opt[@]+"${opt[@]}"}; do [[ "$enabled" == *" ${api} "* ]] || opt_todo+=("$api"); done
+  if [[ ${#req_todo[@]} -gt 0 ]] && ! gcloud services enable "${req_todo[@]}" --project="$project" --quiet >/dev/null 2>&1; then
+    for api in "${req_todo[@]}"; do
+      err="$(gcloud services enable "$api" --project="$project" --quiet 2>&1 >/dev/null)" \
+        || die "could not enable required API ${api} on ${project}: $(printf '%s' "$err" | tail -n 3 | tr '\n' ' ')
+  (billing must be linked, and the installer needs serviceusage.services.enable, e.g. roles/serviceusage.serviceUsageAdmin)"
     done
   fi
-  if [[ ${#opt[@]} -gt 0 ]] && ! gcloud services enable "${opt[@]}" --project="$project" --quiet >/dev/null 2>&1; then
-    for api in "${opt[@]}"; do
+  if [[ ${#opt_todo[@]} -gt 0 ]] && ! gcloud services enable "${opt_todo[@]}" --project="$project" --quiet >/dev/null 2>&1; then
+    for api in "${opt_todo[@]}"; do
       gcloud services enable "$api" --project="$project" --quiet >/dev/null 2>&1 \
         || warn "could not enable ${api} on ${project}; continuing with its fallback"
     done
   fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -396,14 +408,26 @@ _retry_iam_grant() {
     return $?
   fi
   local attempt=1
-  while [[ $attempt -le 4 ]]; do
+  while [[ $attempt -le 7 ]]; do
     if "$@" >/dev/null 2>&1; then
       return 0
     fi
-    sleep $((attempt * 2))
+    sleep $((attempt * 3))
     attempt=$((attempt + 1))
   done
   return 1
+}
+
+# wait_for_sa EMAIL PROJECT: a just-created service account can take up to ~60 s to become visible to IAM.
+wait_for_sa() {
+  [[ "${DRY_RUN:-0}" == "1" ]] && return 0
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    probe gcloud iam service-accounts describe "$1" --project="$2" && return 0
+    sleep 5
+  done
+  warn "service account $1 is not visible after 60s; continuing with retries"
+  return 0
 }
 
 grant_project_role() {  # grant_project_role PROJECT MEMBER ROLE
@@ -481,7 +505,7 @@ detect_org_id() {
   fi
   [[ "${DRY_RUN:-0}" == "1" ]] && return 0
   local ptype pid
-  read -r ptype pid < <(gcloud projects describe "$HUB" --format='value(parent.type,parent.id)' 2>/dev/null || true)
+  read -r ptype pid < <(gcloud projects describe "$HUB" --format='value(parent.type,parent.id)' 2>/dev/null || true) || true
   if [[ "$ptype" == "organization" && -n "$pid" ]]; then
     ORG_ID="$pid"
     return 0
@@ -499,11 +523,11 @@ REALTIME_FILTER='log_id("businessaicode.googleapis.com/inference_response") OR l
 
 ensure_dataset() {  # ensure_dataset PROJECT DATASET LOCATION
   local project="$1" dataset="$2" location="$3"
-  if probe bq --project_id="$project" show --dataset "${project}:${dataset}"; then
+  if probe bq --headless --project_id="$project" show --dataset "${project}:${dataset}"; then
     info "dataset ${project}:${dataset} exists (adopted)"
     return 0
   fi
-  run bq --project_id="$project" mk --dataset --location="$location" \
+  run bq --headless --project_id="$project" mk --dataset --location="$location" \
     --description="AI telemetry logs for GCP AI Usage & Spend Caps API" "${project}:${dataset}" \
     || die "could not create dataset ${project}:${dataset} in ${location} (location policy? use --dataset-location or --reuse-dataset)"
 }
@@ -516,7 +540,7 @@ grant_dataset_writer() {  # grant_dataset_writer PROJECT DATASET MEMBER
     return 0
   fi
   file="$(mktemp)"
-  if ! bq --project_id="$project" show --format=prettyjson "${project}:${dataset}" >"$file" 2>/dev/null; then
+  if ! bq --headless --project_id="$project" show --format=prettyjson "${project}:${dataset}" >"$file" 2>/dev/null; then
     rm -f "$file"
     warn "cannot read ${project}:${dataset} to grant ${member}; run: bq add-iam-policy-binding --member=${member} --role=roles/bigquery.dataEditor ${project}:${dataset}"
     return 0
@@ -535,8 +559,8 @@ access.append({"role": "WRITER", key: email})
 json.dump(dataset, open(path, "w", encoding="utf-8"))
 PYACL
   if [[ $rc -eq 0 ]]; then
-    bq --project_id="$project" update --source "$file" "${project}:${dataset}" >/dev/null 2>&1 \
-      || warn "could not grant ${member} WRITER on ${project}:${dataset}"
+    _retry_iam_grant bq --headless --project_id="$project" update --source "$file" "${project}:${dataset}" \
+      || warn "could not grant ${member} WRITER on ${project}:${dataset}; run: bq add-iam-policy-binding --member=${member} --role=roles/bigquery.dataEditor ${project}:${dataset}"
   fi
   rm -f "$file"
   return 0
@@ -565,7 +589,11 @@ ensure_bq_sink() {
     return 0
   fi
   writer="$(sink_writer "$AI_SINK" --project="$src")"
-  [[ -n "$writer" ]] && grant_dataset_writer "$dproject" "$dataset" "$writer"
+  if [[ -n "$writer" ]]; then
+    grant_dataset_writer "$dproject" "$dataset" "$writer"
+  else
+    warn "${src}: could not read the writer identity of ${AI_SINK}; grant it BigQuery Data Editor on ${dproject}:${dataset}"
+  fi
   info "${src}: sink ${AI_SINK} -> ${dproject}:${dataset}"
 }
 
@@ -583,10 +611,15 @@ ensure_aggregated_bq_sink() {
   fi
   if [[ "${DRY_RUN:-0}" != "1" ]]; then
     writer="$(sink_writer "$AI_SINK" "$flag")"
-    [[ -n "$writer" ]] && grant_dataset_writer "$dproject" "$dataset" "$writer"
+    if [[ -n "$writer" ]]; then
+      grant_dataset_writer "$dproject" "$dataset" "$writer"
+    else
+      warn "could not read the writer identity of ${AI_SINK} (${stype} ${sid}); grant it BigQuery Data Editor on ${dproject}:${dataset}"
+    fi
   else
     grant_dataset_writer "$dproject" "$dataset" "serviceAccount:<writer-of-${AI_SINK}@${stype}/${sid}>"
   fi
+  return 0
 }
 
 # ensure_pubsub_sink SOURCE_PROJECT: routes Antigravity inference_response and Gemini Platform inference_request logs to the
@@ -605,8 +638,8 @@ ensure_pubsub_sink() {
   fi
   writer="$(sink_writer "$USAGE_SINK" --project="$src")"
   if [[ -n "$writer" ]]; then
-    gcloud pubsub topics add-iam-policy-binding "$TOPIC" --project="$HUB" --member="$writer" \
-      --role="roles/pubsub.publisher" --quiet >/dev/null 2>&1 \
+    _retry_iam_grant gcloud pubsub topics add-iam-policy-binding "$TOPIC" --project="$HUB" --member="$writer" \
+      --role="roles/pubsub.publisher" --quiet \
       || warn "could not grant roles/pubsub.publisher to ${writer} on ${TOPIC}"
   fi
 }
@@ -704,8 +737,18 @@ enable_vertex_inference_logging() {
     info "${project}: Gemini Platform inference request metadata logging already ENABLED"
     return 0
   fi
-  code="$(curl -sS -o "$out" -w '%{http_code}' --max-time 60 -X POST -H "Authorization: Bearer ${token}" \
-    -H "x-goog-user-project: ${project}" -H "Content-Type: application/json" "$set_url" -d "$VERTEX_LOGGING_BODY" 2>/dev/null || echo 000)"
+  local try
+  for try in 1 2 3 4; do
+    code="$(curl -sS -o "$out" -w '%{http_code}' --max-time 60 -X POST -H "Authorization: Bearer ${token}" \
+      -H "x-goog-user-project: ${project}" -H "Content-Type: application/json" "$set_url" -d "$VERTEX_LOGGING_BODY" 2>/dev/null || echo 000)"
+    # Just enabled by this installer: the API needs a minute to propagate.
+    if [[ "$code" == "403" && "$project" == "${HUB:-}" && $try -lt 4 ]] \
+       && grep -Eq 'SERVICE_DISABLED|has not been used|it is disabled' "$out" 2>/dev/null; then
+      sleep 20
+      continue
+    fi
+    break
+  done
   case "$code" in
     2??) info "${project}: Gemini Platform inference request metadata logging ENABLED (effective within a few minutes)" ;;
     409) info "${project}: Gemini Platform inference request metadata logging already ENABLED (409)" ;;
@@ -763,4 +806,93 @@ ensure_vertex_reader_org_role() {
     fi
   fi
   VERTEX_READER_ORG_ROLE="organizations/${org}/roles/${VERTEX_READER_ROLE_ID}"
+}
+
+# ---------------------------------------------------------------------------
+# Container build (Cloud Build with a dedicated least-privilege service account)
+# ---------------------------------------------------------------------------
+# New projects no longer give Cloud Build's default service account (the Compute Engine default SA) Editor, and many
+# organizations enforce iam.automaticIamGrantsForDefaultServiceAccounts, so `gcloud builds submit --tag` fails with
+# "...-compute@developer.gserviceaccount.com does not have storage.objects.get access". The build therefore runs as
+# ai-usage-caps-build@HUB with only: read on its own source staging bucket, push to the ai-usage-caps repository,
+# and write build logs. Uses: HUB REGION SERVICE_NAME ROOT_DIR IMAGE AR_REPO WORKER_POOL DRY_RUN.
+
+# bucket_name BASE SUFFIX -> a valid GCS bucket name (<= 63 chars; long names keep a stable hash suffix).
+bucket_name() {
+  local base="$1" suffix="$2" name hash
+  name="$(printf '%s-%s' "${base//[.:]/-}" "$suffix" | tr '[:upper:]' '[:lower:]')"
+  if [[ ${#name} -le 63 ]]; then
+    printf '%s' "$name"
+    return 0
+  fi
+  hash="$(printf '%s' "$name" | cksum | awk '{print $1}')"
+  printf '%s-%s' "${name:0:$((62 - ${#hash}))}" "$hash"
+}
+
+cloud_build_image() {
+  local build_sa_id="ai-usage-caps-build" build_sa build_bucket config attempt rc
+  build_sa="${build_sa_id}@$(sa_domain "$HUB")"
+  build_bucket="$(bucket_name "$HUB" "${SERVICE_NAME}-build")"
+  if ! probe gcloud iam service-accounts describe "$build_sa" --project="$HUB"; then
+    run gcloud iam service-accounts create "$build_sa_id" --display-name="GCP AI Usage Caps image build" \
+      --project="$HUB" --quiet
+  fi
+  wait_for_sa "$build_sa" "$HUB"
+  if ! probe gcloud storage buckets describe "gs://${build_bucket}" --project="$HUB"; then
+    run gcloud storage buckets create "gs://${build_bucket}" --project="$HUB" --location="$REGION" \
+      --uniform-bucket-level-access --public-access-prevention --quiet
+    local lifecycle
+    lifecycle="$(mktemp "${TMPDIR:-/tmp}/caps-lifecycle.XXXXXX")"
+    printf '%s' '{"rule":[{"action":{"type":"Delete"},"condition":{"age":7}}]}' >"$lifecycle"
+    run_quiet gcloud storage buckets update "gs://${build_bucket}" --lifecycle-file="$lifecycle" >/dev/null 2>&1 || true
+    rm -f "$lifecycle"
+  fi
+  _retry_iam_grant gcloud storage buckets add-iam-policy-binding "gs://${build_bucket}" \
+    --member="serviceAccount:${build_sa}" --role="roles/storage.objectViewer" \
+    || warn "could not grant ${build_sa} read access on gs://${build_bucket}"
+  _retry_iam_grant gcloud artifacts repositories add-iam-policy-binding "$AR_REPO" --location="$REGION" \
+    --project="$HUB" --member="serviceAccount:${build_sa}" --role="roles/artifactregistry.writer" --quiet \
+    || warn "could not grant ${build_sa} roles/artifactregistry.writer on ${AR_REPO}"
+  grant_project_role "$HUB" "serviceAccount:${build_sa}" "roles/logging.logWriter"
+
+  config="$(mktemp "${TMPDIR:-/tmp}/caps-cloudbuild.XXXXXX")"
+  cat >"$config" <<YAML
+steps:
+- name: gcr.io/cloud-builders/docker
+  args: ["build", "-t", "${IMAGE}", "."]
+images: ["${IMAGE}"]
+serviceAccount: "projects/${HUB}/serviceAccounts/${build_sa}"
+options:
+  logging: CLOUD_LOGGING_ONLY
+YAML
+  local -a flags=(--config="$config" --gcs-source-staging-dir="gs://${build_bucket}/source" --project="$HUB"
+                  --region="$REGION" --quiet)
+  [[ -n "$WORKER_POOL" ]] && flags+=(--worker-pool="$WORKER_POOL")
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    run gcloud builds submit "$ROOT_DIR" "${flags[@]}"
+    rm -f "$config"
+    return 0
+  fi
+  # A just-created service account / binding can take a minute to be usable by Cloud Build: retry.
+  for attempt in 1 2 3 4; do
+    rc=0
+    gcloud builds submit "$ROOT_DIR" "${flags[@]}" || rc=$?
+    [[ $rc -eq 0 ]] && break
+    if [[ $attempt -lt 4 ]]; then
+      warn "Cloud Build failed (attempt ${attempt}/4; new service accounts and IAM bindings can take a minute); retrying in $((attempt * 20))s"
+      sleep $((attempt * 20))
+    fi
+  done
+  rm -f "$config"
+  [[ $rc -eq 0 ]] || die "container build failed. Check the build log above; or build elsewhere and pass --image IMAGE (or --worker-pool for a private pool)"
+}
+
+# sa_domain PROJECT -> the service-account email domain (domain-scoped "example.com:proj" -> proj.example.com.iam...)
+sa_domain() {
+  local project="$1"
+  if [[ "$project" == *:* ]]; then
+    printf '%s.%s.iam.gserviceaccount.com' "${project#*:}" "${project%%:*}"
+  else
+    printf '%s.iam.gserviceaccount.com' "$project"
+  fi
 }

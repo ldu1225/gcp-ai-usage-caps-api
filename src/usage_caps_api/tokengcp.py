@@ -26,7 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .gcp import GcpError, _google_error, _kind_for_status, log_safe  # pylint: disable=protected-access
+from .gcp import GcpError, _google_error, _kind_for_status, log_safe, quota_project_rejected  # pylint: disable=protected-access
 
 LOG = logging.getLogger("usage_caps_api.tokengcp")
 
@@ -52,6 +52,8 @@ class StaticTokenGcp:
         self._opener = urllib.request.build_opener(_NoRedirect())
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="caps-q")
         self.subpool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="caps-sub")
+        # Quota projects that rejected x-goog-user-project (API not enabled there yet); requests skip the header.
+        self._quota_rejected: set[str] = set()
 
     # -- credentials ----------------------------------------------------------------
     def _fetch_gcloud_token(self) -> str:
@@ -101,11 +103,14 @@ class StaticTokenGcp:
             body = data if isinstance(data, bytes) else str(data).encode("utf-8")
         if headers:
             hdrs.update(headers)
-        if quota_project:
+        if quota_project and quota_project not in self._quota_rejected:
             hdrs["x-goog-user-project"] = quota_project
         status, raw, resp_headers = 0, b"", {}
-        for attempt in (1, 2):
-            hdrs["Authorization"] = "Bearer " + self.token(force=attempt == 2)
+        retried_without_quota = False
+        refresh = False
+        for attempt in (1, 2, 3):
+            hdrs["Authorization"] = "Bearer " + self.token(force=refresh)
+            refresh = False
             req = urllib.request.Request(url, data=body, method=method.upper(), headers=hdrs)
             try:
                 with self._opener.open(req, timeout=timeout) as resp:
@@ -126,8 +131,22 @@ class StaticTokenGcp:
             except OSError as err:
                 raise GcpError("network", message=type(err).__name__)
             if status == 401 and attempt == 1 and self._gcloud:
+                refresh = True
                 continue
+            if status == 403 and "x-goog-user-project" in hdrs and not retried_without_quota:
+                try:
+                    rejected = quota_project_rejected(json.loads(raw.decode("utf-8")), quota_project)
+                except (UnicodeDecodeError, ValueError):
+                    rejected = False
+                if rejected:
+                    # Brand-new hub: its APIs are not enabled yet, so it cannot be the quota project. Retry billed
+                    # to the gcloud credential's own project; keep skipping the header once that works.
+                    retried_without_quota = True
+                    hdrs.pop("x-goog-user-project", None)
+                    continue
             break
+        if retried_without_quota and status < 300:
+            self._quota_rejected.add(quota_project)
         payload = None
         if expect_json and raw:
             try:

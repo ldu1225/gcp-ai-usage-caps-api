@@ -312,6 +312,15 @@ def _split_csv(raw: str) -> list[str]:
     return [item.strip() for item in (raw or "").split(",") if item.strip()]
 
 
+def _int_env(raw, default, name: str) -> int:
+    """Lenient integer env parsing ('2e10', '1.5', '20000000000') that never crash-loops the service."""
+    try:
+        return int(float(str(raw).strip()))
+    except (TypeError, ValueError, OverflowError):
+        LOG.warning("Ignoring invalid integer environment variable %s", name)
+        return default
+
+
 def _parse_bool(raw: str) -> bool:
     return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -341,9 +350,9 @@ def _apply_env(cfg: dict, env: dict) -> dict:
     if get("HOST"):
         out["server"]["host"] = get("HOST")
     if get("PORT"):
-        out["server"]["port"] = int(get("PORT"))
+        out["server"]["port"] = _int_env(get("PORT"), out["server"]["port"], "PORT")
     if get("CACHE_TTL_SECONDS"):
-        out["server"]["cache_ttl_seconds"] = max(0, int(get("CACHE_TTL_SECONDS")))
+        out["server"]["cache_ttl_seconds"] = max(0, _int_env(get("CACHE_TTL_SECONDS"), out["server"]["cache_ttl_seconds"], "CACHE_TTL_SECONDS"))
 
     ws = out["workspace"]
     if get("PROJECT_ID"):
@@ -360,12 +369,15 @@ def _apply_env(cfg: dict, env: dict) -> dict:
         ws["audit_dataset"] = get("AUDIT_DATASET_ID")
     if get("AUDIT_PROJECT_ID"):
         ws["audit_project"] = get("AUDIT_PROJECT_ID").lower()
-    if get("SCOPE_TYPE") in ("projects", "folder", "organization"):
-        ws["scope_type"] = get("SCOPE_TYPE")
+    scope_type = {"folders": "folder", "organizations": "organization"}.get(get("SCOPE_TYPE"), get("SCOPE_TYPE"))
+    if scope_type in ("projects", "folder", "organization"):
+        ws["scope_type"] = scope_type
+    elif scope_type:
+        LOG.warning("Ignoring invalid SCOPE_TYPE (expected projects, folder or organization)")
     if get("SCOPE_IDS"):
         ws["scope_ids"] = [s for s in _split_csv(get("SCOPE_IDS")) if SCOPE_ID_RE.match(s)]
     if get("SCOPE_MAX_PROJECTS"):
-        ws["scope_max_projects"] = max(1, min(5000, int(get("SCOPE_MAX_PROJECTS"))))
+        ws["scope_max_projects"] = max(1, min(5000, _int_env(get("SCOPE_MAX_PROJECTS"), ws["scope_max_projects"], "SCOPE_MAX_PROJECTS")))
     if get("SCOPE_FILTER") in ("none", "gemini_enterprise"):
         ws["scope_filter"] = get("SCOPE_FILTER")
     if get("DISCOVERY_ENGINE_LOCATIONS"):
@@ -388,7 +400,7 @@ def _apply_env(cfg: dict, env: dict) -> dict:
         st["file_path"] = get("STORAGE_FILE_PATH")
 
     if get("BIGQUERY_MAX_BYTES_BILLED"):
-        out["bigquery"]["max_bytes_billed"] = max(10_000_000, int(get("BIGQUERY_MAX_BYTES_BILLED")))
+        out["bigquery"]["max_bytes_billed"] = max(10_000_000, _int_env(get("BIGQUERY_MAX_BYTES_BILLED"), out["bigquery"]["max_bytes_billed"], "BIGQUERY_MAX_BYTES_BILLED"))
 
     auth = out["auth"]
     if get("PUBLIC_BASE_URL"):
@@ -444,14 +456,17 @@ def _apply_env(cfg: dict, env: dict) -> dict:
             hub[key] = get(env_name)
     if get("SERVICE_ACCOUNT_SUBJECTS"):
         hub["service_account_subjects"] = _parse_bool(get("SERVICE_ACCOUNT_SUBJECTS"))
-    if get("ORG_ID") and SCOPE_ID_RE.match(get("ORG_ID")):
-        hub["org_id"] = get("ORG_ID")
+    org_id = (get("ORG_ID") or "").removeprefix("organizations/")
+    if org_id and SCOPE_ID_RE.match(org_id):
+        hub["org_id"] = org_id
+    elif org_id:
+        LOG.warning("Ignoring invalid ORG_ID (expected the numeric organization id)")
 
     models = out["models"]
     if get("MODEL_VIOLATION_ACTION") in MODEL_VIOLATION_ACTIONS:
         models["violation_action"] = get("MODEL_VIOLATION_ACTION")
     if get("MODEL_VIOLATION_BLOCK_MINUTES"):
-        models["violation_block_minutes"] = max(0, min(525600, int(get("MODEL_VIOLATION_BLOCK_MINUTES"))))
+        models["violation_block_minutes"] = max(0, min(525600, _int_env(get("MODEL_VIOLATION_BLOCK_MINUTES"), models["violation_block_minutes"], "MODEL_VIOLATION_BLOCK_MINUTES")))
     if get("MODEL_POLICY_SCOPES"):
         scopes = [s for s in _split_csv(get("MODEL_POLICY_SCOPES")) if s in MODEL_POLICY_SCOPE_TYPES]
         if scopes:
@@ -469,7 +484,7 @@ def _apply_env(cfg: dict, env: dict) -> dict:
 
     pricing_cfg = out["pricing"]
     if get("LONG_CONTEXT_THRESHOLD_TOKENS"):
-        pricing_cfg["long_context_threshold_tokens"] = max(1000, int(get("LONG_CONTEXT_THRESHOLD_TOKENS")))
+        pricing_cfg["long_context_threshold_tokens"] = max(1000, _int_env(get("LONG_CONTEXT_THRESHOLD_TOKENS"), pricing_cfg["long_context_threshold_tokens"], "LONG_CONTEXT_THRESHOLD_TOKENS"))
     if get("PROVISIONED_THROUGHPUT_COST") in ("on_demand", "zero"):
         pricing_cfg["provisioned_throughput_cost"] = get("PROVISIONED_THROUGHPUT_COST")
 

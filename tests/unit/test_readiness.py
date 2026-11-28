@@ -1020,8 +1020,8 @@ class ScriptTests(unittest.TestCase):
                 self.assertRegex(out, r"\[dry-run\] gcloud logging sinks create gcp-ai-usage-caps-api-ai-logs "
                                       r"bigquery\.googleapis\.com/projects/hub-proj/datasets/ge_analytics .*--project=%s"
                                  % pid)
-            self.assertIn("bq --project_id=hub-proj mk --dataset", out)
-            self.assertNotIn("bq --project_id=spoke-a mk", out)
+            self.assertIn("bq --headless --project_id=hub-proj mk --dataset", out)
+            self.assertNotIn("bq --headless --project_id=spoke-a mk", out)
             self.assertIn("Data Access audit logs", out)
             self.assertIn("roles/bigquery.dataEditor", out)
             # v1.2: the BigQuery sink filter routes Vertex AI inference request metadata logs ...
@@ -1070,7 +1070,7 @@ class ScriptTests(unittest.TestCase):
             res = self._run("prepare.sh", ["--project", HUB, "--link-projects", "spoke-a", "--per-project-datasets",
                                            "--dry-run"], env)
             self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
-            self.assertIn("bq --project_id=spoke-a mk --dataset", res.stdout)
+            self.assertIn("bq --headless --project_id=spoke-a mk --dataset", res.stdout)
             self.assertIn("bigquery.googleapis.com/projects/spoke-a/datasets/ge_analytics", res.stdout)
             res = self._run("prepare.sh", ["--project", HUB, "--managed-projects", "spoke-a", "--reuse-dataset",
                                            "sec-proj:ai_audit", "--dry-run"], env)

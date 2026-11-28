@@ -93,6 +93,28 @@ def _kind_for_status(status: int | None, reason: str = "") -> str:
     return "http"
 
 
+QUOTA_PROJECT_REJECT_REASONS = frozenset({"SERVICE_DISABLED", "USER_PROJECT_DENIED"})
+
+
+def quota_project_rejected(payload, quota_project: str) -> bool:
+    """True when a 403 says the x-goog-user-project (quota) project itself cannot be used for this API.
+
+    Typical on a brand-new hub before the installer enables its APIs: the caller can read the resource, but the hub
+    is not yet a valid quota project for cloudresourcemanager, pubsub, ... Retrying without the header bills the
+    call to the credential's own project (gcloud's OAuth client, or the ADC quota project) instead.
+    """
+    if not quota_project or not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+        return False
+    for detail in payload["error"].get("details") or []:
+        if not isinstance(detail, dict) or detail.get("reason") not in QUOTA_PROJECT_REJECT_REASONS:
+            continue
+        meta = detail.get("metadata") or {}
+        consumer = str(meta.get("consumer") or "")
+        if consumer in (f"projects/{quota_project}", "") or str(meta.get("containerInfo") or "") == quota_project:
+            return True
+    return False
+
+
 def _google_error(payload) -> tuple[str, str]:
     if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
         err = payload["error"]
@@ -137,6 +159,8 @@ class Gcp:
         self._scoped: dict = {}
         self._bq: dict = {}
         self._local = threading.local()
+        # Quota projects that rejected x-goog-user-project (API not enabled there yet); requests skip the header.
+        self._quota_rejected: set[str] = set()
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="caps-q")
         self.subpool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="caps-sub")
 
@@ -191,10 +215,13 @@ class Gcp:
     def request(self, method: str, url: str, *, quota_project: str, params=None, json_body=None, data=None,
                 headers=None, timeout: int = 30, expect_json: bool = True):
         import requests  # type: ignore
+        if quota_project and quota_project in self._quota_rejected:
+            quota_project = ""
         hdrs = self.auth_headers(quota_project)
         if headers:
             hdrs.update(headers)
         resp = None
+        retried_without_quota = False
         for attempt in (1, 2):
             try:
                 resp = self._session().request(method, url, params=params, json=json_body, data=data,
@@ -213,6 +240,25 @@ class Gcp:
                         break
                 hdrs.update(self.auth_headers(quota_project))
                 continue
+            if resp.status_code == 403 and quota_project and not retried_without_quota:
+                try:
+                    rejected = quota_project_rejected(resp.json(), quota_project)
+                except ValueError:
+                    rejected = False
+                if rejected:
+                    # The quota project cannot be used for this API (not enabled there yet): retry billed to the
+                    # credential's own project, and keep doing so for this quota project once that works.
+                    retried_without_quota = True
+                    rejected_project, quota_project = quota_project, ""
+                    hdrs = self.auth_headers("")
+                    hdrs.pop("x-goog-user-project", None)
+                    if headers:
+                        hdrs.update(headers)
+                    resp_retry = self._session().request(method, url, params=params, json=json_body, data=data,
+                                                         headers=hdrs, timeout=timeout, allow_redirects=False)
+                    if resp_retry.status_code < 300:
+                        self._quota_rejected.add(rejected_project)
+                    resp = resp_retry
             break
         assert resp is not None
         payload = None

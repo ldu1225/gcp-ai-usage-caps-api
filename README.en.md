@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="openapi.yaml"><img alt="OpenAPI 3.1" src="https://img.shields.io/badge/OpenAPI-3.1-0B1F3A"></a>
-  <img alt="API 1.4.0" src="https://img.shields.io/badge/API-1.4.0-1A73E8">
+  <img alt="API 1.4.1" src="https://img.shields.io/badge/API-1.4.1-1A73E8">
   <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-0B1F3A">
   <img alt="Cloud Run" src="https://img.shields.io/badge/runtime-Cloud%20Run-1A73E8">
   <img alt="Terraform" src="https://img.shields.io/badge/IaC-Terraform-0B1F3A">
@@ -408,6 +408,22 @@ bash <(curl -fsSL https://github.com/ldu1225/gcp-ai-usage-caps-api/raw/main/scri
 
 Install order: **1. Preflight**, **2. prepare** (APIs, dataset, sinks, audit logs, Gemini Platform inference request logging), **3. deploy** (service accounts, Cloud Run, Job, Pub/Sub, Scheduler, Secret). The installer prints the API URL and the bootstrap admin key (stored in Secret Manager). Skip inference logging with `--no-vertex-inference-logging`.
 
+```bash
+# Simplest install: one project (a brand-new empty project works as is; it only needs a linked billing account)
+bash <(curl -fsSL https://github.com/ldu1225/gcp-ai-usage-caps-api/raw/main/scripts/install.sh) --project HUB_PROJECT
+
+# Read the admin key again at any time (it stays in Secret Manager across re-runs and interrupted installs)
+ADMIN=$(gcloud secrets versions access latest --secret=gcp-ai-usage-caps-api-bootstrap-key --project=HUB_PROJECT)
+curl -s "$BASE/v1/admin/readiness" -H "Authorization: Bearer $ADMIN"
+```
+
+- **Empty project**: no API needs to be enabled beforehand. The installer enables them, and builds the image with a dedicated least-privilege service account (`ai-usage-caps-build`) and a bucket in the hub region, so it works without the Compute Engine default service account and under `iam.automaticIamGrantsForDefaultServiceAccounts`.
+- **Existing project**: re-running the same command is safe (idempotent). Existing datasets, sinks and service accounts are reused and the admin key is not rotated.
+- **Resource location policy** (`gcp.resourceLocations`): the secret, buckets and the build all stay in `--region` (default `asia-northeast3`).
+- **Permissions**: Owner on the hub project (or Service Usage, IAM, Cloud Run, Secret Manager, Storage and Logging admin roles). Org roles need `--grant-org-roles` or an organization admin running the printed commands.
+- **Service accounts as cap subjects**: by default only human users get caps. Install with `SERVICE_ACCOUNT_SUBJECTS=true` to cap and block service-account callers too.
+- If an install stops halfway, fix the cause and **run the same command again**; it picks up where it left off.
+
 > [!WARNING]
 > `roles/orgpolicy.policyAdmin` (model policy writes) and `roles/iam.denyAdmin` (blocking) **can only be granted at the organization level.** Use `--grant-org-roles` or hand the printed commands to an organization administrator. Google Group sync additionally needs the Groups Reader role in the Google Admin console ([section 4](#4-groups)).
 
@@ -491,7 +507,7 @@ Error format: `{"error": {"type": "invalid_request_error", "code": "lockout_prev
 
 ## 14. Full endpoint reference
 
-Full specification: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API version 1.4.0, also served at `GET /v1/openapi.yaml`)
+Full specification: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API version 1.4.1, also served at `GET /v1/openapi.yaml`)
 
 | Area | Method | Path | Scope |
 |---|---|---|---|
