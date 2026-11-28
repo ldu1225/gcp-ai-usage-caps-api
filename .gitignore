@@ -14,3 +14,4 @@ deploy.env
 terraform/terraform.tfvars
 .pytest_cache/
 .DS_Store
+e2e-report-*.md
