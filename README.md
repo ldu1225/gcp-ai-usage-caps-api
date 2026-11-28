@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="openapi.yaml"><img alt="OpenAPI 3.1" src="https://img.shields.io/badge/OpenAPI-3.1-0B1F3A"></a>
-  <img alt="API 1.3.1" src="https://img.shields.io/badge/API-1.3.1-1A73E8">
+  <img alt="API 1.4.0" src="https://img.shields.io/badge/API-1.4.0-1A73E8">
   <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-0B1F3A">
   <img alt="Cloud Run" src="https://img.shields.io/badge/runtime-Cloud%20Run-1A73E8">
   <img alt="Terraform" src="https://img.shields.io/badge/IaC-Terraform-0B1F3A">
@@ -242,6 +242,29 @@ curl -s "$BASE/v1/users/alice%40company.com/projects?start=2026-11-01&end=2026-1
 
 수식, 환율, 계산 예시는 [docs/cost-methodology.md](docs/cost-methodology.md)를 참고하세요.
 
+### 6.1 원장형 수집: `/v1/usage/facts` · `/v1/usage/exports` (v1.4.0)
+
+사용자별 비용·사용량을 주기적으로 적재하는 수집기(Airflow 등)를 위한 엔드포인트입니다. 출처·귀속·단가 계산은 `/v1/usage/users`와 같고, 같은 기간의 합계가 정확히 일치합니다.
+
+| 항목 | 내용 |
+|---|---|
+| 버킷 | `granularity=hour` (최대 31일) 또는 `day` (최대 400일), UTC. `start_time`/`end_time`(RFC 3339) 또는 `start`/`end`(날짜) |
+| 차원 (`group_by`, 복수 지정) | `user`, `surface`, `project`, `model`, `location`, `client`, `app`, `agent`, `traffic`, `reasoning_level` (기본 `user,surface,project,model`) |
+| 멱등 키 | `fact_id` = (granularity, 버킷, 차원 값)의 결정적 해시. 수집기는 `fact_id`로 upsert만 하면 재집계(정정)된 값이 덮어써집니다. 값이 바뀌면 `revision`도 바뀝니다 |
+| 토큰 | `requests`, `input_tokens`, `uncached_input_tokens`, `cached_tokens`, `cache_write_tokens`(+`_5m`/`_1h`), `output_tokens`, `thoughts_tokens`, `total_tokens`, `long_context_*`, `by_modality{text,image,audio,video,document}`, `by_traffic` |
+| 비용 | `list_cost`(정가 또는 계약가 x 토큰), `currency`, `cost_basis`, `billing[]` = SKU 라인 `{sku_id, tier, component, quantity{value, unit:"tokens"}, unit_price_per_1m, cost}` (`include=none`으로 생략) |
+| 기타 | `principal_type`, `attribution`, `sessions`(Antigravity 대화 수), `latency_ms_avg`(Gemini Platform), `client_versions`, `agent_names` |
+| 신선도 | 응답에 `data_refreshed_at`(로그를 읽은 시각), `data_complete_through`(로그 전달 지연 약 15분을 감안한 확정 시각). 기존 사용량 응답의 `telemetry`에도 추가 |
+
+파일 방식이 편하면 `GET /v1/usage/exports?after=2026-11-21&before=2026-11-28`로 UTC 일자별 파일 목록을 받고, `GET /v1/usage/exports/usage-facts-hourly-2026-11-27/download`로 JSONL(한 줄 = 시간 단위 fact, 모든 차원)을 내려받습니다. 당일 파일은 `status=partial`이며, 다시 받아 `fact_id`로 덮어쓰면 됩니다.
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" \
+  "$API/v1/usage/facts?granularity=hour&start_time=2026-11-27T00:00:00Z&end_time=2026-11-28T00:00:00Z&group_by=user,model,location&limit=1000"
+```
+
+차원별 출처: `location` = `resource.labels.location`, `client` = Antigravity `labels.client_name`, `app` = Gemini Platform 요청 라벨 `labels.app` 또는 Gemini Enterprise 앱(engine) id, `agent` = Gemini Enterprise `agentInfo.agent`, `reasoning_level` = Antigravity `experience` 접미사, 모달리티 = Gemini Platform `usageMetadata.*TokensDetails`. 로그에 없는 값(웹 검색 횟수, Gemini Enterprise 토큰, 표시 이름)은 제공하지 않습니다.
+
 ## 7. Gemini Platform 사용자별 귀속
 
 Gemini Platform 토큰 수는 **추론 요청 메타데이터 로그**(`aiplatform.googleapis.com/inference_request`)에만 기록됩니다. 이 로그는 프로젝트마다 활성화해야 하고, 호출 주체가 대개 포털의 서비스 계정이므로 다음 순서로 실제 사람에게 귀속합니다.
@@ -460,7 +483,7 @@ print(c.request("GET", "/v1/users/alice%40company.com/groups")["effective_cap_ru
 
 ## 14. API 엔드포인트 전체 목록
 
-전체 스펙: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API 버전 1.3.1, `GET /v1/openapi.yaml`로도 제공)
+전체 스펙: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API 버전 1.4.0, `GET /v1/openapi.yaml`로도 제공)
 
 | 영역 | 메서드 | 경로 | Scope |
 |---|---|---|---|
@@ -470,6 +493,9 @@ print(c.request("GET", "/v1/users/alice%40company.com/groups")["effective_cap_ru
 | 사용량 | GET | `/v1/usage/users/{email}` | `usage:read` |
 | 사용량 | GET | `/v1/users/{email}/projects` | `usage:read` |
 | 사용량 | GET | `/v1/billing/users` | `usage:read` |
+| 사용량 | GET | `/v1/usage/facts` | `usage:read` |
+| 사용량 | GET | `/v1/usage/exports` | `usage:read` |
+| 사용량 | GET | `/v1/usage/exports/{export_id}/download` | `usage:read` |
 | 사용량 | GET | `/v1/usage/models` | `usage:read` 또는 `models:read` |
 | 사용량 | GET | `/v1/pricing` | `usage:read` 또는 `models:read` |
 | 캡 정책 | GET, PUT | `/v1/caps/policy` | `caps:read` / `caps:write` |

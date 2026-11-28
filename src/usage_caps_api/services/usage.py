@@ -64,6 +64,30 @@ TRAFFIC_COUNTERS = ("requests", "input_tokens", "output_tokens", "cached_tokens"
 TRAFFIC_TYPES = {"ON_DEMAND": "on_demand", "ON_DEMAND_FLEX": "flex", "ON_DEMAND_PRIORITY": "priority",
                  "PROVISIONED_THROUGHPUT": "provisioned", "BATCH": "batch"}
 ATTRIBUTION_KINDS = ("log_identity", "header_label", "audit_correlated", "unattributed")
+# Extra per-row metrics carried in `counts["extra"]` (read by /v1/usage/facts; ignored by the classic aggregates).
+MODALITIES = ("text", "image", "audio", "video", "document")
+EXTRA_COUNTERS = tuple("%s_%s_tokens" % (m, d) for m in MODALITIES for d in ("input", "output")) + (
+    "cache_write_5m_tokens", "cache_write_1h_tokens", "latency_ms_sum", "latency_samples")
+_DURATION_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)s\s*$")
+
+
+def duration_ms(raw) -> int:
+    """'28.479840432s' (protobuf Duration JSON) -> 28480 ms; 0 when missing or malformed."""
+    m = _DURATION_RE.match(str(raw or ""))
+    return int(round(float(m.group(1)) * 1000)) if m else 0
+
+
+def modality_tokens(details, direction: str) -> dict:
+    """[{modality: TEXT, tokenCount: n}, ...] -> {"text_input_tokens": n, ...}."""
+    out: dict = {}
+    for d in details if isinstance(details, list) else []:
+        if not isinstance(d, dict):
+            continue
+        m = str(d.get("modality") or "").strip().lower()
+        if m in MODALITIES:
+            key = "%s_%s_tokens" % (m, direction)
+            out[key] = out.get(key, 0) + to_int(d.get("tokenCount"))
+    return out
 
 
 def entry_project(log_name: str | None, default: str | None = None) -> str | None:
@@ -203,6 +227,7 @@ class UsageResult:
         self.models_seen: dict[str, dict] = {}      # model -> {publisher, surfaces, projects, users, requests, ...}
         self.attribution: dict[str, int] = {k: 0 for k in ATTRIBUTION_KINDS}
         self.token_sources: dict[str, str] = {}     # surface -> "logs" | "requests_only" | "unavailable"
+        self.computed_at: dt.datetime | None = None  # when the logs were read (cache snapshots keep the original time)
 
     def user(self, person: str) -> dict:
         rec = self.users.get(person)
@@ -724,6 +749,17 @@ def parse_vertex_entry(entry: dict, *, header_label: str, long_ctx: int) -> dict
         total = prompt + cand
     else:
         return None
+    extra: dict = {}
+    if gmeta:
+        extra.update(modality_tokens(gmeta.get("promptTokensDetails"), "input"))
+        extra.update(modality_tokens(gmeta.get("candidatesTokensDetails"), "output"))
+    elif cmeta:
+        cc = cmeta.get("cache_creation") if isinstance(cmeta.get("cache_creation"), dict) else {}
+        extra["cache_write_5m_tokens"] = to_int(cc.get("ephemeral_5m_input_tokens"))
+        extra["cache_write_1h_tokens"] = to_int(cc.get("ephemeral_1h_input_tokens"))
+    lat = duration_ms(payload.get("requestDuration"))
+    if lat:
+        extra.update(latency_ms_sum=lat, latency_samples=1)
     is_long = prompt > long_ctx
     traffic = normalize_traffic(payload.get("trafficType"))
     counts = token_counts(prompt=prompt, cand=cand, cached=cached, total=total, thoughts=thoughts,
@@ -738,9 +774,13 @@ def parse_vertex_entry(entry: dict, *, header_label: str, long_ctx: int) -> dict
         principal = (principal.get("id") or principal.get("email") or principal.get("principalEmail")
                      or principal.get("serviceAccount"))
     ts = timeutil.parse_rfc3339(payload.get("requestStartTime")) or timeutil.parse_rfc3339(entry.get("timestamp"))
+    counts["extra"] = {k: v for k, v in extra.items() if v}
+    labels = entry.get("labels") if isinstance(entry.get("labels"), dict) else {}
     return {"project": project, "publisher": pub, "model": model, "counts": counts, "traffic": traffic,
             "user_label": user_vals[0] if user_vals else None,
             "principal": principal if isinstance(principal, str) else None,
+            "location": str(res_labels.get("location") or "").strip().lower() or None,
+            "app": str(labels.get("app") or "").strip()[:120] or None,
             "ts": ts, "key": str(entry.get("insertId") or "")}
 
 
@@ -782,10 +822,44 @@ def _vertex_fields(src) -> dict:
         "c_cw": p("rawPredictDetails.usageMetadata.cache_creation_input_tokens",
                   "rawPredictDetails.usageMetadata.cacheCreationInputTokens"),
         "principal": p("principal.id", "principal.email", "principal", cast="STRING"),
+        "location": expr("t", s, "resource.labels.location", cast="STRING"),
+        "app": expr("t", s, "labels.app", cast="STRING"),
+        "duration": p("requestDuration", cast="STRING"),
+        "c_cw5m": p("rawPredictDetails.usageMetadata.cache_creation.ephemeral_5m_input_tokens"),
+        "c_cw1h": p("rawPredictDetails.usageMetadata.cache_creation.ephemeral_1h_input_tokens"),
+        "mod_in": _repeated_path(s, "generateContentDetails.usageMetadata.promptTokensDetails"),
+        "mod_out": _repeated_path(s, "generateContentDetails.usageMetadata.candidatesTokensDetails"),
         "header_tpl": hdr,
         "ts": "t.%s" % quote_ident(src.time_column()),
         "log": expr("t", s, "logName", cast="STRING"),
     }
+
+
+def _repeated_path(s, payload_path: str) -> str | None:
+    """SQL path of a REPEATED STRUCT<modality, tokenCount> payload field (no repeated ancestors), or None."""
+    if s is None:
+        return None
+    for cand in payload_paths(s, payload_path):
+        cur, names, ok, node = s.tree, [], True, None
+        parts = cand.split(".")
+        for i, part in enumerate(parts):
+            node = cur.get(part.lower())
+            if node is None or (node.mode == "REPEATED" and i != len(parts) - 1):
+                ok = False
+                break
+            names.append(node.name)
+            cur = node.children
+        if ok and node is not None and node.mode == "REPEATED" and "modality" in node.children \
+                and "tokencount" in node.children:
+            return "t." + ".".join(quote_ident(n) for n in names)
+    return None
+
+
+def _modality_sum_sql(path: str | None, modality: str) -> str:
+    if not path:
+        return "0"
+    return ("(SELECT IFNULL(SUM(SAFE_CAST(d.tokenCount AS INT64)), 0) FROM UNNEST(%s) d "
+            "WHERE UPPER(CAST(d.modality AS STRING)) = '%s')" % (path, modality.upper()))
 
 
 def _refresh_vertex_schema(ctx, src) -> bool:
@@ -846,21 +920,31 @@ def _bq_vertex_inference_one(ctx, src, start: dt.datetime, end: dt.datetime) -> 
         ok.append("%s IS NULL" % f["error"])
     where = " AND ".join(ok) if ok else "TRUE"
     start_ts = "IFNULL(%s, %s)" % (f["start"], f["ts"]) if f["start"] else f["ts"]
+    extra_cols = [("%s_%s_tokens" % (m, d), _modality_sum_sql(f["mod_in" if d == "input" else "mod_out"], m))
+                  for m in MODALITIES for d in ("input", "output")]
+    extra_cols += [("cache_write_5m_tokens", z(f["c_cw5m"])), ("cache_write_1h_tokens", z(f["c_cw1h"]))]
+    lat_sql = ("IFNULL(SAFE_CAST(REGEXP_EXTRACT(%s, r'^([0-9.]+)s$') AS FLOAT64) * 1000, 0)" % f["duration"]
+               if f["duration"] else "0")
+    extra_cols += [("latency_ms_sum", "CAST(ROUND(%s) AS INT64)" % lat_sql),
+                   ("latency_samples", "IF(%s > 0, 1, 0)" % lat_sql)]
     sql = (
         "WITH %s,\nv AS (SELECT %s AS ts, %s AS raw_ts, %s AS project, %s AS log_project, %s AS publisher, %s AS model, "
         "%s AS user_label, %s AS principal, IFNULL(%s, 'ON_DEMAND') AS traffic, %s AS prompt, %s AS cand, "
-        "%s AS thoughts, %s AS cached, %s AS cwrite, %s AS total FROM s t WHERE %s AND %s IS NOT NULL)\n"
+        "%s AS thoughts, %s AS cached, %s AS cwrite, %s AS total, LOWER(%s) AS location, %s AS app, %s "
+        "FROM s t WHERE %s AND %s IS NOT NULL)\n"
         "SELECT TIMESTAMP_TRUNC(ts, MINUTE) AS minute, project, log_project, publisher, model, user_label, principal, "
-        "traffic, COUNT(*) AS requests, SUM(prompt) AS prompt_tokens, SUM(cand) AS candidate_tokens, "
+        "traffic, location, app, COUNT(*) AS requests, SUM(prompt) AS prompt_tokens, SUM(cand) AS candidate_tokens, "
         "SUM(thoughts) AS thoughts_tokens, SUM(cached) AS cached_tokens, SUM(cwrite) AS cache_write_tokens, "
         "SUM(total) AS tokens, COUNTIF(prompt > @long_ctx) AS long_requests, "
         "SUM(IF(prompt > @long_ctx, prompt, 0)) AS long_input_tokens, "
         "SUM(IF(prompt > @long_ctx, GREATEST(total - prompt, cand + thoughts, 0), 0)) AS long_output_tokens, "
-        "SUM(IF(prompt > @long_ctx, cached, 0)) AS long_cached_tokens, MAX(ts) AS last_ts, MAX(raw_ts) AS max_log_ts\n"
-        "FROM v GROUP BY minute, project, log_project, publisher, model, user_label, principal, traffic"
+        "SUM(IF(prompt > @long_ctx, cached, 0)) AS long_cached_tokens, %s, MAX(ts) AS last_ts, MAX(raw_ts) AS max_log_ts\n"
+        "FROM v GROUP BY minute, project, log_project, publisher, model, user_label, principal, traffic, location, app"
         % (src.cte("s", start="w_start", end="w_end"), start_ts, f["ts"], proj, log_proj, f["publisher"] or null, f["model"],
            user_sql or null, f["principal"] or null, f["traffic"] or "CAST(NULL AS STRING)", prompt, cand, thoughts,
-           cached, cwrite, total, where, f["model"])
+           cached, cwrite, total, f["location"] or null, f["app"] or null,
+           ", ".join("%s AS x_%s" % (sql_e, name) for name, sql_e in extra_cols), where, f["model"],
+           ", ".join("SUM(x_%s) AS %s" % (name, name) for name, _ in extra_cols))
     )
     rows = ctx.query(sql, dict(_window_params(start, end), long_ctx=_long_threshold(ctx)), "usage")
     out = []
@@ -878,8 +962,11 @@ def _bq_vertex_inference_one(ctx, src, start: dt.datetime, end: dt.datetime) -> 
         proj_id = _norm_project(r.get("project"), _norm_project(r.get("log_project"), src.project))
         log_ts = r.get("max_log_ts") if isinstance(r.get("max_log_ts"), dt.datetime) else (
             r.get("last_ts") if isinstance(r.get("last_ts"), dt.datetime) else minute)
+        counts["extra"] = {k: to_int(r.get(k)) for k in EXTRA_COUNTERS if to_int(r.get(k))}
         out.append({"project": proj_id, "publisher": pub, "model": model, "counts": counts,
                     "traffic": traffic, "user_label": r.get("user_label"), "principal": r.get("principal"),
+                    "location": (str(r.get("location") or "").strip().lower() or None),
+                    "app": (str(r.get("app") or "").strip()[:120] or None),
                     "ts": r.get("last_ts") if isinstance(r.get("last_ts"), dt.datetime) else minute,
                     "log_ts": log_ts,
                     "minute": _minute(minute) if isinstance(minute, dt.datetime) else _minute(r.get("last_ts"))})
@@ -1067,6 +1154,10 @@ def attribute_vertex(inf_rows: list[dict], audit_rows: list[dict], directory: di
             for k in TRAFFIC_COUNTERS:
                 for i, part in enumerate(split_int(int(tr.get(k) or 0), w)):
                     shares[i]["by_traffic"].setdefault(t, {kk: 0 for kk in TRAFFIC_COUNTERS})[k] = part
+        for k, v in (row["counts"].get("extra") or {}).items():
+            for i, part in enumerate(split_int(int(v or 0), w)):
+                if part:
+                    shares[i].setdefault("extra", {})[k] = part
         for pp, share in zip(people, shares):
             yield pp, "audit_correlated", row, share
 
@@ -1411,6 +1502,7 @@ def _collect_usage_uncached(ctx, start: dt.datetime, end: dt.datetime, *, email:
         else:
             ctx.warn_error("gemini_platform", val, "Gemini Platform usage")
     combined.ok = any_ok
+    combined.computed_at = dt.datetime.now(dt.timezone.utc)
     if any_ok and not email:
         remember_people(ctx, combined.users.keys())
         try:
@@ -1509,6 +1601,8 @@ def _format_user_row(email: str, rec: dict, pricing: pricing_svc.Pricing) -> dic
     out = {
         "email": email,
         "uid": identity.uid_for(email),
+        "principal_type": ("workforce" if identity.is_workforce_key(email) else
+                           "service_account" if identity.is_service_account(email) else "user"),
         "surfaces": sorted((rec.get("by_surface") or {}).keys()),
         "projects": [p["project"] for p in by_project_list],
         "multi_project": len(by_project_list) > 1,
@@ -1526,8 +1620,20 @@ def _format_user_row(email: str, rec: dict, pricing: pricing_svc.Pricing) -> dic
     return out
 
 
+DATA_SETTLE_DELAY = dt.timedelta(minutes=15)
+
+
+def freshness(usage: UsageResult) -> dict:
+    """data_refreshed_at = when the logs were read; data_complete_through = start of the hour before which Cloud
+    Logging / BigQuery sink delivery is treated as settled (heuristic 15-minute delivery delay)."""
+    at = usage.computed_at if isinstance(usage.computed_at, dt.datetime) else None
+    settled = (at - DATA_SETTLE_DELAY).replace(minute=0, second=0, microsecond=0) if at else None
+    return {"data_refreshed_at": iso(at), "data_complete_through": iso(settled)}
+
+
 def usage_meta(usage: UsageResult) -> dict:
     return {
+        **freshness(usage),
         "attribution": dict(usage.attribution),
         "token_sources": dict(usage.token_sources),
         "unattributed_projects": sorted(usage.unattributed.keys()),
@@ -1555,9 +1661,17 @@ def list_user_usage(ctx) -> dict:
     rows = [_format_user_row(mail, rec, pricing) for mail, rec in usage.users.items()]
     if model_f:
         rows = [r for r in rows if any(m["model"] == model_f for m in r["by_model"])]
+    include = {p.strip().lower() for p in str(ctx.params.get("include") or "").split(",") if p.strip()}
+    if "groups" in include:
+        from . import groups as groups_svc
+        all_groups = groups_svc.load_groups(ctx)
+        mem = groups_svc.membership(all_groups)
+        for r in rows:
+            r["groups"] = [{"id": gid, "name": (all_groups.get(gid) or {}).get("name") or gid}
+                           for gid in mem.get(r["email"], [])]
     rows.sort(key=lambda r: (-(r["estimated_cost"] if r["estimated_cost"] is not None else -1.0),
                              -r["total_tokens"], -r["requests"], r["email"]))
-    page = paginate_list(rows, ctx.params, default_limit=100, max_limit=500)
+    page = paginate_list(rows, ctx.params, default_limit=100, max_limit=1000)
     total_cost = [r["estimated_cost"] for r in rows if r["estimated_cost"] is not None]
     un_cost = [pricing_svc.estimate_cost(p, pricing)[0] for p in usage.unattributed.values()]
     page["range"] = rng.meta()
@@ -1574,6 +1688,7 @@ def list_user_usage(ctx) -> dict:
         "unattributed_estimated_cost": round(sum(c for c in un_cost if c), 6) if any(un_cost) else None,
     }
     page["telemetry"] = usage_meta(usage)
+    page.update(freshness(usage))
     return page
 
 
@@ -1608,6 +1723,7 @@ def get_user_usage(ctx) -> dict:
         "timeseries": timeseries,
         "current_cap": cap_status,
         "telemetry": usage_meta(usage),
+        **freshness(usage),
     }
 
 

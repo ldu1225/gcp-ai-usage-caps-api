@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: GCP AI Usage & Spend Caps API
-  version: 1.3.1
+  version: 1.4.0
   description: |
     Headless M2M REST API for enterprise AI management portals to query per-user Google Cloud AI
     usage & estimated costs (Antigravity, Gemini Platform,
@@ -33,6 +33,12 @@ info:
       exceptions, model rules, usage). Resolution order: user > group (priority) > global policy.
     - **Multi-project users**: usage, caps (`cap_scope`, `project_caps`, `project_defaults`) and blocks
       (`projects: [...]`) work per (user, project); one hub governs every managed project.
+    - **Ledger-style collection (v1.4.0)**: `GET /v1/usage/facts` returns hour/day facts for any combination of
+      `user, surface, project, model, location, client, app, agent, traffic, reasoning_level`. Each row has a
+      deterministic `fact_id` (same bucket + dimensions = same id) and a content `revision`, so collectors simply
+      upsert by `fact_id`; restated buckets overwrite older values. `GET /v1/usage/exports` lists one JSONL file per
+      UTC day and `.../download` returns hourly facts at the finest grain. Responses carry `data_refreshed_at` and
+      `data_complete_through` (Cloud Logging delivery is treated as settled after ~15 minutes).
     - **Project Spend Cap Lift**: Lifting an `ENFORCED` Google Cloud Billing Spend Cap takes up to
       **~1 hour** for Google Cloud to resume Gemini Platform traffic.
 
@@ -126,9 +132,12 @@ paths:
         - name: fresh
           in: query
           schema: { type: boolean, default: false, description: "Bypass usage cache and merge recent Cloud Logging tail entries" }
+        - name: include
+          in: query
+          schema: { type: string, enum: [groups], description: "groups: add each user's hub groups ({id, name}) to the row" }
         - name: limit
           in: query
-          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
         - name: cursor
           in: query
           schema: { type: string }
@@ -162,6 +171,8 @@ paths:
                       unattributed_estimated_cost: { type: ["number", "null"] }
                   pricing_source: { $ref: "#/components/schemas/PricingSource" }
                   telemetry: { $ref: "#/components/schemas/Telemetry" }
+                  data_refreshed_at: { type: ["string", "null"], format: date-time }
+                  data_complete_through: { type: ["string", "null"], format: date-time }
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
 
@@ -211,6 +222,8 @@ paths:
                         total_tokens: { type: integer }
                   current_cap: { $ref: "#/components/schemas/UserCap" }
                   telemetry: { $ref: "#/components/schemas/Telemetry" }
+                  data_refreshed_at: { type: ["string", "null"], format: date-time }
+                  data_complete_through: { type: ["string", "null"], format: date-time }
         "400": { $ref: "#/components/responses/Error" }
 
   /v1/billing/users:
@@ -261,6 +274,169 @@ paths:
                   has_more: { type: boolean }
                   next_cursor: { type: ["string", "null"] }
                   total: { type: integer }
+
+  /v1/usage/facts:
+    get:
+      tags: [Usage & Billing]
+      summary: Hour / day usage facts by any dimensions (upsert-safe ledger rows)
+      description: |
+        Requires scope `usage:read`. Same sources, attribution and pricing as `/v1/usage/users` (logs only; list or
+        contract price x log token counts), sliced into UTC hour or day buckets and grouped by any combination of
+        dimensions. `fact_id` is deterministic for (granularity, bucket, grouped dimension values): store rows keyed
+        by `fact_id` and overwrite on every pull - re-aggregated (restated) buckets replace older values, and
+        `revision` changes whenever a fact's numbers change. Rows without a person (Gemini Platform calls with neither
+        a user header nor a same-minute audit caller) are returned with `email: null` and
+        `attribution.unattributed`, so totals reconcile with project usage.
+      parameters:
+        - name: start_time
+          in: query
+          schema: { type: string, format: date-time, example: "2026-11-27T00:00:00Z", description: "Inclusive (RFC 3339). Wins over start/end." }
+        - name: end_time
+          in: query
+          schema: { type: string, format: date-time, example: "2026-11-28T00:00:00Z", description: "Exclusive (RFC 3339)" }
+        - name: start
+          in: query
+          schema: { type: string, format: date, description: "UTC date (inclusive). Default: 6 days before end" }
+        - name: end
+          in: query
+          schema: { type: string, format: date, description: "UTC date (inclusive). Default: today" }
+        - name: granularity
+          in: query
+          schema: { type: string, enum: [hour, day], default: day, description: "hour: window up to 31 days; day: up to 400 days" }
+        - name: group_by
+          in: query
+          schema:
+            type: string
+            default: "user,surface,project,model"
+            example: "user,model,location"
+            description: "Comma-separated: user, surface, project, model, location, client, app, agent, traffic, reasoning_level"
+        - name: email
+          in: query
+          schema: { type: string, description: "Exact email or Workforce Identity principal" }
+        - name: surface
+          in: query
+          schema: { type: string, enum: [all, antigravity, gemini_platform, gemini_enterprise] }
+        - name: project
+          in: query
+          schema: { type: string }
+        - name: model
+          in: query
+          schema: { type: string }
+        - name: include
+          in: query
+          schema: { type: string, enum: [billing, none], default: billing, description: "billing: per-SKU list-price lines in `billing[]`" }
+        - name: fresh
+          in: query
+          schema: { type: boolean, default: false, description: "Bypass the cache and merge the newest Cloud Logging entries" }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Paginated usage facts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [list] }
+                  data: { type: array, items: { $ref: "#/components/schemas/UsageFact" } }
+                  has_more: { type: boolean }
+                  next_cursor: { type: ["string", "null"] }
+                  total: { type: integer }
+                  range:
+                    type: object
+                    properties:
+                      start_time: { type: string, format: date-time }
+                      end_time: { type: string, format: date-time }
+                      granularity: { type: string, enum: [hour, day] }
+                      timezone: { type: string, enum: [UTC] }
+                  group_by: { type: array, items: { type: string } }
+                  currency: { type: ["string", "null"] }
+                  pricing_source: { $ref: "#/components/schemas/PricingSource" }
+                  data_refreshed_at: { type: string, format: date-time, description: "When the logs were read (cached snapshots keep their original time)" }
+                  data_complete_through: { type: string, format: date-time, description: "Buckets before this time are treated as settled (~15 min log delivery delay)" }
+                  summary:
+                    type: object
+                    properties:
+                      facts: { type: integer }
+                      total_requests: { type: integer }
+                      total_tokens: { type: integer }
+                      total_list_cost: { type: ["number", "null"] }
+                  telemetry:
+                    type: object
+                    properties:
+                      attribution: { type: object, additionalProperties: { type: integer } }
+                      token_sources: { type: object, additionalProperties: { type: string } }
+                      truncated: { type: boolean }
+                      cache_hit: { type: boolean }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /v1/usage/exports:
+    get:
+      tags: [Usage & Billing]
+      summary: List daily usage export files (one JSONL per UTC day)
+      description: |
+        Requires scope `usage:read`. File-feed style collection: list the days, then download each file. A day is
+        `partial` until 15 minutes after it ends; download it again later (or on any schedule) and replace the rows
+        by `fact_id`. The `X-Usage-Export-Revision` response header of the download changes when the content changes.
+      parameters:
+        - name: after
+          in: query
+          schema: { type: string, example: "2026-11-21", description: "UTC day or RFC 3339 time (inclusive). Default: 7 days before `before`" }
+        - name: before
+          in: query
+          schema: { type: string, example: "2026-11-28", description: "UTC day or RFC 3339 time (exclusive). Default: tomorrow" }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 400, default: 100 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Export files
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, enum: [list] }
+                  data: { type: array, items: { $ref: "#/components/schemas/UsageExport" } }
+                  has_more: { type: boolean }
+                  next_cursor: { type: ["string", "null"] }
+                  total: { type: integer }
+                  range: { type: object }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /v1/usage/exports/{export_id}/download:
+    get:
+      tags: [Usage & Billing]
+      summary: Download one daily export (JSONL, one hourly UsageFact per line)
+      description: |
+        Requires scope `usage:read`. Returns `application/x-ndjson`: one `UsageFact` per line, hourly buckets,
+        grouped by every dimension. Headers: `X-Usage-Export-Id`, `X-Usage-Export-Status` (complete | partial),
+        `X-Usage-Export-Revision` (content hash), `X-Data-Refreshed-At`.
+      parameters:
+        - name: export_id
+          in: path
+          required: true
+          schema: { type: string, pattern: "^usage-facts-hourly-[0-9]{4}-[0-9]{2}-[0-9]{2}$" }
+        - name: fresh
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: JSONL file
+          content:
+            application/x-ndjson:
+              schema: { type: string, description: "Newline-delimited UsageFact JSON objects" }
+        "404": { $ref: "#/components/responses/Error" }
 
   /v1/caps/policy:
     get:
@@ -1934,6 +2110,15 @@ components:
       properties:
         email: { type: string }
         uid: { type: string }
+        principal_type: { type: string, enum: [user, service_account, workforce] }
+        groups:
+          type: array
+          description: "Only with include=groups"
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              name: { type: string }
         surfaces:
           type: array
           items: { type: string, enum: [antigravity, gemini_platform, gemini_enterprise] }
@@ -2063,6 +2248,110 @@ components:
         unattributed_projects: { type: array, items: { type: string } }
         telemetry_ok: { type: boolean }
         truncated: { type: boolean }
+        data_refreshed_at: { type: ["string", "null"], format: date-time }
+        data_complete_through: { type: ["string", "null"], format: date-time }
+
+    CostLine:
+      type: object
+      description: One list-price line (official Catalog SKU or contract override) x log token count
+      properties:
+        model: { type: string }
+        tier: { type: string, description: "on_demand | flex | priority | batch | provisioned | long_context" }
+        component: { type: string, enum: [input, cached_input, cache_write, output] }
+        sku_id: { type: ["string", "null"], description: "Cloud Billing Catalog SKU id; null for contract overrides" }
+        sku: { type: ["string", "null"], description: "services/{service}/skus/{sku_id}" }
+        quantity:
+          type: object
+          properties:
+            value: { type: integer }
+            unit: { type: string, enum: [tokens] }
+        unit_price_per_1m: { type: number }
+        cost: { type: number }
+        currency: { type: string }
+
+    UsageFact:
+      type: object
+      description: |
+        Dimension keys appear only when grouped (`group_by`). Counters are integers; `input_tokens` includes cached and
+        cache-write tokens, `output_tokens` includes thinking tokens.
+      properties:
+        object: { type: string, enum: [usage_fact] }
+        fact_id: { type: string, description: "Deterministic id of (granularity, bucket, grouped dimension values)" }
+        revision: { type: string, description: "Content hash; changes when any number in the fact changes" }
+        computed_at: { type: string, format: date-time }
+        bucket_start: { type: string, format: date-time }
+        bucket_end: { type: string, format: date-time }
+        granularity: { type: string, enum: [hour, day] }
+        email: { type: ["string", "null"] }
+        uid: { type: ["string", "null"] }
+        principal_type: { type: ["string", "null"], enum: [user, service_account, workforce, null] }
+        surface: { type: string, enum: [antigravity, gemini_platform, gemini_enterprise] }
+        surfaces: { type: array, items: { type: string }, description: "When surface is not grouped" }
+        project: { type: ["string", "null"] }
+        model: { type: ["string", "null"] }
+        models: { type: array, items: { type: string }, description: "When model is not grouped" }
+        location: { type: ["string", "null"], description: "resource.labels.location (e.g. asia-northeast3, global, us)" }
+        client: { type: ["string", "null"], description: "Antigravity client (labels.client_name)" }
+        client_versions: { type: array, items: { type: string } }
+        app: { type: ["string", "null"], description: "Gemini Platform request label `app` or Gemini Enterprise app (engine) id" }
+        agent: { type: ["string", "null"], description: "Gemini Enterprise agent id" }
+        agent_names: { type: array, items: { type: string } }
+        traffic: { type: ["string", "null"], description: "on_demand | flex | priority | provisioned | batch (Gemini Platform)" }
+        reasoning_level: { type: ["string", "null"], description: "Antigravity experience level (minimal | low | medium | high | max)" }
+        requests: { type: integer }
+        input_tokens: { type: integer }
+        uncached_input_tokens: { type: integer }
+        cached_tokens: { type: integer }
+        cache_write_tokens: { type: integer }
+        cache_write_5m_tokens: { type: integer }
+        cache_write_1h_tokens: { type: integer }
+        output_tokens: { type: integer }
+        thoughts_tokens: { type: integer }
+        total_tokens: { type: integer }
+        long_context_requests: { type: integer }
+        long_context_input_tokens: { type: integer }
+        long_context_output_tokens: { type: integer }
+        long_context_cached_tokens: { type: integer }
+        by_modality:
+          type: object
+          description: "Gemini Platform usageMetadata *TokensDetails: text | image | audio | video | document"
+          additionalProperties:
+            type: object
+            properties:
+              input_tokens: { type: integer }
+              output_tokens: { type: integer }
+        by_traffic: { type: object, additionalProperties: { $ref: "#/components/schemas/TrafficUsage" } }
+        latency_ms_avg: { type: ["integer", "null"], description: "Gemini Platform requestDuration average" }
+        sessions: { type: ["integer", "null"], description: "Distinct Antigravity trajectories (conversations)" }
+        attribution: { type: object, additionalProperties: { type: integer } }
+        list_cost: { type: ["number", "null"] }
+        cost_partial: { type: boolean }
+        currency: { type: ["string", "null"] }
+        cost_basis: { type: string, description: "official_sku | override | default_rate | license | not_token_priced | unpriced | no_tokens | mixed" }
+        billing: { type: array, items: { $ref: "#/components/schemas/CostLine" } }
+
+    UsageExport:
+      type: object
+      properties:
+        object: { type: string, enum: [usage_export] }
+        id: { type: string, example: "usage-facts-hourly-2026-11-27" }
+        period_start: { type: string, format: date-time }
+        period_end: { type: string, format: date-time }
+        granularity: { type: string, enum: [hour] }
+        group_by: { type: array, items: { type: string } }
+        format: { type: string, enum: [jsonl] }
+        status: { type: string, enum: [complete, partial] }
+        download_path: { type: string }
+
+    TrafficUsage:
+      type: object
+      properties:
+        requests: { type: integer }
+        input_tokens: { type: integer }
+        output_tokens: { type: integer }
+        cached_tokens: { type: integer }
+        cache_write_tokens: { type: integer }
+        total_tokens: { type: integer }
 
     UserBillingRow:
       type: object

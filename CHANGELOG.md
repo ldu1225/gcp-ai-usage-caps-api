@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.4.0] - 2026-11-28
+*원장형 사용량 수집 · 시간 단위 · 다차원 · SKU 라인 · 일별 JSONL 내보내기*
+*Ledger-style usage collection: hourly buckets, any dimensions, SKU cost lines, daily JSONL exports*
+
+### 추가 (Added)
+- **`GET /v1/usage/facts`**: UTC 시간/일 버킷 x 차원 조합(`user, surface, project, model, location, client, app, agent, traffic, reasoning_level`). 행마다 결정적 `fact_id`와 내용 해시 `revision`을 제공해 수집기가 upsert만으로 재집계분을 반영할 수 있습니다. `limit` 최대 1000.
+  *Hour/day facts by any dimensions with deterministic `fact_id` and content `revision` for upsert-based collectors.*
+- **SKU 비용 라인** `billing[]`: `{sku_id, sku, tier, component, quantity{value, unit:"tokens"}, unit_price_per_1m, cost}`. `model_cost`와 같은 계산이라 라인 합계 = `list_cost`.
+- **새 카운터·차원(실제 로그 필드 기반)**: Gemini Platform 모달리티별 토큰(`promptTokensDetails`/`candidatesTokensDetails`), 리전(`resource.labels.location`), 요청 라벨 `app`, 평균 지연(`requestDuration`), 파트너 모델 캐시 쓰기 TTL(`cache_write_5m_tokens`/`cache_write_1h_tokens`); Antigravity 클라이언트·버전, 추론 수준(`experience`), 세션 수(`trajectory_id`); Gemini Enterprise 에이전트·앱·모델(`agentInfo.agent`, engine, `modelInfo.model`); `uncached_input_tokens`, `long_context_*`, `principal_type`.
+- **`GET /v1/usage/exports`**, **`GET /v1/usage/exports/{export_id}/download`**: UTC 일자별 JSONL 파일(한 줄 = 시간 단위 fact, 모든 차원). `X-Usage-Export-Revision`, `X-Usage-Export-Status` 헤더.
+- **신선도 메타**: 모든 사용량 응답 `telemetry`와 `/v1/usage/users`, `/v1/usage/users/{email}` 최상위에 `data_refreshed_at`, `data_complete_through`.
+- **`/v1/usage/users?include=groups`**: 행에 허브 그룹 `{id, name}`. 행에 `principal_type` 추가.
+- **`/openapi.json`, `/v1/openapi.json`, `/openapi.yaml`** 별칭.
+
+### 변경 (Changed)
+- `/v1/usage/users`의 `limit` 최대값 500 → 1000.
+- Gemini Platform BigQuery 집계에 리전·앱 라벨 그룹 키와 추가 카운터를 포함(기존 응답 값은 동일).
+
+### 테스트 (Tests)
+- `tests/unit/test_usage_facts.py` 추가(시간 합 = 일 합, `/v1/usage/users`와 합계 일치, `fact_id` 안정성, 차원 추출, SKU 라인 합계, 내보내기, 페이지네이션·검증). 오프라인 테스트 172개 통과. `duleetest`·`dulee-ai-test` 실데이터 14일: 요청 1,849 · 토큰 5,162,196 · 비용 $25.3145로 `/v1/usage/users`와 일치.
+
 ## [1.3.1] - 2026-11-27
 *고객사 포털 연동 마찰 제거 · 즉시 반영되는 차단 상태 · 정규화된 단가 · 응답 속도 개선*
 *Seamless customer-portal integration: immediate block visibility, canonical pricing, structured billing sync, faster reads*

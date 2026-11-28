@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -10,10 +11,11 @@ import sys
 from . import __version__, auth, config, identity, timeutil
 from .cache import TTLCache
 from .gcp import Gcp
-from .httpkit import ApiError, BaseHandler, Router, Server, now_iso, parse_json_object, parse_query
+from .httpkit import (ApiError, BaseHandler, RawResponse, Router, Server, now_iso, parse_json_object,
+                      parse_query)
 from .schema import SchemaRegistry
 from .services import (audit, base as svc_base, caps, chargeback, groups, model_access, model_registry, operations,
-                       pricing_sync, quotas, readiness, spend_caps, surface_models, usage, usage_events,
+                       pricing_sync, quotas, readiness, spend_caps, surface_models, usage, usage_events, usage_facts,
                        user_model_rules, vertex_logging, webhooks)
 from .store import StoreConflict, StoreError, make_doc_store
 
@@ -118,6 +120,10 @@ ROUTER.route("GET", "/v1/health", public=True, optional_auth=True, rate="general
 ROUTER.route("GET", "/v1/usage/users", scope="usage:read", range=True, rate="general")(usage.list_user_usage)
 ROUTER.route("GET", "/v1/usage/users/{email}", scope="usage:read", range=True, rate="general")(usage.get_user_usage)
 ROUTER.route("GET", "/v1/billing/users", scope="usage:read", rate="general")(chargeback.billing_users_report)
+ROUTER.route("GET", "/v1/usage/facts", scope="usage:read", rate="general")(usage_facts.list_facts)
+ROUTER.route("GET", "/v1/usage/exports", scope="usage:read", rate="general")(usage_facts.list_exports)
+ROUTER.route("GET", "/v1/usage/exports/{export_id}/download", scope="usage:read",
+             rate="general")(usage_facts.download_export)
 
 ROUTER.route("GET", "/v1/caps/policy", scope="caps:read", rate="general")(caps.get_policy)
 ROUTER.route("PUT", "/v1/caps/policy", scope="caps:write", rate="write")(caps.update_policy)
@@ -286,16 +292,26 @@ class App:
                 self._openapi_text = fh.read()
         return self._openapi_text
 
+    def openapi_json(self) -> str:
+        if getattr(self, "_openapi_json", None) is None:
+            import yaml  # PyYAML is a runtime dependency (config loading)
+            self._openapi_json = json.dumps(yaml.safe_load(self.openapi_yaml()), ensure_ascii=False, indent=2,
+                                            default=str)
+        return self._openapi_json
+
     def make_handler(self):
         app = self
 
         class Handler(BaseHandler):
             def handle_api(self, method: str, path: str, query: str):
-                if path == "/v1/openapi.yaml":
+                if path in ("/v1/openapi.yaml", "/openapi.yaml", "/v1/openapi.json", "/openapi.json"):
                     if method != "GET":
                         raise ApiError("method_not_allowed", "Method not allowed.", status=405,
                                        headers=[("Allow", "GET")])
-                    self.send_text(200, app.openapi_yaml(), content_type="application/yaml; charset=utf-8")
+                    if path.endswith(".json"):
+                        self.send_text(200, app.openapi_json(), content_type="application/json; charset=utf-8")
+                    else:
+                        self.send_text(200, app.openapi_yaml(), content_type="application/yaml; charset=utf-8")
                     return
 
                 fn, opts, path_params = ROUTER.resolve(method, path)
@@ -340,6 +356,10 @@ class App:
                     raise ApiError("conflict", "Concurrent state update conflict; retry the request.", status=409)
                 except StoreError:
                     raise ApiError("unavailable", "State storage is temporarily unavailable; retry shortly.", status=503)
+                if isinstance(result, RawResponse):
+                    self.send_text(200, result.text, content_type=result.content_type, cache_control="no-store",
+                                   extra_headers=result.headers)
+                    return
                 if isinstance(result, dict) and ctx.warnings:
                     result = dict(result, warnings=ctx.warnings)
                 created = path in ("/v1/admin/api-keys", "/v1/admin/webhooks", "/v1/groups") or (

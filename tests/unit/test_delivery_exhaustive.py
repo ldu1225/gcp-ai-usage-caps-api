@@ -1,7 +1,7 @@
 """Exhaustive customer-delivery verification suite.
 
 Covers:
-  1. Complete 96/96 OpenAPI <-> Router parity and full unauthenticated / wrong-scope / exact-scope RBAC matrix
+  1. Complete 99/99 OpenAPI <-> Router parity and full unauthenticated / wrong-scope / exact-scope RBAC matrix
   2. Strict HTTP / JSON / pagination / query parameter fuzzing (zero 500s)
   3. SSRF URL validation (IPv4/IPv6/IPv4-mapped/CGNAT/trailing-dot/userinfo/port) and HTTP 302 redirect blocking
   4. Catastrophe prevention: empty bulk target lists (`scopes: []`, `apps: []`, `projects: []`) never expand to `*`
@@ -97,7 +97,7 @@ class DeliveryRbacAndParityTests(unittest.TestCase):
                     openapi_ops.add((m.upper(), path))
         router_ops = set(ROUTER.routes()) | {("GET", "/v1/openapi.yaml")}
         self.assertEqual(router_ops, openapi_ops, "Router and openapi.yaml operation drift detected!")
-        self.assertEqual(len(router_ops), 96)
+        self.assertEqual(len(router_ops), 99)
 
         # Create one scoped key per non-admin scope
         scope_keys = {}
@@ -120,7 +120,7 @@ class DeliveryRbacAndParityTests(unittest.TestCase):
             # Iterate every single route in ROUTER
             all_routes = list(ROUTER._exact.items()) + [((rt.method, rt.pattern), (rt.fn, rt.opts))
                                                         for rt in ROUTER._dynamic]
-            self.assertEqual(len(all_routes), 95)
+            self.assertEqual(len(all_routes), 98)
             for (method, pattern), (_fn, opts) in all_routes:
                 path = _sample_path(pattern)
                 if opts.get("public"):

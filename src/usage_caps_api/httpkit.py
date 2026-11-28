@@ -220,6 +220,15 @@ def parse_limit(raw, default: int = 100, maximum: int = 500) -> int:
     return val
 
 
+class RawResponse:
+    """Non-JSON handler result (e.g. JSONL downloads): body text, content type and extra response headers."""
+
+    def __init__(self, text: str, content_type: str, headers=()):
+        self.text = text
+        self.content_type = content_type
+        self.headers = list(headers)
+
+
 def paginate_list(items: list, params: dict, *, default_limit: int = 100, max_limit: int = 500) -> dict:
     limit = parse_limit(params.get("limit"), default=default_limit, maximum=max_limit)
     offset = decode_cursor(params.get("cursor"))

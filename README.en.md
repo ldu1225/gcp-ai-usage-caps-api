@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="openapi.yaml"><img alt="OpenAPI 3.1" src="https://img.shields.io/badge/OpenAPI-3.1-0B1F3A"></a>
-  <img alt="API 1.3.1" src="https://img.shields.io/badge/API-1.3.1-1A73E8">
+  <img alt="API 1.4.0" src="https://img.shields.io/badge/API-1.4.0-1A73E8">
   <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-0B1F3A">
   <img alt="Cloud Run" src="https://img.shields.io/badge/runtime-Cloud%20Run-1A73E8">
   <img alt="Terraform" src="https://img.shields.io/badge/IaC-Terraform-0B1F3A">
@@ -242,6 +242,36 @@ See [docs/multi-project-deployment.md](docs/multi-project-deployment.md).
 
 See [docs/cost-methodology.md](docs/cost-methodology.md) for formulas, currency conversion and worked examples.
 
+### 6.1 Ledger-style collection: `/v1/usage/facts` · `/v1/usage/exports` (v1.4.0)
+
+For collectors (Airflow etc.) that load per-user cost and usage on a schedule. Sources, attribution and pricing are the
+same as `/v1/usage/users`, and totals for the same window match exactly.
+
+| Item | Details |
+|---|---|
+| Buckets | `granularity=hour` (up to 31 days) or `day` (up to 400 days), UTC. `start_time`/`end_time` (RFC 3339) or `start`/`end` (dates) |
+| Dimensions (`group_by`, any combination) | `user`, `surface`, `project`, `model`, `location`, `client`, `app`, `agent`, `traffic`, `reasoning_level` (default `user,surface,project,model`) |
+| Idempotency key | `fact_id` = deterministic hash of (granularity, bucket, dimension values). Upsert by `fact_id`; restated buckets overwrite older values, and `revision` changes when numbers change |
+| Tokens | `requests`, `input_tokens`, `uncached_input_tokens`, `cached_tokens`, `cache_write_tokens` (+`_5m`/`_1h`), `output_tokens`, `thoughts_tokens`, `total_tokens`, `long_context_*`, `by_modality{text,image,audio,video,document}`, `by_traffic` |
+| Cost | `list_cost` (list or contract price x tokens), `currency`, `cost_basis`, `billing[]` = SKU lines `{sku_id, tier, component, quantity{value, unit:"tokens"}, unit_price_per_1m, cost}` (omit with `include=none`) |
+| Other | `principal_type`, `attribution`, `sessions` (Antigravity conversations), `latency_ms_avg` (Gemini Platform), `client_versions`, `agent_names` |
+| Freshness | `data_refreshed_at` (when logs were read) and `data_complete_through` (settled time after ~15 min log delivery delay); also added to `telemetry` of existing usage responses |
+
+File feed: `GET /v1/usage/exports?after=2026-11-21&before=2026-11-28` lists one file per UTC day and
+`GET /v1/usage/exports/usage-facts-hourly-2026-11-27/download` returns JSONL (one hourly fact per line, every
+dimension). Today's file is `status=partial`; download again later and upsert by `fact_id`.
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" \
+  "$API/v1/usage/facts?granularity=hour&start_time=2026-11-27T00:00:00Z&end_time=2026-11-28T00:00:00Z&group_by=user,model,location&limit=1000"
+```
+
+Dimension sources: `location` = `resource.labels.location`, `client` = Antigravity `labels.client_name`, `app` =
+Gemini Platform request label `labels.app` or the Gemini Enterprise app (engine) id, `agent` = Gemini Enterprise
+`agentInfo.agent`, `reasoning_level` = Antigravity `experience` suffix, modality = Gemini Platform
+`usageMetadata.*TokensDetails`. Values that are not in the logs (web search counts, Gemini Enterprise tokens, display
+names) are not provided.
+
 ## 7. Gemini Platform per-user attribution
 
 Gemini Platform token counts are recorded only in the **inference request metadata log** (`aiplatform.googleapis.com/inference_request`). It must be enabled per project, and the caller is usually the portal's service account, so usage is attributed to people in this order:
@@ -460,7 +490,7 @@ Error format: `{"error": {"type": "invalid_request_error", "code": "lockout_prev
 
 ## 14. Full endpoint reference
 
-Full specification: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API version 1.3.1, also served at `GET /v1/openapi.yaml`)
+Full specification: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API version 1.4.0, also served at `GET /v1/openapi.yaml`)
 
 | Area | Method | Path | Scope |
 |---|---|---|---|
@@ -470,6 +500,9 @@ Full specification: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1, API version 1.3
 | Usage | GET | `/v1/usage/users/{email}` | `usage:read` |
 | Usage | GET | `/v1/users/{email}/projects` | `usage:read` |
 | Usage | GET | `/v1/billing/users` | `usage:read` |
+| Usage | GET | `/v1/usage/facts` | `usage:read` |
+| Usage | GET | `/v1/usage/exports` | `usage:read` |
+| Usage | GET | `/v1/usage/exports/{export_id}/download` | `usage:read` |
 | Usage | GET | `/v1/usage/models` | `usage:read` or `models:read` |
 | Usage | GET | `/v1/pricing` | `usage:read` or `models:read` |
 | Cap policy | GET, PUT | `/v1/caps/policy` | `caps:read` / `caps:write` |

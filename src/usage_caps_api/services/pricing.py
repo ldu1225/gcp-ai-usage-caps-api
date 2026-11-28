@@ -277,6 +277,75 @@ def model_cost(model: str | None, agg: dict, pricing: Pricing) -> tuple[float, b
     return total, base["priced"], tokens
 
 
+COST_COMPONENTS = (("input", "input"), ("cached_input", "cached"), ("cache_write", "cache_write"), ("output", "output"))
+
+
+def _sku_ref(pricing: Pricing, model: str | None, tier: str | None, direction: str) -> tuple[str | None, str | None]:
+    """(sku_id, sku_name) of the official Catalog SKU behind one price, or (None, None) for overrides / fallbacks."""
+    if pricing._override(model) is not None:  # pylint: disable=protected-access
+        return None, None
+    hit = pricing.entry(model) or {}
+    skus = hit.get("skus") or {}
+    name = skus.get("%s.%s" % (tier, direction)) if tier else skus.get(direction)
+    if not name:
+        return None, None
+    return str(name).rsplit("/", 1)[-1], str(name)
+
+
+def cost_lines(model: str | None, agg: dict, pricing: Pricing | None) -> list[dict]:
+    """Per-SKU cost lines for one model aggregate. Uses exactly the arithmetic of `model_cost`, so
+    `sum(line.cost) == model_cost(...)[0]` (list / override price x log token counts; no billing data)."""
+    if pricing is None or not pricing.configured or (model and mc.is_non_token_model(model)):
+        return []
+    tokens = to_int(agg.get("total_tokens") if "total_tokens" in agg else agg.get("tokens"))
+    base = pricing.rates(model)
+    agg = dict(agg)
+    agg["output_tokens"] = max(to_int(agg.get("output_tokens")), tokens - to_int(agg.get("input_tokens")), 0)
+    bucket_keys = ("input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens")
+    traffic = agg.get("by_traffic") or {}
+    if traffic:
+        buckets = {t: {k: max(0, to_int(v.get(k))) for k in bucket_keys} for t, v in traffic.items()}
+        rem = {k: max(0, to_int(agg.get(k)) - sum(b[k] for b in buckets.values())) for k in bucket_keys}
+        if any(rem.values()):
+            od = buckets.setdefault("on_demand", {k: 0 for k in bucket_keys})
+            for k, v in rem.items():
+                od[k] += v
+    else:
+        buckets = {"on_demand": {k: max(0, to_int(agg.get(k))) for k in bucket_keys}}
+    plan: list[tuple[str, str | None, dict, dict]] = []
+    long_c = {k: to_int(agg.get("long_" + k)) for k in ("input_tokens", "output_tokens", "cached_tokens")}
+    if any(long_c.values()):
+        std = buckets.get("on_demand") or next(iter(buckets.values()))
+        for k, v in long_c.items():
+            take = min(v, to_int(std.get(k)))
+            std[k] = to_int(std.get(k)) - take
+            long_c[k] = take
+        plan.append(("long_context", "long_context", long_c, pricing.rates(model, "long_context")))
+    for t, c in buckets.items():
+        if t == "provisioned" and pricing.provisioned == "zero":
+            continue
+        tier = TRAFFIC_TO_TIER.get(t)
+        plan.append((t, tier, c, pricing.rates(model, tier) if tier else base))
+    lines = []
+    for tier_name, tier_key, c, r in plan:
+        inp = max(0, to_int(c.get("input_tokens")))
+        cached = min(max(0, to_int(c.get("cached_tokens"))), inp)
+        cw = min(max(0, to_int(c.get("cache_write_tokens"))), inp - cached)
+        qty = {"input": inp - cached - cw, "cached_input": cached, "cache_write": cw,
+               "output": max(0, to_int(c.get("output_tokens")))}
+        for component, rate_key in COST_COMPONENTS:
+            n = qty[component]
+            if n <= 0:
+                continue
+            unit = float(r.get(rate_key) or 0.0)
+            used_tier = tier_key if (tier_key and r.get("tier_used") == tier_key) else None
+            sku_id, sku_name = _sku_ref(pricing, model, used_tier, rate_key)
+            lines.append({"tier": tier_name, "component": component, "sku_id": sku_id, "sku": sku_name,
+                          "quantity": {"value": n, "unit": "tokens"}, "unit_price_per_1m": round(unit, 6),
+                          "cost": round(n * unit / 1e6, 9), "currency": pricing.currency})
+    return lines
+
+
 def estimate_cost(rec: dict, pricing: Pricing | None) -> tuple[float | None, bool]:
     """Returns (estimated_cost, partial) for a usage record with per-model token counts.
 
