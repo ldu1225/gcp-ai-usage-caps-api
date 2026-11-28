@@ -109,6 +109,14 @@ curl -s -X DELETE "$BASE/v1/model-access/projects/team-a-prod" -H "Authorization
 
 **패턴 재확장(Reconcile)**: Org Policy는 와일드카드를 지원하지 않으므로 고객 의도(예: `google/*`, `<family>-*`)를 저장해 두고, 새 모델이 실시간 카탈로그(Model Garden 또는 로그 관측)에 나타나면 **매시간 자동 재확장**합니다(`POST /v1/model-access/reconcile`, 응답의 `drift`). Model Garden에서 제외(`delisted_at`)된 모델과 publisher를 모르는 모델은 패턴 확장에서 빠집니다.
 
+> **집행 범위와 전파 시간 (2026-11 실환경 관측)**
+> 이 API는 Org Policy를 즉시 기록하지만, 실제 거부는 Google 쪽에서 엔드포인트별로 반영됩니다.
+> - 리전 엔드포인트(`us-central1-aiplatform.googleapis.com`): 적용 약 6분 뒤 `400 FAILED_PRECONDITION`(`constraints/vertexai.allowedModels violated`)으로 거부됨.
+> - **global 엔드포인트(`aiplatform.googleapis.com`, `locations/global`): 15분 동안 거부되지 않음.** 다른 리전(`asia-northeast3`)도 20분 동안 반영되지 않은 사례가 있음.
+> - 정책 삭제(허용) 후에도 이미 거부가 반영된 리전에서는 45분 이상 거부가 이어진 사례가 있음.
+>
+> 따라서 특정 사용자나 프로젝트를 **즉시** 막아야 할 때는 IAM Deny 기반 차단(`POST /v1/users/{email}/block`, 지출 캡, 모델 규칙 위반 차단)을 함께 쓰세요. IAM Deny는 global·리전 엔드포인트 모두에서 1~2분 안에 `403 PERMISSION_DENIED`로 거부되는 것을 확인했습니다. 모델 접근 Org Policy는 프로젝트 전체의 장기 허용 목록을 관리하는 용도로 쓰는 것을 권장합니다.
+
 ## 3. 서비스별 모델 제어
 
 ```bash

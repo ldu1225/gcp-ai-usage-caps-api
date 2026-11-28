@@ -19,6 +19,9 @@
 ### 테스트 (Tests)
 - `tests/unit/test_seamless_customer_api.py` 추가. 오프라인 테스트 163개 통과.
 
+### 문서 (Docs)
+- `docs/model-governance.md`: 모델 접근 Org Policy의 실환경 집행 범위와 전파 시간 안내 추가(global 엔드포인트 미반영, 리전별 반영 지연, 즉시 차단에는 IAM Deny 병행 권장).
+
 ## [1.3.0] - 2026-11-26
 *그룹을 일급 정책 주체로 · Gemini Platform 명칭 변경 · 문서와 다이어그램 재설계*
 *Groups as first-class policy subjects · Gemini Platform naming · redesigned docs and diagrams*
