@@ -14,12 +14,17 @@
 - **`/v1/usage/users?include=groups`**: 행에 허브 그룹 `{id, name}`. 행에 `principal_type` 추가.
 - **`/openapi.json`, `/v1/openapi.json`, `/openapi.yaml`** 별칭.
 
+- **모달리티별 SKU 단가**: 오디오·이미지·영상 입력과 오디오·이미지 출력 토큰을 공식 Catalog의 해당 SKU(`Audio Input`, `Image Output` 등)로 계산합니다. Gemini-TTS는 Cloud Text-to-Speech SKU(텍스트 입력 / 오디오 출력)를 씁니다. 실호출 6건(이미지·오디오·문서·영상 입력, 이미지·오디오 출력)으로 로그의 모달리티 토큰이 응답 `usageMetadata`와 정확히 같음을 확인했습니다.
+  *Audio / image / video tokens are priced at their own official SKUs; Gemini-TTS uses Cloud Text-to-Speech SKUs. Verified with 6 live calls.*
+
 ### 변경 (Changed)
+- **단가 정확도**: Catalog에서 GA SKU를 이전 프리뷰 SKU보다 우선하고, `(Long)` 표기를 장문 컨텍스트 티어로 인식합니다. 예: Gemini 2.5 Flash 입력 $0.225 → $0.30, Gemini 2.5 Pro 입력/출력 $1.875/$12.5 → $1.25/$10 (장문 $2.50/$15 별도). 기존 추정치가 공식 정가와 달랐던 모델은 비용이 바뀝니다.
+- 단가 SKU가 없는 구성요소는 `billing[]`에 $0 라인으로 넣지 않고 `cost_partial=true`로 표시합니다.
 - `/v1/usage/users`의 `limit` 최대값 500 → 1000.
 - Gemini Platform BigQuery 집계에 리전·앱 라벨 그룹 키와 추가 카운터를 포함(기존 응답 값은 동일).
 
 ### 테스트 (Tests)
-- `tests/unit/test_usage_facts.py` 추가(시간 합 = 일 합, `/v1/usage/users`와 합계 일치, `fact_id` 안정성, 차원 추출, SKU 라인 합계, 내보내기, 페이지네이션·검증). 오프라인 테스트 172개 통과. `duleetest`·`dulee-ai-test` 실데이터 14일: 요청 1,849 · 토큰 5,162,196 · 비용 $25.3145로 `/v1/usage/users`와 일치.
+- `tests/unit/test_usage_facts.py` 추가(시간 합 = 일 합, `/v1/usage/users`와 합계 일치, `fact_id` 안정성, 차원 추출, SKU 라인 합계, 내보내기, 페이지네이션·검증). 오프라인 테스트 177개 통과. `duleetest`·`dulee-ai-test` 실데이터 14일: 요청 1,849 · 토큰 5,162,196 · 비용 $25.3145로 `/v1/usage/users`와 일치.
 
 ## [1.3.1] - 2026-11-27
 *고객사 포털 연동 마찰 제거 · 즉시 반영되는 차단 상태 · 정규화된 단가 · 응답 속도 개선*

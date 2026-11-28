@@ -29,7 +29,12 @@ LOG = logging.getLogger("usage_caps_api.pricing")
 CATALOG_V1 = "https://cloudbilling.googleapis.com/v1"
 CACHE_SECONDS = 6 * 3600
 MAX_USD_PER_SINGLE_TOKEN = 0.0005  # $500 / 1M tokens sanity bound
-DIRECTIONS = ("input", "output", "cached", "cache_write")
+TEXT_DIRECTIONS = ("input", "output", "cached", "cache_write")
+# Modality SKUs (official Catalog "Audio Input", "Image Output", ...). Priced only from the per-modality token counts
+# in Gemini Platform usageMetadata (`*TokensDetails`); everything else stays at the text SKU.
+MODALITY_DIRECTIONS = ("audio_input", "image_input", "video_input", "audio_output", "image_output")
+DIRECTIONS = TEXT_DIRECTIONS + MODALITY_DIRECTIONS
+MODALITY_WORDS = {"audio": "audio", "image": "image", "images": "image", "video": "video"}
 TIER_VARIANTS = ("flex", "priority", "batch")
 
 # SKU words that mean "not a plain text-token SKU" (media, tuning, grounding, storage ...).
@@ -76,11 +81,37 @@ def classify_sku(description, service=None, unit=None, pricing_unit=None):
         return None
     low = description.lower()
     words = set(WORD_RE.findall(low))
-    if words & NON_TEXT_WORDS:
+    if words & (NON_TEXT_WORDS - set(MODALITY_WORDS)):
         return None
     info = mc.parse_sku(description, service)
     if not info or mc.is_non_token_model(info["key"]):
         return None
+    if "text-to-speech" in str(service or "").lower() or low.startswith("cloud tts api"):
+        # Gemini-TTS on Gemini Platform is billed under Cloud Text-to-Speech: "Cloud TTS API text input token count
+        # for Gemini 2.5 Flash TTS" / "... audio output token count for Gemini 2.5 Flash" -> model key *-tts.
+        if "token" not in words or not ({"input", "output"} & words):
+            return None
+        key = info["key"] if info["key"].endswith("-tts") else info["key"] + "-tts"
+        direction = "audio_output" if ("audio" in words and "output" in words) else (
+            "input" if ("text" in words and "input" in words) else None)
+        if direction is None:
+            return None
+        return key, direction, info["product"], None, None
+    name = str(info.get("name") or "").lower()
+    at = low.find(name) if name else -1
+    rest_words = set(WORD_RE.findall(low[at + len(name):] if at >= 0 else low))
+    name_words = set(WORD_RE.findall(name))
+    modality = None if "text" in rest_words else next(
+        (MODALITY_WORDS[w] for w in ("audio", "image", "images", "video") if w in rest_words), None)
+    if modality is None and (words & set(MODALITY_WORDS)) - name_words and "text" not in rest_words:
+        return None
+    if modality is None and name_words & set(MODALITY_WORDS) and "text" not in rest_words:
+        # Model named "... Image": "Output" = generated images; bare "Input" is ambiguous, so skip it.
+        if "output" not in rest_words:
+            return None
+        modality = next(MODALITY_WORDS[w] for w in ("audio", "image", "images", "video") if w in name_words)
+    if modality and "cach" in low:
+        return None   # per-modality cache SKUs are not matched (cache reads stay at the text cached SKU)
     if "cach" in low:
         tokenish = "token" in low or "token" in (pricing_unit or "").lower() or (unit or "").lower() == "count"
         if not tokenish:
@@ -94,8 +125,13 @@ def classify_sku(description, service=None, unit=None, pricing_unit=None):
             direction = "output"
         else:
             return None
+    if modality:
+        direction = "%s_%s" % (modality, direction)
+        if direction not in MODALITY_DIRECTIONS:
+            return None
     variant = next((v for v in TIER_VARIANTS if v in words), None)
-    is_long = bool(LONG_CONTEXT_RE.search(low))
+    # "(Long)" = the >200K-token prompt tier in current Catalog descriptions.
+    is_long = bool(LONG_CONTEXT_RE.search(low)) or "long" in rest_words
     tier = ("%s_long_context" % variant if variant else "long_context") if is_long else variant
     return info["key"], direction, info["product"], tier, (parse_threshold(description) if is_long else None)
 
@@ -192,7 +228,11 @@ class Pricing:
             hit = self.table.lookup(model)
             if hit:
                 pin, pout = float(hit.get("input") or 0), float(hit.get("output") or 0)
-                return pin, pout, bool(pin and pout)
+                # Speech / image generation models may only list modality output SKUs (e.g. "Audio Output").
+                out_ok = bool(pout) or any(hit.get(d) for d in ("audio_output", "image_output"))
+                if not pout and hit.get("audio_output") and not hit.get("image_output"):
+                    pout = float(hit["audio_output"])   # speech models: every output token is audio
+                return pin, pout, bool(pin and out_ok)
             return 0.0, 0.0, False
         has_def = self.input_per_million > 0 or self.output_per_million > 0
         return self.input_per_million, self.output_per_million, has_def
@@ -207,6 +247,18 @@ class Pricing:
             if hit.get("cached") is not None:
                 return float(hit["cached"]), True
         return input_price, False
+
+    def modality_rate(self, model: str | None, direction: str, tier: str | None = None) -> float | None:
+        """Official per-1M price of a modality SKU (e.g. `audio_input`), or None (-> text price applies).
+        Contract overrides are modality-agnostic, so they always return None."""
+        if direction not in MODALITY_DIRECTIONS or self._override(model) is not None:
+            return None
+        hit = self.entry(model) or {}
+        if tier:
+            t = (hit.get("tiers") or {}).get(tier) or {}
+            if t.get(direction) is not None:
+                return float(t[direction])
+        return float(hit[direction]) if hit.get(direction) is not None else None
 
     def rates(self, model: str | None, tier: str | None = None) -> dict:
         """{input, output, cached, cache_write, priced, tier_used} for one model and optional SKU tier."""
@@ -226,16 +278,26 @@ class Pricing:
         return out
 
 
-def _bucket_cost(c: dict, r: dict) -> float:
-    inp = max(0, to_int(c.get("input_tokens")))
-    cached = min(max(0, to_int(c.get("cached_tokens"))), inp)
-    cw = min(max(0, to_int(c.get("cache_write_tokens"))), inp - cached)
-    out = max(0, to_int(c.get("output_tokens")))
-    return ((inp - cached - cw) * r["input"] + cached * r["cached"] + cw * r["cache_write"] + out * r["output"]) / 1e6
+COST_COMPONENTS = (("input", "input"), ("cached_input", "cached"), ("cache_write", "cache_write"), ("output", "output"))
 
 
-def model_cost(model: str | None, agg: dict, pricing: Pricing) -> tuple[float, bool, int]:
-    """(cost, priced, tokens) for one model aggregate, honouring traffic-type tiers and long-context tiers."""
+def _sku_ref(pricing: Pricing, model: str | None, tier: str | None, direction: str) -> tuple[str | None, str | None]:
+    """(sku_id, sku_name) of the official Catalog SKU behind one price, or (None, None) for overrides / fallbacks."""
+    if pricing._override(model) is not None:  # pylint: disable=protected-access
+        return None, None
+    hit = pricing.entry(model) or {}
+    skus = hit.get("skus") or {}
+    name = skus.get("%s.%s" % (tier, direction)) if tier else skus.get(direction)
+    if not name:
+        return None, None
+    return str(name).rsplit("/", 1)[-1], str(name)
+
+
+def _cost_plan(model: str | None, agg: dict, pricing: Pricing) -> tuple[list[dict], bool, int]:
+    """Every priced token of one model aggregate as SKU lines: (lines with unrounded cost, priced, tokens).
+
+    Order: long-context tier -> per-modality SKUs (audio / image / video tokens from usageMetadata, taken out of the
+    standard bucket) -> Flex / Priority / Batch / Provisioned / on-demand text SKUs."""
     tokens = to_int(agg.get("total_tokens") if "total_tokens" in agg else agg.get("tokens"))
     if "input_tokens" not in agg and ("promptTokens" in agg or "candidateTokens" in agg):
         agg = {"input_tokens": agg.get("promptTokens"), "output_tokens": agg.get("candidateTokens"),
@@ -258,92 +320,75 @@ def model_cost(model: str | None, agg: dict, pricing: Pricing) -> tuple[float, b
                 od[k] += v
     else:
         buckets = {"on_demand": {k: max(0, to_int(agg.get(k))) for k in bucket_keys}}
-    total = 0.0
-    long_c = {k: to_int(agg.get("long_" + k)) for k in ("input_tokens", "output_tokens", "cached_tokens")}
-    if any(long_c.values()):
-        std = buckets.get("on_demand") or next(iter(buckets.values()))
-        for k, v in long_c.items():
-            take = min(v, to_int(std.get(k)))
-            std[k] = to_int(std.get(k)) - take
-            long_c[k] = take
-        lr = pricing.rates(model, "long_context")
-        total += _bucket_cost(long_c, lr)
-    for t, c in buckets.items():
-        if t == "provisioned" and pricing.provisioned == "zero":
-            continue
-        tier = TRAFFIC_TO_TIER.get(t)
-        r = pricing.rates(model, tier) if tier else base
-        total += _bucket_cost(c, r)
-    return total, base["priced"], tokens
+    lines: list[dict] = []
 
+    def add(tier_name: str, tier_key: str | None, component: str, rate_key: str, n: int, unit: float, used: bool):
+        if n <= 0 or unit <= 0:
+            return   # no price for this component (reported as cost_partial, never guessed)
+        sku_id, sku_name = _sku_ref(pricing, model, tier_key if used else None, rate_key)
+        lines.append({"tier": tier_name, "component": component, "sku_id": sku_id, "sku": sku_name,
+                      "quantity": {"value": n, "unit": "tokens"}, "unit_price_per_1m": unit,
+                      "cost": n * unit / 1e6, "currency": pricing.currency})
 
-COST_COMPONENTS = (("input", "input"), ("cached_input", "cached"), ("cache_write", "cache_write"), ("output", "output"))
-
-
-def _sku_ref(pricing: Pricing, model: str | None, tier: str | None, direction: str) -> tuple[str | None, str | None]:
-    """(sku_id, sku_name) of the official Catalog SKU behind one price, or (None, None) for overrides / fallbacks."""
-    if pricing._override(model) is not None:  # pylint: disable=protected-access
-        return None, None
-    hit = pricing.entry(model) or {}
-    skus = hit.get("skus") or {}
-    name = skus.get("%s.%s" % (tier, direction)) if tier else skus.get(direction)
-    if not name:
-        return None, None
-    return str(name).rsplit("/", 1)[-1], str(name)
-
-
-def cost_lines(model: str | None, agg: dict, pricing: Pricing | None) -> list[dict]:
-    """Per-SKU cost lines for one model aggregate. Uses exactly the arithmetic of `model_cost`, so
-    `sum(line.cost) == model_cost(...)[0]` (list / override price x log token counts; no billing data)."""
-    if pricing is None or not pricing.configured or (model and mc.is_non_token_model(model)):
-        return []
-    tokens = to_int(agg.get("total_tokens") if "total_tokens" in agg else agg.get("tokens"))
-    base = pricing.rates(model)
-    agg = dict(agg)
-    agg["output_tokens"] = max(to_int(agg.get("output_tokens")), tokens - to_int(agg.get("input_tokens")), 0)
-    bucket_keys = ("input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens")
-    traffic = agg.get("by_traffic") or {}
-    if traffic:
-        buckets = {t: {k: max(0, to_int(v.get(k))) for k in bucket_keys} for t, v in traffic.items()}
-        rem = {k: max(0, to_int(agg.get(k)) - sum(b[k] for b in buckets.values())) for k in bucket_keys}
-        if any(rem.values()):
-            od = buckets.setdefault("on_demand", {k: 0 for k in bucket_keys})
-            for k, v in rem.items():
-                od[k] += v
-    else:
-        buckets = {"on_demand": {k: max(0, to_int(agg.get(k))) for k in bucket_keys}}
-    plan: list[tuple[str, str | None, dict, dict]] = []
-    long_c = {k: to_int(agg.get("long_" + k)) for k in ("input_tokens", "output_tokens", "cached_tokens")}
-    if any(long_c.values()):
-        std = buckets.get("on_demand") or next(iter(buckets.values()))
-        for k, v in long_c.items():
-            take = min(v, to_int(std.get(k)))
-            std[k] = to_int(std.get(k)) - take
-            long_c[k] = take
-        plan.append(("long_context", "long_context", long_c, pricing.rates(model, "long_context")))
-    for t, c in buckets.items():
-        if t == "provisioned" and pricing.provisioned == "zero":
-            continue
-        tier = TRAFFIC_TO_TIER.get(t)
-        plan.append((t, tier, c, pricing.rates(model, tier) if tier else base))
-    lines = []
-    for tier_name, tier_key, c, r in plan:
+    def add_bucket(tier_name: str, tier_key: str | None, c: dict, r: dict):
         inp = max(0, to_int(c.get("input_tokens")))
         cached = min(max(0, to_int(c.get("cached_tokens"))), inp)
         cw = min(max(0, to_int(c.get("cache_write_tokens"))), inp - cached)
         qty = {"input": inp - cached - cw, "cached_input": cached, "cache_write": cw,
                "output": max(0, to_int(c.get("output_tokens")))}
+        used = bool(tier_key and r.get("tier_used") == tier_key)
         for component, rate_key in COST_COMPONENTS:
-            n = qty[component]
-            if n <= 0:
-                continue
-            unit = float(r.get(rate_key) or 0.0)
-            used_tier = tier_key if (tier_key and r.get("tier_used") == tier_key) else None
-            sku_id, sku_name = _sku_ref(pricing, model, used_tier, rate_key)
-            lines.append({"tier": tier_name, "component": component, "sku_id": sku_id, "sku": sku_name,
-                          "quantity": {"value": n, "unit": "tokens"}, "unit_price_per_1m": round(unit, 6),
-                          "cost": round(n * unit / 1e6, 9), "currency": pricing.currency})
-    return lines
+            add(tier_name, tier_key, component, rate_key, qty[component], float(r.get(rate_key) or 0.0), used)
+
+    long_c = {k: to_int(agg.get("long_" + k)) for k in ("input_tokens", "output_tokens", "cached_tokens")}
+    std_name = "on_demand" if "on_demand" in buckets else next(iter(buckets))
+    std = buckets[std_name]
+    if any(long_c.values()):
+        for k, v in long_c.items():
+            take = min(v, to_int(std.get(k)))
+            std[k] = to_int(std.get(k)) - take
+            long_c[k] = take
+        add_bucket("long_context", "long_context", long_c, pricing.rates(model, "long_context"))
+    extra = agg.get("extra") or {}
+    if extra and not (std_name == "provisioned" and pricing.provisioned == "zero"):
+        std_tier = TRAFFIC_TO_TIER.get(std_name)
+        for direction in MODALITY_DIRECTIONS:
+            n = to_int(extra.get("%s_tokens" % direction))
+            unit = pricing.modality_rate(model, direction, std_tier) if n > 0 else None
+            if unit is None:
+                continue   # no modality SKU: these tokens stay in the text bucket
+            if direction.endswith("_input"):
+                inp = to_int(std.get("input_tokens"))
+                avail = inp - min(to_int(std.get("cached_tokens")), inp) - min(
+                    to_int(std.get("cache_write_tokens")), max(0, inp - to_int(std.get("cached_tokens"))))
+                take = min(n, max(0, avail))
+                std["input_tokens"] = inp - take
+            else:
+                take = min(n, max(0, to_int(std.get("output_tokens"))))
+                std["output_tokens"] = to_int(std.get("output_tokens")) - take
+            used = bool(std_tier and pricing.modality_rate(model, direction, std_tier) !=
+                        pricing.modality_rate(model, direction))
+            add(std_name, std_tier, direction, direction, take, unit, used)
+    for t, c in buckets.items():
+        if t == "provisioned" and pricing.provisioned == "zero":
+            continue
+        tier = TRAFFIC_TO_TIER.get(t)
+        add_bucket(t, tier, c, pricing.rates(model, tier) if tier else base)
+    return lines, base["priced"], tokens
+
+
+def model_cost(model: str | None, agg: dict, pricing: Pricing) -> tuple[float, bool, int]:
+    """(cost, priced, tokens) for one model aggregate, honouring traffic tiers, long-context tiers and modality SKUs."""
+    lines, priced, tokens = _cost_plan(model, agg, pricing)
+    return sum(ln["cost"] for ln in lines), priced, tokens
+
+
+def cost_lines(model: str | None, agg: dict, pricing: Pricing | None) -> list[dict]:
+    """Per-SKU cost lines for one model aggregate (same plan as `model_cost`, so the lines add up to it)."""
+    if pricing is None or not pricing.configured or (model and mc.is_non_token_model(model)):
+        return []
+    lines, _, _ = _cost_plan(model, agg, pricing)
+    return [dict(ln, unit_price_per_1m=round(ln["unit_price_per_1m"], 6), cost=round(ln["cost"], 9)) for ln in lines]
 
 
 def estimate_cost(rec: dict, pricing: Pricing | None) -> tuple[float | None, bool]:

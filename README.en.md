@@ -234,6 +234,7 @@ See [docs/multi-project-deployment.md](docs/multi-project-deployment.md).
 | Cache write | Partner model prompt-cache creation | Falls back to input price |
 | Long context | Requests whose prompt exceeds the threshold (default 200,000) | `LONG_CONTEXT_THRESHOLD_TOKENS` |
 | Flex / Priority / Batch | Requests whose log `trafficType` is that tier | Falls back to standard price |
+| Audio / image / video | Per-modality tokens from Gemini Platform `usageMetadata` | Matching SKU (`Audio Input`, `Image Output`, ...); Gemini-TTS uses Cloud Text-to-Speech SKUs |
 | Provisioned Throughput | Requests served by PT | `on_demand` (default) or `zero` |
 
 * Every usage response contains `pricing_source` (`method=log_token_counts_x_official_sku_prices`, `billing_export=not_used`, sync time). `GET /v1/pricing` shows per-model prices with **SKU resource names**.
@@ -253,7 +254,7 @@ same as `/v1/usage/users`, and totals for the same window match exactly.
 | Dimensions (`group_by`, any combination) | `user`, `surface`, `project`, `model`, `location`, `client`, `app`, `agent`, `traffic`, `reasoning_level` (default `user,surface,project,model`) |
 | Idempotency key | `fact_id` = deterministic hash of (granularity, bucket, dimension values). Upsert by `fact_id`; restated buckets overwrite older values, and `revision` changes when numbers change |
 | Tokens | `requests`, `input_tokens`, `uncached_input_tokens`, `cached_tokens`, `cache_write_tokens` (+`_5m`/`_1h`), `output_tokens`, `thoughts_tokens`, `total_tokens`, `long_context_*`, `by_modality{text,image,audio,video,document}`, `by_traffic` |
-| Cost | `list_cost` (list or contract price x tokens), `currency`, `cost_basis`, `billing[]` = SKU lines `{sku_id, tier, component, quantity{value, unit:"tokens"}, unit_price_per_1m, cost}` (omit with `include=none`) |
+| Cost | `list_cost` (list or contract price x tokens; audio / image / video tokens at their modality SKUs), `currency`, `cost_basis`, `billing[]` = SKU lines `{sku_id, tier, component, quantity{value, unit:"tokens"}, unit_price_per_1m, cost}` (omit with `include=none`) |
 | Other | `principal_type`, `attribution`, `sessions` (Antigravity conversations), `latency_ms_avg` (Gemini Platform), `client_versions`, `agent_names` |
 | Freshness | `data_refreshed_at` (when logs were read) and `data_complete_through` (settled time after ~15 min log delivery delay); also added to `telemetry` of existing usage responses |
 

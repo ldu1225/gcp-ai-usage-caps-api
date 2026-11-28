@@ -2257,7 +2257,7 @@ components:
       properties:
         model: { type: string }
         tier: { type: string, description: "on_demand | flex | priority | batch | provisioned | long_context" }
-        component: { type: string, enum: [input, cached_input, cache_write, output] }
+        component: { type: string, enum: [input, cached_input, cache_write, output, audio_input, image_input, video_input, audio_output, image_output] }
         sku_id: { type: ["string", "null"], description: "Cloud Billing Catalog SKU id; null for contract overrides" }
         sku: { type: ["string", "null"], description: "services/{service}/skus/{sku_id}" }
         quantity:

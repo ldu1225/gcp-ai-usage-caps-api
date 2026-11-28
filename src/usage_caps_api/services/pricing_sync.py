@@ -10,6 +10,7 @@ models observed in logs, so newly launched models are priced as soon as Google p
 from __future__ import annotations
 
 import json
+import re
 import logging
 import statistics
 import urllib.request
@@ -108,7 +109,9 @@ def catalog_entries(skus, service: str | None = None, excluded=()):
             yield None, None, None, None, None, None, rate, eff, None
             continue
         key, direction, prod, tier, threshold = hit
-        rank = (1 if prod else 0, 0 if "global" in low else 1)
+        # Prefer GA SKUs over older preview SKUs of the same model key (e.g. "2.5 Flash GA Text Input" $0.30 vs the
+        # retired preview "2.5 Flash Text Input" $0.15), then global over regional.
+        rank = (1 if prod else 0, 0 if re.search(r"\bga\b", low) else 1, 0 if "global" in low else 1)
         yield key, direction, tier, threshold, rank, price, rate, eff, sku.get("name") or sku.get("skuId")
 
 

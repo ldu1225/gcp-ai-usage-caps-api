@@ -100,6 +100,7 @@ pricing:
     - "Agent Platform"
     - "Gemini API"
     - "Generative Language"
+    - "Cloud Text-to-Speech"      # Gemini-TTS text input / audio output SKUs
   include_partner_models: true
   excluded_sku_patterns:
     - "code assist"

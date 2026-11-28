@@ -205,5 +205,74 @@ class UsageFactsTest(unittest.TestCase):
         self.assertEqual(alice["groups"], [{"id": "eng", "name": "Engineering"}])
 
 
+class ModalityPricingTest(unittest.TestCase):
+    """Audio / image / video tokens are priced at their own official Catalog SKUs (live-verified log shapes)."""
+
+    def test_catalog_classifies_modality_ga_and_long_skus(self):
+        c = pricing_svc.classify_sku
+        self.assertEqual(c("Gemini 2.5 Flash GA Audio Input - Predictions", "Vertex AI", "count", "count")[:2],
+                         ("gemini-2.5-flash", "audio_input"))
+        self.assertEqual(c("Gemini 2.5 Flash Image Output - Predictions", "Vertex AI", "count", "count")[:2],
+                         ("gemini-2.5-flash-image", "image_output"))
+        self.assertEqual(c("Gemini 3.1 Flash Image Global Image Output Flex - Predictions", "Vertex AI", "count",
+                           "count")[1:4:2], ("image_output", "flex"))
+        self.assertEqual(c("Gemini 2.5 Pro Text Input (Long) - Predictions", "Vertex AI", "count", "count")[3],
+                         "long_context")
+        self.assertIsNone(c("Gemini 2.5 Flash Input Audio Caching", "Vertex AI", "count", "count"))
+        self.assertIsNone(c("Gemini 2.5 Flash Live Audio (AV2A) Output - Predictions", "Vertex AI", "count", "count"))
+        self.assertIsNone(c("Gemini 3.8 Flash Cyber Global Audio Input - Online Predictions", "Vertex AI", "count",
+                            "count"))
+
+    def _pricing(self):
+        table = pricing_svc.PriceTable(currency="USD", prices={
+            "gemini-2.5-flash": {"input": 0.30, "output": 2.50, "cached": 0.03, "audio_input": 1.00,
+                                 "image_input": 0.30, "video_input": 0.30, "source": "official_sku",
+                                 "skus": {"input": "services/x/skus/TXT-IN", "audio_input": "services/x/skus/AUD-IN",
+                                          "output": "services/x/skus/TXT-OUT"}},
+            "gemini-2.5-flash-image": {"image_output": 30.0, "source": "official_sku",
+                                       "skus": {"image_output": "services/x/skus/IMG-OUT"}},
+        })
+        return pricing_svc.Pricing(source="auto", table=table)
+
+    def test_audio_input_priced_at_audio_sku(self):
+        p = self._pricing()
+        # Live call: promptTokensDetails AUDIO 100 + TEXT 8, candidates TEXT 11
+        agg = {"input_tokens": 108, "output_tokens": 11, "cached_tokens": 0, "cache_write_tokens": 0,
+               "total_tokens": 119, "extra": {"audio_input_tokens": 100, "text_input_tokens": 8,
+                                              "text_output_tokens": 11}}
+        cost, priced, _ = pricing_svc.model_cost("gemini-2.5-flash", agg, p)
+        self.assertTrue(priced)
+        self.assertAlmostEqual(cost, (100 * 1.00 + 8 * 0.30 + 11 * 2.50) / 1e6, places=12)
+        lines = {ln["component"]: ln for ln in pricing_svc.cost_lines("gemini-2.5-flash", agg, p)}
+        self.assertEqual(lines["audio_input"]["quantity"]["value"], 100)
+        self.assertEqual(lines["audio_input"]["sku_id"], "AUD-IN")
+        self.assertEqual(lines["input"]["quantity"]["value"], 8)
+        self.assertAlmostEqual(sum(ln["cost"] for ln in lines.values()), cost, places=9)
+
+    def test_image_output_priced_at_image_sku(self):
+        p = self._pricing()
+        # Live call: candidatesTokensDetails IMAGE 1290 + TEXT 8
+        agg = {"input_tokens": 12, "output_tokens": 1298, "cached_tokens": 0, "cache_write_tokens": 0,
+               "total_tokens": 1310, "extra": {"image_output_tokens": 1290, "text_output_tokens": 8}}
+        cost, _, _ = pricing_svc.model_cost("gemini-2.5-flash-image", agg, p)
+        self.assertAlmostEqual(cost, 1290 * 30.0 / 1e6, places=12)
+        lines = pricing_svc.cost_lines("gemini-2.5-flash-image", agg, p)
+        self.assertEqual([(ln["component"], ln["sku_id"]) for ln in lines if ln["component"] == "image_output"],
+                         [("image_output", "IMG-OUT")])
+
+    def test_override_prices_stay_modality_agnostic(self):
+        p = pricing_svc.Pricing(models=(("gemini-2.5-flash", 0.2, 1.0),), source="manual")
+        agg = {"input_tokens": 108, "output_tokens": 11, "total_tokens": 119,
+               "extra": {"audio_input_tokens": 100}}
+        cost, _, _ = pricing_svc.model_cost("gemini-2.5-flash", agg, p)
+        self.assertAlmostEqual(cost, (108 * 0.2 + 11 * 1.0) / 1e6, places=12)
+
+    def test_extra_counters_survive_classic_aggregation(self):
+        dst = usage._new_counters()  # pylint: disable=protected-access
+        usage._add(dst, {"requests": 1, "extra": {"audio_input_tokens": 100}})  # pylint: disable=protected-access
+        usage._add(dst, {"requests": 1, "extra": {"audio_input_tokens": 50, "image_input_tokens": 7}})  # pylint: disable=protected-access
+        self.assertEqual(dst["extra"], {"audio_input_tokens": 150, "image_input_tokens": 7})
+
+
 if __name__ == "__main__":
     unittest.main()

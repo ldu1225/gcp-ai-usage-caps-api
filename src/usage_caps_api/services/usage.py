@@ -174,6 +174,10 @@ def _add(dst: dict, src: dict):
         cur = dst.setdefault("by_traffic", {}).setdefault(t, {k: 0 for k in TRAFFIC_COUNTERS})
         for k in TRAFFIC_COUNTERS:
             cur[k] += int(tr.get(k) or 0)
+    for k, v in (src.get("extra") or {}).items():
+        if v:
+            ex = dst.setdefault("extra", {})
+            ex[k] = ex.get(k, 0) + int(v)
 
 
 def split_int(total: int, weights: list[float]) -> list[int]:

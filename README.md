@@ -234,6 +234,7 @@ curl -s "$BASE/v1/users/alice%40company.com/projects?start=2026-11-01&end=2026-1
 | 캐시 쓰기 | 파트너 모델 프롬프트 캐시 생성 토큰 | SKU가 없으면 입력 단가 |
 | 장문 컨텍스트 | 프롬프트가 임계값(기본 200,000) 초과인 요청 | `LONG_CONTEXT_THRESHOLD_TOKENS` |
 | Flex / Priority / Batch | 로그 `trafficType`이 해당 티어인 요청 | 티어 SKU가 없으면 표준 단가 |
+| 오디오 · 이미지 · 영상 | Gemini Platform `usageMetadata`의 모달리티별 토큰 | `Audio Input`, `Image Output` 등 해당 SKU. Gemini-TTS는 Cloud Text-to-Speech SKU |
 | Provisioned Throughput | PT로 처리된 요청 | `on_demand`(기본) 또는 `zero` |
 
 * 모든 사용량 응답에 `pricing_source`(`method=log_token_counts_x_official_sku_prices`, `billing_export=not_used`, 동기화 시각)가 포함됩니다. `GET /v1/pricing`은 모델별 단가와 **SKU 리소스 이름**을 보여 줍니다.
@@ -252,7 +253,7 @@ curl -s "$BASE/v1/users/alice%40company.com/projects?start=2026-11-01&end=2026-1
 | 차원 (`group_by`, 복수 지정) | `user`, `surface`, `project`, `model`, `location`, `client`, `app`, `agent`, `traffic`, `reasoning_level` (기본 `user,surface,project,model`) |
 | 멱등 키 | `fact_id` = (granularity, 버킷, 차원 값)의 결정적 해시. 수집기는 `fact_id`로 upsert만 하면 재집계(정정)된 값이 덮어써집니다. 값이 바뀌면 `revision`도 바뀝니다 |
 | 토큰 | `requests`, `input_tokens`, `uncached_input_tokens`, `cached_tokens`, `cache_write_tokens`(+`_5m`/`_1h`), `output_tokens`, `thoughts_tokens`, `total_tokens`, `long_context_*`, `by_modality{text,image,audio,video,document}`, `by_traffic` |
-| 비용 | `list_cost`(정가 또는 계약가 x 토큰), `currency`, `cost_basis`, `billing[]` = SKU 라인 `{sku_id, tier, component, quantity{value, unit:"tokens"}, unit_price_per_1m, cost}` (`include=none`으로 생략) |
+| 비용 | `list_cost`(정가 또는 계약가 x 토큰, 오디오·이미지·영상 토큰은 해당 모달리티 SKU), `currency`, `cost_basis`, `billing[]` = SKU 라인 `{sku_id, tier, component, quantity{value, unit:"tokens"}, unit_price_per_1m, cost}` (`include=none`으로 생략) |
 | 기타 | `principal_type`, `attribution`, `sessions`(Antigravity 대화 수), `latency_ms_avg`(Gemini Platform), `client_versions`, `agent_names` |
 | 신선도 | 응답에 `data_refreshed_at`(로그를 읽은 시각), `data_complete_through`(로그 전달 지연 약 15분을 감안한 확정 시각). 기존 사용량 응답의 `telemetry`에도 추가 |
 
